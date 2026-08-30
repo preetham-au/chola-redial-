@@ -1,0 +1,24 @@
+# Credentials. .env holds the Metabase service key and the Formi API key, and
+# DRY_RUN lives there too — committing it would publish both and pin the safety
+# switch to whatever this machine happened to be set to.
+.env
+.env.*
+!.env.example
+
+# Local state. redial.db is seeded from engine.seed on first run, so it is
+# reproducible and machine-specific rather than something to share.
+*.db
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Node
+node_modules/
+dist/
+dist.new/
