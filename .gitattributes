@@ -1,0 +1,17 @@
+# The repo is authored on Windows but deployed to Linux, so without this the
+# blobs go in as CRLF and every file reads as modified in the VM checkout —
+# which makes `git pull` on the server useless as an update path.
+#
+# Normalise everything to LF in the repository. Git still hands Windows working
+# copies whatever core.autocrlf asks for; only the stored bytes are pinned.
+* text=auto eol=lf
+
+# run.bat is executed by cmd.exe, which is the one thing here that wants CRLF.
+*.bat text eol=crlf
+
+# Never touch the bytes of anything binary.
+*.png binary
+*.jpg binary
+*.woff binary
+*.woff2 binary
+*.db binary
