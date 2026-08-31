@@ -56,6 +56,14 @@ def db_path() -> str:
     return os.environ.get("REDIAL_DB") or str(ROOT / "redial.db")
 
 
+def formi_token() -> str:
+    """Formi's bearer token. Deploys have shipped it under either name."""
+    token = os.environ.get("FORMI_TOKEN") or os.environ.get("FORMI_API_KEY")
+    if not token:
+        raise RuntimeError("Neither FORMI_TOKEN nor FORMI_API_KEY is set")
+    return token
+
+
 def dry_run() -> bool:
     """Live dialling requires an explicit DRY_RUN=0. Anything else is a dry run."""
     return (os.environ.get("DRY_RUN") or "1").strip() not in {"0", "false", "False"}

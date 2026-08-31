@@ -21,7 +21,8 @@ from engine.red_engine import (
 from engine.seed import load_leads
 
 from .db import (
-    DEFAULT_CONFIG, current_config, dry_run, insert_config, now_iso, now_ist, session,
+    DEFAULT_CONFIG, current_config, dry_run, formi_token, insert_config, now_iso, now_ist,
+    session,
 )
 
 router = APIRouter()
@@ -594,11 +595,8 @@ def _formi_post(agent_id: Any, lead_uuid: Any, scheduled_time: Any):
     """
     if dry_run():
         raise RuntimeError("DRY_RUN is set — refusing to dial")
-    import os                                        # noqa: PLC0415 — see docstring
     import requests                                  # noqa: PLC0415 — see docstring
-    token = os.environ.get("FORMI_TOKEN")
-    if not token:
-        raise HTTPException(500, "FORMI_TOKEN is not set; cannot dial live")
+    token = formi_token()
     return requests.post(
         f"https://api.formi.co.in{_schedule_path(agent_id, lead_uuid)}",
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},

@@ -8,7 +8,7 @@ import sqlite3
 import pytest
 import requests
 
-from api.db import db_path
+from api.db import db_path, formi_token
 
 # The seed anchors every RED to the day it was written, so bucket-sensitive
 # assertions have to ask about today.
@@ -642,3 +642,27 @@ def test_trigger_ignores_pause_but_not_exclusions(client, no_network):
                          (phone, campaign_id))
             conn.commit()
         client.post(f"/api/campaigns/{campaign_id}/resume")
+
+
+class TestFormiToken:
+    """Deploys have shipped the Formi key under either name; accept both.
+
+    A live dial used to read FORMI_TOKEN only, so a .env that set
+    FORMI_API_KEY turned every approve into a 500 and nothing was dialled.
+    """
+
+    def test_formi_token_wins_when_both_are_set(self, monkeypatch):
+        monkeypatch.setenv("FORMI_TOKEN", "from-token")
+        monkeypatch.setenv("FORMI_API_KEY", "from-key")
+        assert formi_token() == "from-token"
+
+    def test_falls_back_to_formi_api_key(self, monkeypatch):
+        monkeypatch.delenv("FORMI_TOKEN", raising=False)
+        monkeypatch.setenv("FORMI_API_KEY", "from-key")
+        assert formi_token() == "from-key"
+
+    def test_raises_naming_both_when_neither_is_set(self, monkeypatch):
+        monkeypatch.delenv("FORMI_TOKEN", raising=False)
+        monkeypatch.delenv("FORMI_API_KEY", raising=False)
+        with pytest.raises(RuntimeError, match="FORMI_API_KEY"):
+            formi_token()
