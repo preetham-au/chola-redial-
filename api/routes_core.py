@@ -21,8 +21,8 @@ from engine.red_engine import (
 from engine.seed import load_leads
 
 from .db import (
-    DEFAULT_CONFIG, current_config, dry_run, formi_token, insert_config, now_iso, now_ist,
-    session,
+    DEFAULT_CONFIG, NO_TOKEN, current_config, dry_run, formi_token, insert_config,
+    now_iso, now_ist, session,
 )
 
 router = APIRouter()
@@ -34,7 +34,7 @@ router = APIRouter()
 
 class PlanBody(BaseModel):
     date: Optional[str] = None
-    # Empty = plan every schedulable bucket. Supply e.g. ["M0","F6","F5"] to put
+    # Empty = plan every schedulable bucket. Supply e.g. ["M0","E0","F6","F5"] to put
     # only the urgent buckets on the clock; the rest are still evaluated and
     # recorded in `decisions`, they just get no slot today.
     buckets: list[str] = Field(default_factory=list)
@@ -484,7 +484,9 @@ def patch_item(run_id: int, item_id: int, body: ItemPatch) -> dict[str, Any]:
         run = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
         if run is None:
             raise HTTPException(404, f"run {run_id} not found")
-        if run["status"] != "planned":
+        # A paused run is editable too — pausing exists precisely so the rest of
+        # the day can be moved before it is resumed.
+        if run["status"] not in ("planned", "paused"):
             raise HTTPException(409, f"run {run_id} is {run['status']}, cannot edit items")
         item = conn.execute("SELECT * FROM plan_items WHERE id=? AND run_id=?",
                             (item_id, run_id)).fetchone()
@@ -527,6 +529,59 @@ def patch_item(run_id: int, item_id: int, body: ItemPatch) -> dict[str, Any]:
         return _item_json(conn.execute("SELECT * FROM plan_items WHERE id=?", (item_id,)).fetchone())
 
 
+def _commit(conn: sqlite3.Connection, run: sqlite3.Row, campaign: sqlite3.Row,
+            verb: str) -> dict[str, Any]:
+    """Post this run's still-`planned` slots to Formi. The only path that dials.
+
+    Shared by approve and resume: a resumed run is the same act as approving it,
+    minus the slots that already went out before it was paused.
+    """
+    run_id = run["id"]
+    every = conn.execute(
+        "SELECT * FROM plan_items WHERE run_id=? AND status='planned' "
+        "ORDER BY scheduled_time, id", (run_id,)).fetchall()
+
+    # A plan is a proposal, not a promise: it can sit unapproved while the
+    # clock runs past its early slots. Posting those to Formi would ask for a
+    # call at a time that has already gone, so they are retired here instead.
+    # The rest of the run still goes out — one stale slot must not block the
+    # afternoon. Re-plan to put the retired leads back on the clock.
+    # Truncated to the minute: Formi schedules by the minute, so a slot at
+    # 16:26 approved at 16:26:40 is still on time, not stale.
+    cutoff = now_ist().strftime("%Y-%m-%dT%H:%M:00")
+    stale = [r for r in every if (r["scheduled_time"] or "") < cutoff]
+    items = [r for r in every if (r["scheduled_time"] or "") >= cutoff]
+    if stale and not items:
+        raise HTTPException(
+            409, f"every remaining slot in run {run_id} is in the past (it is "
+                 f"{now_ist().strftime('%H:%M')}); re-plan before {verb}")
+    if stale:
+        conn.executemany("UPDATE plan_items SET status='expired' WHERE id=?",
+                         [(r["id"],) for r in stale])
+
+    if dry_run():
+        # No network I/O whatsoever: record exactly what would have been sent.
+        conn.executemany(
+            "UPDATE plan_items SET status='simulated', response=? WHERE id=?",
+            [(json.dumps({"would_post": {
+                "url": _schedule_path(campaign["agent_id"], r["lead_uuid"]),
+                "body": {"scheduled_time": r["scheduled_time"]}}}), r["id"]) for r in items])
+        posted, failed = len(items), 0
+    else:
+        posted, failed = _dial_live(conn, campaign, items)
+    # Counts are cumulative across pause/resume cycles, so a run that went out in
+    # two halves still reports how many calls it actually placed.
+    conn.execute("UPDATE runs SET status='committed', posted=posted+?, failed=failed+?, "
+                 "dropped=dropped+?, dry_run=? WHERE id=?",
+                 (posted, failed, len(stale), int(dry_run()), run_id))
+    conn.commit()
+    out = _run_json(conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
+    out["dry_run"] = dry_run()
+    out["simulated"] = posted if dry_run() else 0
+    out["expired"] = len(stale)
+    return out
+
+
 @router.post("/api/runs/{run_id}/approve")
 def approve(run_id: int) -> dict[str, Any]:
     """The only path that can dial. Under DRY_RUN it only marks items simulated."""
@@ -539,47 +594,120 @@ def approve(run_id: int) -> dict[str, Any]:
             raise HTTPException(409, f"campaign {campaign['id']} is paused")
         if run["status"] != "planned":
             raise HTTPException(409, f"run {run_id} is {run['status']}, not planned")
+        return _commit(conn, run, campaign, "approving")
 
-        every = conn.execute("SELECT * FROM plan_items WHERE run_id=? ORDER BY scheduled_time, id",
-                             (run_id,)).fetchall()
 
-        # A plan is a proposal, not a promise: it can sit unapproved while the
-        # clock runs past its early slots. Posting those to Formi would ask for a
-        # call at a time that has already gone, so they are retired here instead.
-        # The rest of the run still goes out — one stale slot must not block the
-        # afternoon. Re-plan to put the retired leads back on the clock.
-        # Truncated to the minute: Formi schedules by the minute, so a slot at
-        # 16:26 approved at 16:26:40 is still on time, not stale.
+@router.post("/api/runs/{run_id}/resume")
+def resume_run(run_id: int) -> dict[str, Any]:
+    """Put the rest of a paused run back on Formi's clock, edits included."""
+    with session() as conn:
+        run = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+        if run is None:
+            raise HTTPException(404, f"run {run_id} not found")
+        if run["status"] != "paused":
+            raise HTTPException(409, f"run {run_id} is {run['status']}, not paused")
+        campaign = _campaign(conn, run["campaign_id"])
+        if campaign["paused"]:
+            raise HTTPException(409, f"campaign {campaign['id']} is paused")
+        return _commit(conn, run, campaign, "resuming")
+
+
+@router.post("/api/runs/{run_id}/pause")
+def pause_run(run_id: int) -> dict[str, Any]:
+    """Take a committed run's un-dialled calls back off Formi's clock.
+
+    Pausing is not a flag: the calls are already queued in the main system, so
+    stopping them means DELETEing those interactions there. Slots whose time has
+    already passed are left alone — that call either happened or is happening,
+    and deleting its interaction would erase the record rather than cancel it.
+    The rest go back to `planned`, so they can be edited and resumed.
+    """
+    with session() as conn:
+        run = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+        if run is None:
+            raise HTTPException(404, f"run {run_id} not found")
+        if run["status"] != "committed":
+            raise HTTPException(409, f"run {run_id} is {run['status']}, not committed")
+
         cutoff = now_ist().strftime("%Y-%m-%dT%H:%M:00")
-        stale = [r for r in every if (r["scheduled_time"] or "") < cutoff]
-        items = [r for r in every if (r["scheduled_time"] or "") >= cutoff]
-        if stale and not items:
-            raise HTTPException(
-                409, f"every slot in run {run_id} is in the past (it is "
-                     f"{now_ist().strftime('%H:%M')}); re-plan before approving")
-        if stale:
-            conn.executemany("UPDATE plan_items SET status='expired' WHERE id=?",
-                             [(r["id"],) for r in stale])
+        items = conn.execute(
+            "SELECT * FROM plan_items WHERE run_id=? AND status IN ('posted','simulated') "
+            "AND scheduled_time > ? ORDER BY scheduled_time, id", (run_id, cutoff)).fetchall()
 
-        if dry_run():
-            # No network I/O whatsoever: record exactly what would have been sent.
-            conn.executemany(
-                "UPDATE plan_items SET status='simulated', response=? WHERE id=?",
-                [(json.dumps({"would_post": {
-                    "url": _schedule_path(campaign["agent_id"], r["lead_uuid"]),
-                    "body": {"scheduled_time": r["scheduled_time"]}}}), r["id"]) for r in items])
-            posted, failed = len(items), 0
-        else:
-            posted, failed = _dial_live(conn, campaign, items)
-        conn.execute("UPDATE runs SET status='committed', posted=?, failed=?, dropped=?, "
-                     "dry_run=? WHERE id=?",
-                     (posted, failed, run["dropped"] + len(stale), int(dry_run()), run_id))
+        cancelled = failed = 0
+        if items and not dry_run():
+            cancelled, failed = _cancel_live(conn, run, items)
+        elif items:
+            cancelled = len(items)                     # simulated: nothing to undo
+        conn.executemany("UPDATE plan_items SET status='planned', http_status=NULL WHERE id=?",
+                         [(r["id"],) for r in items])
+        conn.execute("UPDATE runs SET status='paused', posted=MAX(posted-?, 0) WHERE id=?",
+                     (cancelled, run_id))
         conn.commit()
         out = _run_json(conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
-        out["dry_run"] = dry_run()
-        out["simulated"] = posted if dry_run() else 0
-        out["expired"] = len(stale)
+        out["cancelled"] = cancelled
+        out["cancel_failed"] = failed
+        out["left_running"] = conn.execute(
+            "SELECT COUNT(*) c FROM plan_items WHERE run_id=? AND status IN ('posted','simulated')",
+            (run_id,)).fetchone()["c"]
         return out
+
+
+def _cancel_live(conn: sqlite3.Connection, run: sqlite3.Row, items) -> tuple[int, int]:
+    """DELETE the queued Formi interactions behind `items`. Never in a dry run.
+
+    The interaction ids are not in the local store — the schedule POST does not
+    hand them back — so they are looked up in the warehouse by (campaign, lead,
+    run date), the same shape `scripts/redial/cancel_scheduled_calls.py` proved.
+    Only `init` rows are touched: `attempted`/`ongoing`/`ended` already dialled,
+    and deleting one of those destroys a call record instead of cancelling a call.
+    """
+    if dry_run():
+        raise RuntimeError("DRY_RUN is set — refusing to cancel live interactions")
+    import os                                          # noqa: PLC0415 — see _formi_post
+    import requests                                    # noqa: PLC0415
+    from engine import metabase_source as ms           # noqa: PLC0415
+
+    token = formi_token()
+    if not token:
+        raise HTTPException(500, f"{NO_TOKEN}; cannot cancel scheduled calls")
+
+    uuids = {r["lead_uuid"] for r in items if r["lead_uuid"]}
+    marks = ",".join("?" * len(uuids))
+    lead_ids = [row["id"] for row in conn.execute(
+        f"SELECT id FROM leads WHERE campaign_id=? AND lead_uuid IN ({marks})",
+        [run["campaign_id"], *uuids])] if uuids else []
+    if not lead_ids:
+        return 0, 0
+
+    ids = ",".join(str(int(i)) for i in lead_ids)
+    try:
+        rows = ms.run_sql(f"""
+SELECT i.id
+FROM public.interactions i
+WHERE i.campaign_id = {int(run['campaign_id'])}
+  AND i.status = 'init'
+  AND i.lead_id IN ({ids})
+  AND (i.scheduled_time AT TIME ZONE 'UTC'
+       AT TIME ZONE 'Asia/Kolkata')::date = DATE '{_iso_day(run['run_date'])}'
+""".strip(), timeout=180)
+    except ms.MetabaseError as exc:
+        raise HTTPException(502, f"could not read the dial queue to cancel it: {exc}") from None
+
+    cancelled = failed = 0
+    for row in rows:
+        response = requests.delete(
+            f"https://api.formi.co.in/v2/interactions/{int(row['id'])}",
+            headers={"Authorization": f"Bearer {token}"}, timeout=60)
+        ok = 200 <= response.status_code < 300
+        cancelled += int(ok)
+        failed += int(not ok)
+    return cancelled, failed
+
+
+def _iso_day(value: Any) -> str:
+    """Round-trip a stored run_date so only a real date can reach the SQL."""
+    return date.fromisoformat(str(value)[:10]).isoformat()
 
 
 def _schedule_path(agent_id: Any, lead_uuid: Any) -> str:
@@ -597,6 +725,8 @@ def _formi_post(agent_id: Any, lead_uuid: Any, scheduled_time: Any):
         raise RuntimeError("DRY_RUN is set — refusing to dial")
     import requests                                  # noqa: PLC0415 — see docstring
     token = formi_token()
+    if not token:
+        raise HTTPException(500, f"{NO_TOKEN}; cannot dial live")
     return requests.post(
         f"https://api.formi.co.in{_schedule_path(agent_id, lead_uuid)}",
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},

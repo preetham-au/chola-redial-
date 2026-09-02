@@ -2,6 +2,7 @@
  * through the same reducer the UI calls. Run: npm run check
  * Not part of the app bundle — nothing imports it. */
 
+import { readFileSync } from 'node:fs';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { applyBd, BucketDispositions, type BdAction } from './components/BucketDispositions';
 import { AgentChip, AgentPauseConfirm, AgentSwitcher } from './components/AgentBar';
@@ -12,6 +13,8 @@ import { api } from './lib/api';
 import { mockBuckets, mockCampaigns, mockConfig, mockTestCall, mockTestNumbers } from './lib/mock';
 import {
   agentsFrom,
+  BUCKET_COLOR,
+  BUCKET_ORDER,
   configurableBuckets,
   effectiveDispositions,
   narrowedBuckets,
@@ -78,10 +81,10 @@ ok('"inherit" removes the key entirely', !('F4' in cfg.bucket_dispositions!));
 ok('telephony_failed starts mixed', !effectiveDispositions(cfg, 'F1').includes('telephony_failed'));
 html = click({ kind: 'col', slug: 'telephony_failed' });
 ok('mixed column turns on down all buckets', ROWS.every((b) => effectiveDispositions(cfg, b).includes('telephony_failed')));
-ok('column header counts 8 of 8 on', has(html, '>8/8<'));
+ok('column header counts every bucket on', has(html, `>${ROWS.length}/${ROWS.length}<`));
 html = click({ kind: 'col', slug: 'telephony_failed' });
 ok('clicking again turns it off down all buckets', ROWS.every((b) => !effectiveDispositions(cfg, b).includes('telephony_failed')));
-ok('column header counts 0 of 8 and strikes the label', has(html, '>0/8<') && has(html, 'bd-colhead is-dead'));
+ok('column header counts none on and strikes the label', has(html, `>0/${ROWS.length}<`) && has(html, 'bd-colhead is-dead'));
 
 // --- M0 warning -------------------------------------------------------------
 html = click({ kind: 'cell', bucket: 'M0', slug: 'did_not_pick' });
@@ -222,6 +225,25 @@ ok(
     <TriggerConfirm phone="9379747274" live typed="9379747274" onTyped={() => {}} busy={false} onClose={() => {}} onConfirm={() => {}} />,
   ).includes('disabled=""'),
 );
+
+// --- the urgency ramp is written twice, so assert it agrees ------------------
+// BUCKET_COLOR fills the charts and the bucket dots; --b-F1..--b-D0 in app.css
+// dresses the D0 stripes and the F5 headline. Two copies of one palette is
+// exactly the shape of bug that had the reports counting three different
+// numbers for one day, so the copies are compared rather than trusted.
+{
+  const css = readFileSync('src/styles/app.css', 'utf8');
+  const declared = new Map<string, string>();
+  for (const [, key, hex] of css.matchAll(/--b-(F\d|E0|M0|D0):\s*(#[0-9a-fA-F]{6})/g)) {
+    declared.set(key, hex.toLowerCase());
+  }
+  ok('app.css declares a colour for every bucket', declared.size === BUCKET_ORDER.length);
+  const drifted = BUCKET_ORDER.filter((b) => declared.get(b) !== BUCKET_COLOR[b].toLowerCase());
+  ok(
+    `the stylesheet ramp matches BUCKET_COLOR${drifted.length ? ` (drifted: ${drifted.join(', ')})` : ''}`,
+    drifted.length === 0,
+  );
+}
 
 // --- scope leak guard (async: exercises the api layer's offline fallback) ----
 (async () => {

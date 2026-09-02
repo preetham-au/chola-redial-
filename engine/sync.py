@@ -12,12 +12,16 @@ per run and the console does not need it:
   * --campaigns (default 20) of them, --leads (default 5000) leads each,
   * plus, always, the newest campaign per agent that holds a test number, so
     /api/test-call keeps resolving even though those campaigns are tiny.
+  * only leads TODAY is about: inside the campaign's own RED window (what the
+    engine can put on the clock today), plus anything already scheduled or
+    dialled today. `--all-leads` restores the whole-campaign pull.
 
 Everything it capped is printed. A truncated sync must never read as complete.
 """
 from __future__ import annotations
 
 import argparse
+import re
 import sqlite3
 import sys
 import time
@@ -27,10 +31,41 @@ from typing import Any, Iterable, Sequence
 from api.db import init_db, load_env, purge_campaigns, current_config
 
 from . import metabase_source as ms
+from .red_engine import config_from_settings
 from .seed import AGENTS, TEST_NUMBERS
 
 DEFAULT_MAX_CAMPAIGNS = 20
 DEFAULT_MAX_LEADS = 5_000
+
+# Campaigns whose name says they are not production. "Newest first with leads
+# and a RED" is otherwise a perfect description of a test campaign, so the
+# console used to offer `test 26`, `test 1` and `Dev_Test_06-08-2026` alongside
+# the real cohorts -- and under DRY_RUN=0 approving one of those dials whatever
+# real numbers happen to be sitting in it.
+#
+# Matched on the name rather than a list of ids on purpose. The reports kept an
+# explicit exclusion list and it went stale every time someone made a new test
+# campaign; a name pattern covers the one that gets created tomorrow. A campaign
+# that is genuinely production must not be named like a test, which is a rule
+# worth having anyway. --force-campaigns overrides this for a specific id.
+NON_PRODUCTION_WORDS = {
+    "test", "tests", "testing", "dev", "demo", "dummy", "sample", "sandbox",
+    "staging", "scratch",
+    # Not test campaigns, but dead ones that were left dialable: 1574
+    # "audit_redial (killed)" and 1421 "paymnet link (link plumbing)".
+    "killed", "plumbing", "deprecated", "obsolete",
+}
+
+
+def is_production_campaign(name: Any) -> bool:
+    """False when any word in the name marks it as not-for-customers.
+
+    Split on non-alphanumerics rather than using \\b, because `_` is a word
+    character to `re` -- `\\bdev\\b` does not match `Dev_Test_06-08-2026`, which
+    is exactly the naming style these campaigns use.
+    """
+    words = re.split(r"[^a-z0-9]+", str(name or "").lower())
+    return not (NON_PRODUCTION_WORDS & set(words))
 
 
 def log(message: str) -> None:
@@ -101,7 +136,9 @@ ORDER BY l.agent_id, l.id DESC
     return {int(r["agent_id"]): int(r["campaign_id"]) for r in rows}
 
 
-def fetch_fresh_leads(campaign_id: int, config: ms.MetabaseConfig) -> list[dict[str, Any]]:
+def fetch_fresh_leads(campaign_id: int, config: ms.MetabaseConfig,
+                      dte_min: int | None = None, dte_max: int | None = None,
+                      today: date | None = None) -> list[dict[str, Any]]:
     """Direct-from-view lead list for a campaign with NO interaction history.
 
     `fetch_redial_leads` starts from `public.interactions` — brand-new "first
@@ -115,6 +152,13 @@ def fetch_fresh_leads(campaign_id: int, config: ms.MetabaseConfig) -> list[dict[
     part-scheduled by hand is exactly the case that would otherwise double-dial.
     """
     red_expr = ms.red_parse_expression("v.red")
+    # Same "today only" scope as the history path: leads the engine could put on
+    # today's clock, plus anything Formi already has scheduled for today.
+    window = ""
+    if dte_min is not None and dte_max is not None:
+        today_sql = f"DATE '{(today or date.today()).isoformat()}'"
+        window = (f"  AND ((red.d - {today_sql}) BETWEEN {int(dte_min)} AND {int(dte_max)}\n"
+                  f"       OR COALESCE(q.queued_today, 0) > 0)\n")
     rows = retry(f"fresh leads {campaign_id}", ms.run_sql, f"""
 SELECT v.id AS warehouse_lead_id, v.uuid AS lead_uuid, v.lead_name,
        LOWER(COALESCE(v.stage, '')) AS stage,
@@ -134,7 +178,7 @@ LEFT JOIN (
   GROUP BY i.lead_id
 ) q ON q.lead_id = v.id
 WHERE l.campaign_id = {int(campaign_id)}
-""".strip(), config, timeout=120)
+{window}""".strip(), config, timeout=120)
     for r in rows:
         red = r.get("red")
         if red is not None and not isinstance(red, str):
@@ -256,7 +300,8 @@ def sync(agents: Sequence[int] = tuple(AGENTS),
          max_leads: int = DEFAULT_MAX_LEADS,
          today: date | None = None,
          keep_local: bool = False,
-         force_campaigns: Sequence[int] = ()) -> dict[str, Any]:
+         force_campaigns: Sequence[int] = (),
+         all_leads: bool = False) -> dict[str, Any]:
     config = ms.load_config()
     schema = retry("schema", ms.describe_schema, config)
 
@@ -278,8 +323,17 @@ def sync(agents: Sequence[int] = tuple(AGENTS),
 
     # Newest first: a redial console is about this week's cohorts, and campaign
     # ids are issued in creation order.
-    eligible = sorted((r for r in everything if r["leads"] and r["leads_with_red"]),
+    has_leads = [r for r in everything if r["leads"] and r["leads_with_red"]]
+    eligible = sorted((r for r in has_leads
+                       if is_production_campaign(r.get("campaign_name"))),
                       key=lambda r: -int(r["campaign_id"]))
+    kept_ids = {int(r["campaign_id"]) for r in eligible}
+    dropped = [r for r in has_leads if int(r["campaign_id"]) not in kept_ids]
+    if dropped:
+        log(f"non-production: skipping {len(dropped)} campaign(s) whose name says "
+            f"test/dev — " + ", ".join(
+                f"{r['campaign_id']} {str(r.get('campaign_name'))[:24]!r}"
+                for r in sorted(dropped, key=lambda r: -int(r["campaign_id"]))[:12]))
     chosen = eligible[:max_campaigns]
     chosen_ids = {int(r["campaign_id"]) for r in chosen}
     always = set(forced.values()) | forced_ids
@@ -307,15 +361,24 @@ def sync(agents: Sequence[int] = tuple(AGENTS),
 
         for row in chosen:
             campaign_id = int(row["campaign_id"])
+            # The window is read from the campaign's OWN saved strategy, not from
+            # the engine defaults: an operator who widened the frequency table
+            # would otherwise find the leads they just asked for missing from the
+            # local store.
+            window = config_from_settings(current_config(conn, campaign_id))
             if campaign_id in forced_ids:
-                leads = fetch_fresh_leads(campaign_id, config)
+                leads = fetch_fresh_leads(
+                    campaign_id, config, today=today,
+                    dte_min=None if all_leads else window.dte_min,
+                    dte_max=None if all_leads else window.dte_max)
             else:
                 leads = retry(f"leads {campaign_id}", ms.fetch_redial_leads,
                               [campaign_id], config, schema, limit=max_leads,
-                              today=today, require_red=False)
+                              today=today, require_red=not all_leads,
+                              keep_today=not all_leads,
+                              dte_min=window.dte_min, dte_max=window.dte_max)
             contacts = fetch_contacts(campaign_id, config)
             stored = store_leads(conn, campaign_id, leads, contacts)
-            current_config(conn, campaign_id)          # materialise config v1
             with_phone = conn.execute(
                 "SELECT COUNT(*) FROM leads WHERE campaign_id=? AND phone IS NOT NULL",
                 (campaign_id,)).fetchone()[0]
@@ -331,6 +394,10 @@ def sync(agents: Sequence[int] = tuple(AGENTS),
 
     log(f"CAP: {total_leads} leads stored; {truncated} campaign(s) hit the "
         f"--leads {max_leads} ceiling and are INCOMPLETE.")
+    log("SCOPE: every lead in the campaign (--all-leads)" if all_leads else
+        "SCOPE: today only — leads inside each campaign's RED window, plus any "
+        "already scheduled or dialled today. Leads outside it are NOT in the "
+        "local store and cannot be planned; re-sync with --all-leads for those.")
     return {"campaigns": len(chosen), "leads": total_leads,
             "campaigns_skipped": skipped, "campaigns_truncated": truncated,
             "per_campaign": per_campaign}
@@ -346,13 +413,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="do not delete campaigns this sync did not touch")
     parser.add_argument("--force-campaigns", default="",
                         help="comma-separated campaign ids to sync regardless of RED filter")
+    parser.add_argument("--all-leads", action="store_true",
+                        help="pull every lead, not just the ones in play today")
     args = parser.parse_args(argv)
 
     agents = [int(a) for a in str(args.agents).split(",") if a.strip()]
     forced = [int(c) for c in str(args.force_campaigns).split(",") if c.strip()]
     try:
         result = sync(agents, args.campaigns, args.leads, keep_local=args.keep_local,
-                      force_campaigns=forced)
+                      force_campaigns=forced, all_leads=args.all_leads)
     except ms.MetabaseError as exc:
         log(f"sync failed: {exc}")
         return 1

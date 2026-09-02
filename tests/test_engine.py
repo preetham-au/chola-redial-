@@ -43,6 +43,26 @@ def test_did_not_pick_lead_schedules():
     assert decision.bucket == "F3"          # dte 20
 
 
+@pytest.mark.parametrize("dte, bucket", [(2, "F5"), (1, "M0"), (0, "M0"), (-1, "E0"), (-2, "F6")])
+def test_expiry_day_and_the_day_after_land_in_their_own_bucket(dte, bucket):
+    """E0 covers dte 0..-1. dte 1/0 still get the mandatory override first."""
+    decision = decide(lead(red=(TODAY + timedelta(days=dte)).isoformat(),
+                           last_interaction_time="2026-08-26 10:00:00"),
+                      NOW, DEFAULT_CONFIG)
+    assert decision.bucket == bucket
+
+
+def test_e0_takes_its_own_disposition_allow_list():
+    """The per-bucket allow-list reaches the new bucket like any other."""
+    config = red_config_from_body({"bucket_dispositions": {"E0": ["voicemail"]}})
+    blocked = decide(lead(stage="did_not_pick", red=(TODAY - timedelta(days=1)).isoformat()),
+                     NOW, config)
+    assert blocked.schedule is False and blocked.bucket == "E0"
+    allowed = decide(lead(stage="voicemail", red=(TODAY - timedelta(days=1)).isoformat()),
+                     NOW, config)
+    assert allowed.schedule is True and allowed.bucket == "E0"
+
+
 def test_mandatory_day_overrides_the_gate_for_a_connected_lead():
     """RED-1 forces a call even for a warm lead that is otherwise manual-only."""
     warm = lead(stage="positive_followup", red=(TODAY + timedelta(days=1)).isoformat())
@@ -241,3 +261,71 @@ def test_synced_red_keeps_the_warehouses_own_reading():
     # Unparseable RED keeps its raw text, so the NO_EXPIRY skip stays visible.
     assert _red({"red_raw": "25-Aug", "red": "25-Aug"}) == "25-Aug"
     assert _red({"red_raw": "", "red": None}) == ""
+
+
+# ---------------------------------------------------------------------------
+# The Formi credential
+# ---------------------------------------------------------------------------
+# The app documented FORMI_TOKEN; every other Chola tool writes FORMI_API_KEY
+# into the same .env. A working credential file therefore produced "not set" on
+# every live dial and every bulk stage commit. Both names must resolve.
+
+def test_formi_token_accepts_either_env_name(monkeypatch):
+    from api.db import formi_token
+
+    monkeypatch.delenv("FORMI_TOKEN", raising=False)
+    monkeypatch.delenv("FORMI_API_KEY", raising=False)
+    assert formi_token() is None
+
+    monkeypatch.setenv("FORMI_API_KEY", "key-from-the-shared-env")
+    assert formi_token() == "key-from-the-shared-env"
+
+    # Explicit beats inherited, so exporting FORMI_TOKEN still wins.
+    monkeypatch.setenv("FORMI_TOKEN", "explicit")
+    assert formi_token() == "explicit"
+
+
+def test_formi_token_ignores_a_blank_value(monkeypatch):
+    """An empty export is how a half-filled .env fails; it must not count."""
+    from api.db import formi_token
+
+    monkeypatch.setenv("FORMI_TOKEN", "   ")
+    monkeypatch.setenv("FORMI_API_KEY", "real")
+    assert formi_token() == "real"
+
+
+# ---------------------------------------------------------------------------
+# Which campaigns the sync is allowed to offer
+# ---------------------------------------------------------------------------
+# "Newest first, has leads, has a RED" also describes a test campaign perfectly,
+# so the console listed `test 26` next to the real cohorts. Approving one of
+# those under DRY_RUN=0 dials whatever real numbers are sitting in it.
+
+@pytest.mark.parametrize("name", [
+    "test", "test 1", "test 26", "link test", "send_payment_link-test",
+    "Test campagin", "24_July_Dev_Campaign", "Dev_Test_06-08-2026",
+    "audit_redial (killed)", "paymnet link (link plumbing)",
+])
+def test_non_production_campaigns_are_not_offered(name):
+    from engine.sync import is_production_campaign
+    assert not is_production_campaign(name)
+
+
+@pytest.mark.parametrize("name", [
+    "0308Redial -CV", "0608-PV_updated", "10-08-Redial-missed", "RED-22-07",
+    "Redial_missed_2608",
+    # Substring matching would kill this one: it contains "test" inside
+    # "Contest". Splitting into words is the whole reason the filter is safe to
+    # apply to names nobody has reviewed.
+    "Contest_Aug",
+])
+def test_real_campaigns_survive_the_filter(name):
+    from engine.sync import is_production_campaign
+    assert is_production_campaign(name)
+
+
+def test_a_missing_name_is_not_treated_as_a_test_campaign():
+    """An unnamed campaign is a data gap, not permission to drop real leads."""
+    from engine.sync import is_production_campaign
+    assert is_production_campaign(None)
+    assert is_production_campaign("")

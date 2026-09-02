@@ -56,14 +56,6 @@ def db_path() -> str:
     return os.environ.get("REDIAL_DB") or str(ROOT / "redial.db")
 
 
-def formi_token() -> str:
-    """Formi's bearer token. Deploys have shipped it under either name."""
-    token = os.environ.get("FORMI_TOKEN") or os.environ.get("FORMI_API_KEY")
-    if not token:
-        raise RuntimeError("Neither FORMI_TOKEN nor FORMI_API_KEY is set")
-    return token
-
-
 def dry_run() -> bool:
     """Live dialling requires an explicit DRY_RUN=0. Anything else is a dry run."""
     return (os.environ.get("DRY_RUN") or "1").strip() not in {"0", "false", "False"}
@@ -71,6 +63,30 @@ def dry_run() -> bool:
 
 def leads_source() -> str:
     return (os.environ.get("LEADS_SOURCE") or "seed").strip().lower()
+
+
+def formi_token() -> str | None:
+    """The bearer for a live Formi write, or None if nothing is configured.
+
+    FORMI_API_KEY is the name the rest of the Chola tooling uses -- mark_paid,
+    upload_leads and the redial scripts all read it from the same .env. This app
+    asked for FORMI_TOKEN instead, so a .env that worked everywhere else left
+    every live dial and every bulk stage commit failing on "FORMI_TOKEN is not
+    set", which reads like a missing credential rather than a misspelled one.
+
+    FORMI_TOKEN still wins when both are set, so an operator who exported the
+    name this app used to document does not silently start using a different
+    key.
+    """
+    for name in ("FORMI_TOKEN", "FORMI_API_KEY"):
+        value = (os.environ.get(name) or "").strip()
+        if value:
+            return value
+    return None
+
+
+NO_TOKEN = ("No Formi credential: set FORMI_API_KEY (or FORMI_TOKEN) in the "
+            "environment or .env")
 
 
 def connect() -> sqlite3.Connection:
@@ -144,10 +160,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         {"bucket": "F2", "label": "Early engagement", "from_dte": 31, "to_dte": 24, "calls_per_week": 2, "calls_per_day": 0},
         {"bucket": "F3", "label": "Building urgency", "from_dte": 23, "to_dte": 16, "calls_per_week": 3, "calls_per_day": 0},
         {"bucket": "F4", "label": "High frequency",   "from_dte": 15, "to_dte": 8,  "calls_per_week": 5, "calls_per_day": 0},
-        {"bucket": "F5", "label": "Critical window",  "from_dte": 7,  "to_dte": 0,  "calls_per_week": 0, "calls_per_day": 2},
-        {"bucket": "F6", "label": "Grace period",     "from_dte": -1, "to_dte": -3, "calls_per_week": 0, "calls_per_day": 2},
+        {"bucket": "F5", "label": "Critical window",  "from_dte": 7,  "to_dte": 1,  "calls_per_week": 0, "calls_per_day": 2},
+        {"bucket": "E0", "label": "Expiry window",    "from_dte": 0,  "to_dte": -1, "calls_per_week": 0, "calls_per_day": 2},
+        {"bucket": "F6", "label": "Grace period",     "from_dte": -2, "to_dte": -3, "calls_per_week": 0, "calls_per_day": 2},
     ],
-    "bucket_priority": ["M0", "F6", "F5", "F4", "F3", "F2", "F1", "D0"],
+    "bucket_priority": ["M0", "E0", "F6", "F5", "F4", "F3", "F2", "F1", "D0"],
     "auto_dispositions": ["did_not_pick", "hung_up", "unreachable", "rnr",
                           "beep_tone_number_busy_not_reachable_switched_off",
                           "voicemail", "telephony_failed", "dialer_nc",
@@ -155,7 +172,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # bucket -> slugs that bucket alone may auto-dial. Absent or empty = inherit
     # `auto_dispositions`, so {} is exactly the previous behaviour.
     "bucket_dispositions": {},
-    # Who gets the SECOND call of the day in F5/F6/M0. Empty = everyone in those
+    # Who gets the SECOND call of the day in F5/E0/F6/M0. Empty = everyone in those
     # buckets, which is the historic behaviour. List the no-contact slugs to give
     # the afternoon call only to leads that were not reached.
     "second_call_dispositions": [],

@@ -29,26 +29,27 @@ export function agentsFrom(campaigns: Campaign[]): Agent[] {
 /** Sequential urgency ramp. Ordered along the runway: F1 is 45 days out
  *  (calm steel), F6 is past expiry (deep red). Never used for controls. */
 export const BUCKET_COLOR: Record<string, string> = {
-  F1: '#5a7791',
-  F2: '#7f8b93',
-  F3: '#a89478',
-  F4: '#d19a4e',
-  F5: '#e8703f',
-  F6: '#d14545',
-  M0: '#ff6b52',
-  D0: '#566a73',
+  F1: '#55779b',
+  F2: '#6f7c86',
+  F3: '#9c7c3c',
+  F4: '#c07817',
+  F5: '#dd5a26',
+  E0: '#c9401f',
+  F6: '#ab2b2b',
+  M0: '#e8452f',
+  D0: '#7c8a92',
 };
 
 export function bucketColor(b: string): string {
-  return BUCKET_COLOR[b] ?? '#566a73';
+  return BUCKET_COLOR[b] ?? BUCKET_COLOR.D0;
 }
 
-/** F5/F6/M0 get two calls a day and dial first. */
+/** F5/E0/F6/M0 get two calls a day and dial first. */
 export function isIntensive(b: string): boolean {
-  return b === 'F5' || b === 'F6' || b === 'M0';
+  return b === 'F5' || b === 'E0' || b === 'F6' || b === 'M0';
 }
 
-export const BUCKET_ORDER = ['F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'M0', 'D0'];
+export const BUCKET_ORDER = ['F1', 'F2', 'F3', 'F4', 'F5', 'E0', 'F6', 'M0', 'D0'];
 
 export const BUCKET_NOTE: Record<string, string> = {
   M0: 'Mandatory (RED-1 / RED). Overrides cadence, weekly budget and pending callbacks.',
@@ -61,6 +62,7 @@ export const BUCKET_NOTE: Record<string, string> = {
 export const BUCKET_FRIENDLY: Record<string, string> = {
   M0: 'Renewal today',
   F6: 'Grace period',
+  E0: 'Expiry window',
   F5: 'Critical week',
   F4: 'High-frequency',
   F3: 'Building urgency',
@@ -71,8 +73,9 @@ export const BUCKET_FRIENDLY: Record<string, string> = {
 
 export const BUCKET_RANGE: Record<string, string> = {
   M0: 'renewal day',
-  F6: 'past due, 1–3 days',
-  F5: '0–7 days out',
+  F6: 'past due, 2–3 days',
+  E0: 'expiry day and the day after',
+  F5: '1–7 days out',
   F4: '8–15 days',
   F3: '16–23 days',
   F2: '24–31 days',
@@ -357,6 +360,7 @@ export const RUN_STATUS_TONE: Record<string, string> = {
   planned: 'badge-accent',
   approved: 'badge-warn',
   committed: 'badge-ok',
+  paused: 'badge-warn',
   failed: 'badge-bad',
 };
 

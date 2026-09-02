@@ -27,6 +27,12 @@ Defaults: the 20 newest campaigns that have leads with a parseable RED, 5,000
 leads each, plus whichever campaign currently holds a `test_numbers` lead. Both
 caps are printed as `CAP:` lines — a truncated sync says so.
 
+Campaigns whose name contains a word like `test`, `dev`, `demo` or `killed` are
+skipped and listed on a `non-production:` line. "Newest, has leads, has a RED"
+otherwise describes a test campaign exactly, and approving one under `DRY_RUN=0`
+dials the real numbers inside it. Matching is on whole words, so `Contest_Aug`
+survives. `--force-campaigns` overrides it for a specific id.
+
 On Windows `run.bat` does all three (it seeds only if `redial.db` is missing).
 The React dev server on `http://localhost:5173` is allowed by CORS.
 
@@ -46,7 +52,7 @@ pytest                                      # 47 tests, no network, no credentia
 * `tests/test_api.py` patches `requests.post`/`Session.request` to raise and
   then drives approve and both commits, so a regression here fails the suite.
 
-Live dialling needs an explicit `DRY_RUN=0` **and** `FORMI_TOKEN` in the
+Live dialling needs an explicit `DRY_RUN=0` **and** a Formi credential in the
 environment. There is no other switch.
 
 ## Environment
@@ -56,7 +62,7 @@ environment. There is no other switch.
 | `DRY_RUN` | `1` | `0` (or `false`) enables live dialling. Anything else is a dry run. |
 | `LEADS_SOURCE` | `seed` | `seed` reads the local `leads` table — whatever `engine.sync` or `engine.seed` last put there; `metabase` re-queries the warehouse live on every plan. Test-call resolution always uses the local table. |
 | `REDIAL_DB` | `./redial.db` | SQLite path. |
-| `FORMI_TOKEN` | — | Only read on a live (`DRY_RUN=0`) write. |
+| `FORMI_API_KEY` | — | Only read on a live (`DRY_RUN=0`) write. The name the rest of the Chola tooling uses; `FORMI_TOKEN` is honoured too and wins if both are set. |
 
 ## Layout
 
@@ -67,7 +73,7 @@ api/main.py          app, CORS, {"error": ...} handlers, /api/health
 api/routes_core.py   campaigns, config, plan, buckets, runs, approve, manual
 api/routes_stage.py  bulk stage preview/commit, job history
 engine/red_engine.py vendored decision logic (whether to call) — do not edit
-engine/dispatcher.py priority, two-slot F5/F6, time rotation, load stagger
+engine/dispatcher.py priority, two-slot F5/E0/F6, time rotation, load stagger
 engine/seed.py       deterministic offline dataset + the one lead source
 engine/sync.py       pulls the real warehouse campaigns/leads into redial.db
 engine/stage_ops.py  mark_stage_by_policy / mark_stage_by_red, vendored
@@ -75,10 +81,10 @@ engine/stage_ops.py  mark_stage_by_policy / mark_stage_by_red, vendored
 
 ### Dispatcher rules
 
-1. **Priority** — sorted by `config.priority_of(bucket)` (`M0 F6 F5 F4 F3 F2 F1 D0`).
+1. **Priority** — sorted by `config.priority_of(bucket)` (`M0 E0 F6 F5 F4 F3 F2 F1 D0`).
    `max_per_run` sheds from the tail, so the leads that get dropped are the ones
    furthest from expiry. The count lands in `runs.dropped`.
-2. **Two slots** — F5/F6 (`calls_per_day == 2`) get `slot_no` 1 and 2, slot 2 at
+2. **Two slots** — F5/E0/F6 (`calls_per_day == 2`) get `slot_no` 1 and 2, slot 2 at
    least `same_day_gap_hours` later. If it will not fit before the window closes,
    slot 1 is emitted alone.
 3. **Rotation** — today's minute is `(last call's minute-of-day + shift_from_last_hours)`

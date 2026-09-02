@@ -1,57 +1,125 @@
 /* ============================================================
    Redial Console — design tokens
-   Rule of the palette: COOL is the interface, WARM is time pressure.
-   No warm hue is ever used for a control; no cool hue ever encodes
-   urgency. That split is what makes F5/F6 read instantly.
+
+   Restyled onto the Chola dashboard design language (the same move as
+   render/static/app.css in the reports repo): light lavender canvas, white
+   cards, dark rail, Plus Jakarta Sans with JetBrains Mono for every figure.
+
+   Only this block changed. Every class name and every rule below is the
+   original — the stylesheet already routed all of its colour through these
+   tokens, so re-pointing them reskins 2,200 lines without touching markup that
+   `npm run check` asserts the behaviour of.
+
+   Rule of the palette, unchanged: COOL is the interface, WARM is time pressure.
+   No warm hue is ever used for a control; no cool hue ever encodes urgency.
+   That split is what makes F5/F6 read instantly.
    ============================================================ */
 
 :root {
-  /* Surfaces — deep slate with a blue-green cast, not neutral black */
-  --bg: #0d1417;
-  --bg-deep: #090f12;
-  --surface: #121c21;
-  --raised: #18242a;
-  --raised-2: #1e2c33;
-  --line: #24343b;
-  --line-soft: #1b282e;
+  color-scheme: light;
 
-  /* Text */
-  --text: #dde7eb;
-  --text-dim: #9fb2ba;
-  --muted: #71868f;
-  --faint: #4c5f68;
+  /* Surfaces — the dashboard's paper-over-lavender, not slate */
+  --bg: #faf9fe;
+  --bg-deep: #f1f0f5;      /* was the darkest surface; now the recessed one */
+  --surface: #ffffff;
+  --raised: #ffffff;
+  --raised-2: #f4f3f8;
+  --line: #e3e2e7;
+  --line-soft: #eeedf2;
 
-  /* Interface accent — cool, never used for urgency */
-  --accent: #4fb8c9;
-  --accent-dim: #2f7e8c;
-  --accent-wash: rgba(79, 184, 201, 0.12);
-  --accent-ink: #06171b;
+  /* Text — ink descending, mirroring --ink / --ink-2 / --ink-3 */
+  --text: #1a1c1f;
+  --text-dim: #47464b;
+  --muted: #6e6c74;
+  --faint: #9c9aa3;
+
+  /* Interface accent. The dashboard's is a warm yellow, which would break the
+     cool-interface / warm-urgency split this app depends on -- a yellow button
+     next to an amber F4 chip reads as urgency. So the accent stays cool and
+     borrows the dashboard's sky tone instead, darkened enough to carry white
+     text and to pass contrast against white. */
+  --accent: #2f6f9f;
+  --accent-dim: #24587f;
+  --accent-wash: rgba(47, 111, 159, 0.10);
+  --accent-ink: #ffffff;
 
   /* Urgency ramp — sequential, cold to ember, no green detour.
-     F1 (45 days out) is calm steel; F6 (past expiry) is deep red. */
-  --b-F1: #5a7791;
-  --b-F2: #7f8b93;
-  --b-F3: #a89478;
-  --b-F4: #d19a4e;
-  --b-F5: #e8703f;
-  --b-F6: #d14545;
-  --b-M0: #ff6b52; /* overlay flag, not a runway position */
-  --b-D0: #566a73; /* off-runway on purpose */
+     F1 (45 days out) is calm steel; F6 (past expiry) is deep red. Re-cut for a
+     light canvas: the dark-theme ramp was mixed for contrast against #0d1417
+     and goes muddy on white. Kept in step with BUCKET_COLOR in lib/domain.ts,
+     which selfcheck.tsx asserts cell by cell. */
+  --b-F1: #55779b;
+  --b-F2: #6f7c86;
+  --b-F3: #9c7c3c;
+  --b-F4: #c07817;
+  --b-F5: #dd5a26;
+  --b-E0: #c9401f; /* expiry day and the day after */
+  --b-F6: #ab2b2b;
+  --b-M0: #e8452f; /* overlay flag, not a runway position */
+  --b-D0: #7c8a92; /* off-runway on purpose */
 
-  /* Status */
-  --ok: #5bbd8f;
-  --warn: #d19a4e;
-  --bad: #d14545;
-  --live: #ff6b52;
+  /* Status — the dashboard's --good / --warn / --bad */
+  --ok: #0b6e67;
+  --warn: #8a6100;
+  --bad: #ba1a1a;
+  --live: #d93d1e;
 
-  --radius: 3px;
-  --radius-lg: 5px;
+  /* Cards are round like the dashboard's; controls become full pills further
+     down. 28px on a dense table cell would be absurd, so the small radius is a
+     softened version rather than a copy. */
+  --radius: 12px;
+  --radius-lg: 24px;
+  --radius-pill: 999px;
+
+  --shadow-pop: 0 8px 40px -12px rgb(26 28 31 / 0.28);
 
   --mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
   --sans: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
 
   --rail: 212px;
   --topbar: 52px;
+}
+
+/* Controls are fully-rounded pills, the dashboard's most recognisable move.
+   Listed explicitly because --radius also dresses warn/info boxes and the
+   payload viewer, which must stay rectangles. */
+.btn,
+.input,
+.select,
+.dry-badge,
+.tog {
+  border-radius: var(--radius-pill);
+}
+
+/* The dark navigation rail against a light canvas is the other half of the
+   dashboard's look. Done by re-pointing the tokens *inside* .rail rather than
+   restyling its children: the rail's brand, agent picker, nav items and footer
+   already take every colour from these names, so eleven declarations invert the
+   whole column and nothing below this line needs to know. The accent goes to
+   the dashboard's yellow here -- on a dark rail it is unmistakably "you are on
+   this page" and can't be confused with the warm urgency ramp, which never
+   appears in the rail. */
+.rail {
+  --bg-deep: #1b1b20;
+  --bg: #26262c;
+  --surface: #26262c;
+  --raised: #33333b;
+  --raised-2: #3c3c45;
+  --line: #3c3c45;
+  --line-soft: #2c2c33;
+  --text: #f1f0f5;
+  --text-dim: #c9c7d0;
+  --muted: #9c9aa3;
+  --faint: #7b7982;
+  --accent: #f3dd6d;
+  --accent-ink: #1a1c1f;
+
+  /* The status trio is mixed for contrast against white, and the paused-agent
+     and stale-data warnings live in here. #8a6100 on #1b1b20 is unreadable, so
+     the rail gets the light-on-dark cut of the same three meanings. */
+  --ok: #7fd6c8;
+  --warn: #f0c56a;
+  --bad: #ff9e94;
 }
 
 * {
@@ -122,8 +190,8 @@ button {
 }
 
 ::selection {
-  background: var(--accent-dim);
-  color: #fff;
+  background: var(--accent-wash);
+  color: var(--text);
 }
 
 /* scrollbars */
@@ -516,8 +584,8 @@ button {
 }
 
 .btn-primary:hover:not(:disabled) {
-  background: #63c9d9;
-  border-color: #63c9d9;
+  background: var(--accent-dim);
+  border-color: var(--accent-dim);
 }
 
 /* The only warm control in the app: approving a LIVE run.
@@ -525,12 +593,12 @@ button {
 .btn-live {
   background: var(--live);
   border-color: var(--live);
-  color: #1a0703;
+  color: #ffffff;
 }
 
 .btn-live:hover:not(:disabled) {
-  background: #ff8069;
-  border-color: #ff8069;
+  background: #b8300f;
+  border-color: #b8300f;
 }
 
 .btn-ghost {
@@ -552,7 +620,7 @@ button {
 
 .btn-danger:hover:not(:disabled) {
   border-color: var(--bad);
-  color: #f0a0a0;
+  color: var(--bad);
 }
 
 .input,
@@ -645,7 +713,7 @@ input[type='datetime-local'] {
   background: rgba(209, 154, 78, 0.1);
 }
 .badge-bad {
-  color: #e88b8b;
+  color: var(--bad);
   border-color: rgba(209, 69, 69, 0.4);
   background: rgba(209, 69, 69, 0.12);
 }
@@ -1101,7 +1169,7 @@ table.xt thead th:first-child {
 }
 
 .xt-cell.is-zero {
-  color: #33434a;
+  color: #c8c5cb;
 }
 
 .xt-cell.is-manual {
@@ -1548,7 +1616,7 @@ table.xt thead th:first-child {
   border: 1px solid rgba(255, 107, 82, 0.35);
   background: rgba(255, 107, 82, 0.09);
   font-size: 12px;
-  color: #ffb9a8;
+  color: #7a1f0a;
   line-height: 1.5;
 }
 
@@ -1929,7 +1997,7 @@ button.bd-colhead:hover b {
 }
 
 .bd-cell.is-off {
-  color: #33434a;
+  color: #c8c5cb;
   background: repeating-linear-gradient(
     -45deg,
     rgba(255, 255, 255, 0.03),

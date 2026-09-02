@@ -129,8 +129,10 @@ def bulk_update(agent_id: int, lead_ids: Sequence[int], stage: str, reason: str,
         raise RuntimeError("DRY_RUN is set — refusing to POST to Formi's bulk endpoint")
 
     import requests                                   # noqa: PLC0415 — see docstring
-    from api.db import formi_token                   # noqa: PLC0415 — see docstring
+    from api.db import NO_TOKEN, formi_token          # noqa: PLC0415 — after the guard
     token = formi_token()
+    if not token:
+        raise RuntimeError(f"{NO_TOKEN}; cannot authenticate a live bulk update")
 
     ok = failed = 0
     for start in range(0, len(lead_ids), CHUNK):

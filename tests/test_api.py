@@ -8,7 +8,7 @@ import sqlite3
 import pytest
 import requests
 
-from api.db import db_path, formi_token
+from api.db import NO_TOKEN, db_path, formi_token
 
 # The seed anchors every RED to the day it was written, so bucket-sensitive
 # assertions have to ask about today.
@@ -661,8 +661,12 @@ class TestFormiToken:
         monkeypatch.setenv("FORMI_API_KEY", "from-key")
         assert formi_token() == "from-key"
 
-    def test_raises_naming_both_when_neither_is_set(self, monkeypatch):
+    def test_none_when_neither_is_set_and_the_message_names_both(self, monkeypatch):
+        # The lookup reports "nothing configured" rather than raising, so each
+        # caller can fail in its own vocabulary -- an HTTP 500 from the dial
+        # route, a RuntimeError from the bulk-stage engine. What must not vary
+        # is the name an operator is told to set.
         monkeypatch.delenv("FORMI_TOKEN", raising=False)
         monkeypatch.delenv("FORMI_API_KEY", raising=False)
-        with pytest.raises(RuntimeError, match="FORMI_API_KEY"):
-            formi_token()
+        assert formi_token() is None
+        assert "FORMI_API_KEY" in NO_TOKEN and "FORMI_TOKEN" in NO_TOKEN
