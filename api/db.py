@@ -125,6 +125,11 @@ def init_db(conn: sqlite3.Connection | None = None) -> sqlite3.Connection:
     item_columns = {r["name"] for r in conn.execute("PRAGMA table_info(plan_items)")}
     if item_columns and "phone" not in item_columns:
         conn.execute("ALTER TABLE plan_items ADD COLUMN phone TEXT")
+    campaign_columns = {r["name"] for r in conn.execute("PRAGMA table_info(campaigns)")}
+    if campaign_columns and "autopilot" not in campaign_columns:
+        conn.execute("ALTER TABLE campaigns ADD COLUMN autopilot INTEGER NOT NULL DEFAULT 0")
+    if campaign_columns and "autopilot_note" not in campaign_columns:
+        conn.execute("ALTER TABLE campaigns ADD COLUMN autopilot_note TEXT NOT NULL DEFAULT ''")
     conn.executescript(SCHEMA.read_text(encoding="utf-8"))
     conn.commit()
     return conn
@@ -156,10 +161,10 @@ def now_iso() -> str:
 DEFAULT_CONFIG: dict[str, Any] = {
     "dial_window": {"start": "09:30", "end": "19:00"},
     "frequency_table": [
-        {"bucket": "F1", "label": "Warm-up",          "from_dte": 45, "to_dte": 32, "calls_per_week": 1, "calls_per_day": 0},
+        {"bucket": "F1", "label": "Warm-up",          "from_dte": 45, "to_dte": 32, "calls_per_week": 2, "calls_per_day": 0},
         {"bucket": "F2", "label": "Early engagement", "from_dte": 31, "to_dte": 24, "calls_per_week": 2, "calls_per_day": 0},
         {"bucket": "F3", "label": "Building urgency", "from_dte": 23, "to_dte": 16, "calls_per_week": 3, "calls_per_day": 0},
-        {"bucket": "F4", "label": "High frequency",   "from_dte": 15, "to_dte": 8,  "calls_per_week": 5, "calls_per_day": 0},
+        {"bucket": "F4", "label": "High frequency",   "from_dte": 15, "to_dte": 8,  "calls_per_week": 3, "calls_per_day": 0},
         {"bucket": "F5", "label": "Critical window",  "from_dte": 7,  "to_dte": 1,  "calls_per_week": 0, "calls_per_day": 2},
         {"bucket": "E0", "label": "Expiry window",    "from_dte": 0,  "to_dte": -1, "calls_per_week": 0, "calls_per_day": 2},
         {"bucket": "F6", "label": "Grace period",     "from_dte": -2, "to_dte": -3, "calls_per_week": 0, "calls_per_day": 2},
@@ -172,10 +177,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # bucket -> slugs that bucket alone may auto-dial. Absent or empty = inherit
     # `auto_dispositions`, so {} is exactly the previous behaviour.
     "bucket_dispositions": {},
-    # Who gets the SECOND call of the day in F5/E0/F6/M0. Empty = everyone in those
-    # buckets, which is the historic behaviour. List the no-contact slugs to give
-    # the afternoon call only to leads that were not reached.
-    "second_call_dispositions": [],
+    # Who gets the SECOND call of the day in F5/E0/F6/M0. The client's rule is
+    # "2nd call only if the 1st was not answered", so this is the no-contact set:
+    # a lead who picked up this morning is not called again this afternoon.
+    # Empty would mean everyone, which is the historic (wrong) behaviour.
+    "second_call_dispositions": ["did_not_pick", "hung_up", "hung_up_no_contact",
+                                 "unreachable", "rnr",
+                                 "beep_tone_number_busy_not_reachable_switched_off",
+                                 "voicemail", "voicemail_ivr", "telephony_failed",
+                                 "dialer_nc", "new", "fresh", "not_dialed", ""],
     "mandatory_days": [1, 0],
     "calls_per_day_cap": 2,
     "same_day_gap_hours": 3.0,

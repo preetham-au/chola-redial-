@@ -2,13 +2,19 @@
 -- Nothing here is a Formi mirror: `leads` exists only so the app is explorable
 -- offline (LEADS_SOURCE=seed). With LEADS_SOURCE=metabase it stays empty.
 
+-- `autopilot` is the console's own switch and is NEVER written by a sync: the
+-- operator turns it on here and only this app, or a killed campaign, turns it
+-- off. It ends by itself when every lead is past the grace floor or in a
+-- terminal stage (api/autopilot.py).
 CREATE TABLE IF NOT EXISTS campaigns (
   id            INTEGER PRIMARY KEY,
   agent_id      INTEGER NOT NULL,
   warehouse_id  INTEGER NOT NULL,
   name          TEXT    NOT NULL,
   enabled       INTEGER NOT NULL DEFAULT 1,
-  paused        INTEGER NOT NULL DEFAULT 0
+  paused        INTEGER NOT NULL DEFAULT 0,
+  autopilot     INTEGER NOT NULL DEFAULT 0,
+  autopilot_note TEXT   NOT NULL DEFAULT ''   -- why it last stopped, or last pass
 );
 
 -- Versioned and append-only: a PUT inserts, it never updates. The current
@@ -27,7 +33,7 @@ CREATE TABLE IF NOT EXISTS runs (
   campaign_id    INTEGER NOT NULL REFERENCES campaigns(id),
   run_date       TEXT    NOT NULL,       -- YYYY-MM-DD
   kind           TEXT    NOT NULL,       -- auto | manual
-  status         TEXT    NOT NULL,       -- planned | approved | committed | failed
+  status         TEXT    NOT NULL,       -- planned | committed | paused
   config_version INTEGER NOT NULL,
   created_at     TEXT    NOT NULL,
   dry_run        INTEGER NOT NULL DEFAULT 1,

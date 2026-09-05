@@ -6,6 +6,7 @@ imports `requests` only after that check passes.
 """
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -23,11 +24,21 @@ from .routes_stage import router as stage_router
 # test that exports LEADS_SOURCE=seed is not overridden by the .env on disk.
 load_env()
 
+# After load_env(): the module reads AUTOPILOT_AM/PM at call time, but keeping
+# the import here documents the ordering the rest of this file depends on.
+from .autopilot import loop as autopilot_loop, router as autopilot_router  # noqa: E402
+
 
 @asynccontextmanager
 async def _lifespan(_app: "FastAPI"):
     init_db().close()
-    yield
+    # The autopilot's clock. Inert unless a campaign has been switched on for it,
+    # and under DRY_RUN=1 its dials are simulated like every other path here.
+    task = asyncio.create_task(autopilot_loop())
+    try:
+        yield
+    finally:
+        task.cancel()
 
 
 app = FastAPI(title="chola-redial", version="1.0", lifespan=_lifespan)
@@ -68,3 +79,4 @@ def health() -> dict[str, object]:
 
 app.include_router(core_router)
 app.include_router(stage_router)
+app.include_router(autopilot_router)

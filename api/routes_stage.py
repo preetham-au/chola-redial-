@@ -13,7 +13,7 @@ from engine.stage_ops import (
     DEFAULT_KEEP, apply_stage, bulk_update, preview_expired, preview_policies, read_policies,
 )
 
-from .db import dry_run, leads_source, now_iso, session
+from .db import dry_run, now_iso, session
 
 router = APIRouter()
 
@@ -73,31 +73,59 @@ def _public(result: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _commit(conn: sqlite3.Connection, result: dict[str, Any]) -> int:
-    """Apply the stage change. Refuses outright while DRY_RUN is set.
+def _applied(result: dict[str, Any], applied: int) -> dict[str, Any]:
+    """The commit response, with the Formi/local split spelled out."""
+    return {"applied": applied,
+            "applied_formi": result.get("applied_formi", 0),
+            "applied_local": result.get("applied_local", 0)}
 
-    With LEADS_SOURCE=seed there is no warehouse to write to, so the local
-    dataset is the target. With LEADS_SOURCE=metabase the write goes to Formi's
-    bulk endpoint, grouped by agent exactly as mark_stage_by_policy did.
+
+def _commit(conn: sqlite3.Connection, result: dict[str, Any]) -> int:
+    """Apply the stage change to FORMI. Refuses outright while DRY_RUN is set.
+
+    This used to branch on LEADS_SOURCE and, with the seed default, write the
+    new stage into the local SQLite copy instead — returning a positive count so
+    the console reported success while Formi never heard about it. That is the
+    whole of "it can't mark anything": LEADS_SOURCE says where leads are READ
+    from and has no business choosing where a write LANDS.
+
+    The one thing that must still be checked is whether these lead ids mean
+    anything to Formi. `engine.sync` makes the warehouse id the local id, so a
+    synced campaign has id == warehouse_id; `engine.seed` invents ids 1-16 with
+    a different warehouse_id. Posting a seed id would mark a stranger's lead, so
+    seed rows go to the local table and say so.
     """
     if dry_run():
         return 0
     lead_ids = result.get("lead_ids") or []
-    if leads_source() == "seed":
-        return apply_stage(conn, lead_ids, result["target_stage"])
+    if not lead_ids:
+        return 0
+
+    marks = ",".join("?" * len(lead_ids))
+    rows = conn.execute(
+        f"SELECT l.id, c.agent_id, c.id AS campaign_id, c.warehouse_id "
+        f"FROM leads l JOIN campaigns c ON c.id=l.campaign_id "
+        f"WHERE l.id IN ({marks})", lead_ids).fetchall()
 
     by_agent: dict[int, list[int]] = defaultdict(list)
-    marks = ",".join("?" * len(lead_ids)) or "NULL"
-    for row in conn.execute(
-            f"SELECT l.id, c.agent_id FROM leads l JOIN campaigns c ON c.id=l.campaign_id "
-            f"WHERE l.id IN ({marks})", lead_ids):
-        by_agent[row["agent_id"]].append(row["id"])
+    seeded: list[int] = []
+    for row in rows:
+        if row["campaign_id"] != row["warehouse_id"]:
+            seeded.append(row["id"])           # invented dataset, not a real lead
+        else:
+            by_agent[row["agent_id"]].append(row["id"])
+
+    # Reported separately, never merged into one number: a count that mixes
+    # "Formi accepted it" with "written to a local copy" is the same lie in a
+    # smaller font.
+    result["applied_local"] = apply_stage(conn, seeded, result["target_stage"]) if seeded else 0
     applied = 0
     reason = f"chola-redial console: {result['target_stage']}"
     for agent_id, ids in by_agent.items():
         ok, _failed = bulk_update(agent_id, ids, result["target_stage"], reason, dry_run=False)
         applied += ok
-    return applied
+    result["applied_formi"] = applied
+    return applied + result["applied_local"]
 
 
 @router.post("/api/stage/policies/preview")
@@ -118,7 +146,7 @@ async def policies_commit(request: Request) -> dict[str, Any]:
         applied = _commit(conn, result)
         job_id = _record(conn, "policies", "commit", result,
                          {"policies": len(policies), "target_stage": target}, applied)
-    return {**_public(result), "job_id": job_id, "dry_run": dry_run(), "applied": applied}
+    return {**_public(result), "job_id": job_id, "dry_run": dry_run(), **_applied(result, applied)}
 
 
 @router.post("/api/stage/expired/preview")
@@ -135,7 +163,7 @@ def expired_commit(body: ExpiredBody) -> dict[str, Any]:
         result = _expired(conn, body)
         applied = _commit(conn, result)
         job_id = _record(conn, "expired", "commit", result, body.model_dump(), applied)
-    return {**_public(result), "job_id": job_id, "dry_run": dry_run(), "applied": applied}
+    return {**_public(result), "job_id": job_id, "dry_run": dry_run(), **_applied(result, applied)}
 
 
 def _expired(conn: sqlite3.Connection, body: ExpiredBody) -> dict[str, Any]:

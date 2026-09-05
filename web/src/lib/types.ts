@@ -7,6 +7,12 @@ export interface Campaign {
   name: string;
   enabled: boolean;
   paused: boolean;
+  /** Switched on here and only here: the server dials this campaign's urgent
+   *  buckets twice a day until nothing is left to call. Optional so a backend
+   *  that predates it still typechecks. */
+  autopilot?: boolean;
+  /** Why it last stopped, or the result of its last pass. */
+  autopilot_note?: string;
 }
 
 /** The console is scoped to exactly one agent at a time. `paused` is true only
@@ -94,7 +100,7 @@ export interface RunCounts {
   dropped?: number;
 }
 
-export type RunStatus = 'planned' | 'approved' | 'committed' | 'failed';
+export type RunStatus = 'planned' | 'approved' | 'committed' | 'paused' | 'failed';
 
 export interface Run {
   id: number;

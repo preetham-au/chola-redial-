@@ -124,7 +124,8 @@ def _item_json(row: sqlite3.Row) -> dict[str, Any]:
 
 def _campaign_json(row: sqlite3.Row) -> dict[str, Any]:
     return {"id": row["id"], "agent_id": row["agent_id"], "warehouse_id": row["warehouse_id"],
-            "name": row["name"], "enabled": bool(row["enabled"]), "paused": bool(row["paused"])}
+            "name": row["name"], "enabled": bool(row["enabled"]), "paused": bool(row["paused"]),
+            "autopilot": bool(row["autopilot"]), "autopilot_note": row["autopilot_note"]}
 
 
 @router.get("/api/campaigns")
