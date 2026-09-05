@@ -335,6 +335,17 @@ DEFAULT_DISPOSITION_RULES: dict[str, DispositionRule] = _rules(
 # Configuration
 # ---------------------------------------------------------------------------
 
+# Dispositions that survive a mandatory day. See `RedConfig.never_dial`.
+NEVER_DIAL: tuple[str, ...] = (
+    # consent withdrawn — regulatory (TRAI/NCPR), never overridable
+    "do_not_call", "dnc", "dnd",
+    # the business outcome already happened
+    "renewed", "already_paid_to_chola",
+    # the number on file does not reach this customer
+    "wrong_number", "number_not_working", "invalid_number",
+)
+
+
 @dataclass(frozen=True)
 class RedConfig:
     """Everything a run needs, all overridable per saved strategy."""
@@ -345,6 +356,16 @@ class RedConfig:
 
     # dte values that force a call (RED−1 and RED itself).
     mandatory_days: tuple[int, ...] = (1, 0)
+
+    # The slugs a mandatory day may NOT override. The client's rule is "for all
+    # cases excluding the renewed and DND cases, calls need to be initiated on
+    # RED−1 and RED date, irrespective of the disposition status" -- so on those
+    # two days an exclusion or a hold is not a veto, it is a preference. These
+    # are the exceptions, and they are the three kinds that stay exceptions:
+    # consent withdrawn, the policy already renewed, and a number known to be
+    # wrong. Dialling one of those on RED−1 is not a last chance to save the
+    # policy, it is a complaint or a stranger's phone ringing.
+    never_dial: frozenset[str] = frozenset(NEVER_DIAL)
 
     # Hard per-calendar-day ceiling inside the intensive windows.
     calls_per_day_cap: int = 2
@@ -853,10 +874,17 @@ def decide(lead: dict[str, Any], now: datetime, config: RedConfig = DEFAULT_CONF
                         disposition_class=klass, meta=meta, **kw)
 
     # --- Priority 1: exclusions -------------------------------------------
-    if klass == EXCLUDED:
+    # On RED−1 and RED the client's rule inverts this: every case except renewed
+    # and DND is called "irrespective of the disposition status". So on those two
+    # days an exclusion or a hold no longer vetoes — only `never_dial` does.
+    # `other_language` and unmapped slugs still veto: a call an agent cannot hold,
+    # or one whose disposition we do not recognise, is not a last chance.
+    forced = (dte is not None and dte in config.mandatory_days
+              and stage not in config.never_dial)
+    if klass == EXCLUDED and not forced:
         note = rule.note if rule else ""
         return out(SKIP_EXCLUDED, f"{SKIP_EXCLUDED} ({stage}){f' — {note}' if note else ''}")
-    if klass == HOLD:
+    if klass == HOLD and not forced:
         return out(SKIP_HOLD, f"{SKIP_HOLD} ({stage}) — {rule.note if rule else 'paused'}")
     if klass == REASSIGN:
         return out(SKIP_REASSIGN, f"{SKIP_REASSIGN} ({stage}) — route to a language-capable agent")
@@ -1166,14 +1194,27 @@ def config_from_settings(settings: dict[str, Any] | None) -> RedConfig:
     if numeric:
         config = replace(config, **numeric)
 
+    raw_never = settings.get("never_dial")
+    if raw_never is not None:
+        if not isinstance(raw_never, (list, tuple, set, frozenset)):
+            raise ValueError("never_dial must be a list of disposition slugs")
+        cleaned = {str(s).strip().lower() for s in raw_never}
+        cleaned.discard("")
+        config = replace(config, never_dial=frozenset(cleaned))
+
     extra_excluded = settings.get("extra_exclusions") or []
     if extra_excluded:
         rules = dict(config.disposition_rules)
+        added: set[str] = set()
         for slug in extra_excluded:
             slug = str(slug).strip().lower()
             if slug:
                 rules[slug] = DispositionRule(slug, EXCLUDED, note="Excluded by strategy")
-        config = replace(config, disposition_rules=rules)
+                added.add(slug)
+        # An operator adding an exclusion means "stop calling these". A mandatory
+        # day must not quietly undo that, so they join `never_dial` too.
+        config = replace(config, disposition_rules=rules,
+                         never_dial=config.never_dial | added)
 
     return config
 

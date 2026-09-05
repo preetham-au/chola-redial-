@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from engine.red_engine import NEVER_DIAL
 from engine.seed import TEST_NUMBERS
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -187,6 +188,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
                                  "voicemail", "voicemail_ivr", "telephony_failed",
                                  "dialer_nc", "new", "fresh", "not_dialed", ""],
     "mandatory_days": [1, 0],
+    # The only dispositions a mandatory day (RED−1, RED) may NOT override. The
+    # client's rule is "all cases excluding the renewed and DND cases" — so on
+    # those two days everything else is called whatever its disposition says.
+    "never_dial": list(NEVER_DIAL),
     "calls_per_day_cap": 2,
     "same_day_gap_hours": 3.0,
     "shift_from_last_hours": 2.0,

@@ -412,3 +412,57 @@ def test_a_rejected_stage_write_stops_and_carries_formis_reason():
     reason = "Invalid stage. Valid stages are: renewed, did_not_pick"
     assert _why(_Resp(400, {"success": False, "message": reason})) == reason
     assert _why(_Resp(404, None)) == "HTTP 404"
+
+
+# ---------------------------------------------------------------------------
+# RED−1 and RED override the disposition
+# ---------------------------------------------------------------------------
+# The client's rule, verbatim: "For all cases excluding the renewed and DND
+# cases - calls needs to be initiated on RED - 1 and RED date - irrespective of
+# the disposition status." The exclusion ladder used to run first, so ~400
+# not_interested/lost leads and 2.7k in human_review silently lost the two days
+# that matter most.
+
+@pytest.mark.parametrize("dte", [1, 0])
+@pytest.mark.parametrize("stage", [
+    "not_interested", "lost", "firm_decision_to_discontinue",   # were EXCLUDED
+    "ai_qualified_lead", "lead_transferred_to_sales",
+    "human_review", "agent_number", "chola_field_executive",     # were HOLD
+    "requested_human_agent_connect", "alternate_contact_given",
+])
+def test_a_mandatory_day_overrides_an_exclusion_or_a_hold(stage, dte):
+    from engine.red_engine import MANDATORY_LABEL
+    decision = decide(lead(stage=stage, red=(TODAY + timedelta(days=dte)).isoformat()),
+                      NOW, DEFAULT_CONFIG)
+    assert decision.action == SCHEDULE, f"{stage} at dte={dte}: {decision.reason}"
+    assert decision.bucket == "M0" and decision.bucket_label == MANDATORY_LABEL
+
+
+@pytest.mark.parametrize("dte", [1, 0])
+@pytest.mark.parametrize("stage", [
+    "do_not_call", "dnc", "dnd",                    # consent — regulatory
+    "renewed", "already_paid_to_chola",             # already renewed
+    "wrong_number", "number_not_working", "invalid_number",   # not this customer
+])
+def test_consent_renewal_and_bad_numbers_survive_a_mandatory_day(stage, dte):
+    """The two exceptions the client named, plus numbers that reach a stranger."""
+    decision = decide(lead(stage=stage, red=(TODAY + timedelta(days=dte)).isoformat()),
+                      NOW, DEFAULT_CONFIG)
+    assert decision.action != SCHEDULE, f"{stage} at dte={dte} would be dialled"
+
+
+@pytest.mark.parametrize("stage", ["not_interested", "human_review"])
+def test_the_override_lasts_exactly_two_days(stage):
+    """RED−2 and RED+1 are ordinary days: the exclusion holds again."""
+    for dte in (2, -1):
+        decision = decide(lead(stage=stage, red=(TODAY + timedelta(days=dte)).isoformat()),
+                          NOW, DEFAULT_CONFIG)
+        assert decision.action != SCHEDULE, f"{stage} dialled at dte={dte}"
+
+
+def test_an_operator_added_exclusion_is_not_undone_by_a_mandatory_day():
+    """`extra_exclusions` means "stop calling these" — including on RED−1."""
+    config = red_config_from_body({"extra_exclusions": ["positive_followup"]})
+    decision = decide(lead(stage="positive_followup", red=(TODAY + timedelta(days=1)).isoformat()),
+                      NOW, config)
+    assert decision.action != SCHEDULE, decision.reason
