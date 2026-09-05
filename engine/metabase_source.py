@@ -92,9 +92,9 @@ CONNECTED_STAGES = ("complete", "completed")
 # scripts/reports/build_day_overview_daily.py, flattened to raw aliases. They
 # are duplicated rather than imported because that module pulls in
 # sharepoint_client at import time, which has no business loading on Render's
-# redial path. tests/test_redial_metabase_source.py asserts the two stay in
-# sync, so drift fails the suite instead of silently skewing the console
-# (test_contacted_dispositions_match_the_report and its machine twin).
+# redial path. Nothing checks the copy against the original -- this comment used
+# to claim tests/test_redial_metabase_source.py did, and that file has never
+# existed -- so drift here is silent. Compare by eye when either list moves.
 CONTACTED_DISPOSITIONS = (
     "lead_appointment_fixed", "appointment_fixed", "lead_cmrl_interested",
     "cmrl_interested", "lead_directed_to_branch", "directed_to_branch",
