@@ -204,13 +204,56 @@ DEFAULT_CONFIG: dict[str, Any] = {
 }
 
 
+# Every frequency table this app has shipped as a default and has since
+# corrected, as (bucket, from_dte, to_dte, calls_per_week, calls_per_day). Both
+# predate the client's own table: F1 once a week where the client asks twice, F4
+# five times where the client asks three, and the first has no bucket at all for
+# RED day itself. A campaign storing one of these verbatim never had it edited.
+SUPERSEDED_FREQUENCY = {
+    (("F1", 45, 32, 1, 0), ("F2", 31, 24, 2, 0), ("F3", 23, 16, 3, 0),
+     ("F4", 15, 8, 5, 0), ("F5", 7, 0, 0, 2), ("F6", -1, -3, 0, 2)),
+    (("F1", 45, 32, 1, 0), ("F2", 31, 24, 2, 0), ("F3", 23, 16, 3, 0),
+     ("F4", 15, 8, 5, 0), ("F5", 7, 1, 0, 2), ("E0", 0, -1, 0, 2),
+     ("F6", -2, -3, 0, 2)),
+}
+
+
+def _signature(table: Any) -> tuple:
+    try:
+        return tuple((str(r["bucket"]), int(r["from_dte"]), int(r["to_dte"]),
+                      int(r["calls_per_week"]), int(r["calls_per_day"])) for r in table)
+    except (TypeError, KeyError, ValueError):
+        return ()
+
+
+def with_defaults(body: dict[str, Any]) -> dict[str, Any]:
+    """A stored config body brought up to today's defaults.
+
+    A config row is a *snapshot*, not a set of overrides — a campaign keeps
+    whatever DEFAULT_CONFIG said on the day it was created. So a key added later
+    is missing for every existing campaign (`never_dial`, `second_call_dispositions`
+    were, which silently disabled the client's mandatory-day and second-call
+    rules on all 22 live campaigns), and a value corrected later stays wrong
+    there forever.
+
+    Merging the defaults underneath fixes the first. `SUPERSEDED_FREQUENCY`
+    fixes the second for the one value we can prove nobody chose, because it is
+    a verbatim copy of a default we used to ship. An operator's own table does
+    not match any of those, so it is left alone.
+    """
+    if _signature(body.get("frequency_table")) in SUPERSEDED_FREQUENCY:
+        body = {**body, "frequency_table": DEFAULT_CONFIG["frequency_table"]}
+    return {**DEFAULT_CONFIG, **body}
+
+
 def current_config(conn: sqlite3.Connection, campaign_id: int) -> dict[str, Any]:
     row = conn.execute(
         "SELECT version, created_at, body FROM config WHERE campaign_id=? "
         "ORDER BY version DESC LIMIT 1", (campaign_id,)).fetchone()
     if row is None:
         return insert_config(conn, campaign_id, DEFAULT_CONFIG)
-    return {"version": row["version"], "created_at": row["created_at"], **json.loads(row["body"])}
+    return {"version": row["version"], "created_at": row["created_at"],
+            **with_defaults(json.loads(row["body"]))}
 
 
 def insert_config(conn: sqlite3.Connection, campaign_id: int, body: dict[str, Any]) -> dict[str, Any]:

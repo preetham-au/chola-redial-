@@ -411,8 +411,14 @@ def sync(agents: Sequence[int] = tuple(AGENTS),
 
         for row in chosen:
             campaign_id = int(row["campaign_id"])
+            # A campaign is force-synced *because* of the lead we want in it —
+            # the test number, or one an operator named. Applying the RED window
+            # to it then drops that very lead and stores the campaign with zero,
+            # which is how /api/test-call/numbers came to answer "no lead on this
+            # number" for a number the sync had just gone out of its way to find.
             stored = refresh_campaign_leads(conn, campaign_id, config, schema, today=today,
-                                            max_leads=max_leads, all_leads=all_leads)
+                                            max_leads=max_leads,
+                                            all_leads=all_leads or campaign_id in always)
             with_phone = conn.execute(
                 "SELECT COUNT(*) FROM leads WHERE campaign_id=? AND phone IS NOT NULL",
                 (campaign_id,)).fetchone()[0]

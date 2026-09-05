@@ -8,7 +8,7 @@ import sqlite3
 import pytest
 import requests
 
-from api.db import NO_TOKEN, db_path, formi_token
+from api.db import DEFAULT_CONFIG, NO_TOKEN, db_path, formi_token, with_defaults
 
 # The seed anchors every RED to the day it was written, so bucket-sensitive
 # assertions have to ask about today.
@@ -716,3 +716,48 @@ class TestFormiToken:
         monkeypatch.delenv("FORMI_API_KEY", raising=False)
         assert formi_token() is None
         assert "FORMI_API_KEY" in NO_TOKEN and "FORMI_TOKEN" in NO_TOKEN
+
+
+class TestStoredConfigsTrackTheDefaults:
+    """A config row is a snapshot, so every campaign froze on the day it synced.
+
+    All 22 live campaigns were still running the pre-client frequency table (F1
+    once a week, F4 five times) with no `never_dial` and no
+    `second_call_dispositions` -- which meant the mandatory-day rule and the
+    "2nd call only if the 1st was not answered" rule were switched off
+    everywhere they mattered.
+    """
+
+    def test_a_key_added_after_the_campaign_was_created_still_reaches_it(self):
+        old = {k: v for k, v in DEFAULT_CONFIG.items()
+               if k not in ("never_dial", "second_call_dispositions")}
+        merged = with_defaults(old)
+        assert merged["never_dial"] == DEFAULT_CONFIG["never_dial"]
+        assert merged["second_call_dispositions"] == DEFAULT_CONFIG["second_call_dispositions"]
+
+    @pytest.mark.parametrize("table", [
+        # the two frequency tables this app shipped before the client's own
+        [{"bucket": "F1", "label": "Warm-up", "from_dte": 45, "to_dte": 32, "calls_per_week": 1, "calls_per_day": 0},
+         {"bucket": "F2", "label": "Early engagement", "from_dte": 31, "to_dte": 24, "calls_per_week": 2, "calls_per_day": 0},
+         {"bucket": "F3", "label": "Building urgency", "from_dte": 23, "to_dte": 16, "calls_per_week": 3, "calls_per_day": 0},
+         {"bucket": "F4", "label": "High frequency", "from_dte": 15, "to_dte": 8, "calls_per_week": 5, "calls_per_day": 0},
+         {"bucket": "F5", "label": "Critical window", "from_dte": 7, "to_dte": 0, "calls_per_week": 0, "calls_per_day": 2},
+         {"bucket": "F6", "label": "Grace period", "from_dte": -1, "to_dte": -3, "calls_per_week": 0, "calls_per_day": 2}],
+        [{"bucket": "F1", "label": "Warm-up", "from_dte": 45, "to_dte": 32, "calls_per_week": 1, "calls_per_day": 0},
+         {"bucket": "F2", "label": "Early engagement", "from_dte": 31, "to_dte": 24, "calls_per_week": 2, "calls_per_day": 0},
+         {"bucket": "F3", "label": "Building urgency", "from_dte": 23, "to_dte": 16, "calls_per_week": 3, "calls_per_day": 0},
+         {"bucket": "F4", "label": "High frequency", "from_dte": 15, "to_dte": 8, "calls_per_week": 5, "calls_per_day": 0},
+         {"bucket": "F5", "label": "Critical window", "from_dte": 7, "to_dte": 1, "calls_per_week": 0, "calls_per_day": 2},
+         {"bucket": "E0", "label": "Expiry window", "from_dte": 0, "to_dte": -1, "calls_per_week": 0, "calls_per_day": 2},
+         {"bucket": "F6", "label": "Grace period", "from_dte": -2, "to_dte": -3, "calls_per_week": 0, "calls_per_day": 2}],
+    ])
+    def test_a_superseded_default_table_is_replaced_by_the_clients(self, table):
+        merged = with_defaults({**DEFAULT_CONFIG, "frequency_table": table})
+        assert merged["frequency_table"] == DEFAULT_CONFIG["frequency_table"]
+
+    def test_an_operators_own_table_is_left_alone(self):
+        # Same shape as a shipped default but one number changed by hand: that
+        # is a choice, and a choice outranks the default it was made against.
+        mine = [dict(r) for r in DEFAULT_CONFIG["frequency_table"]]
+        mine[0]["calls_per_week"] = 4
+        assert with_defaults({**DEFAULT_CONFIG, "frequency_table": mine})["frequency_table"] == mine
