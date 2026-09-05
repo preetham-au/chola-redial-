@@ -16,7 +16,7 @@ import type { DialWindow, PlanItem } from '../lib/types';
    is "are they stacked at one time?", so the bars are absolute counts per
    15 minutes with the per-minute ceiling drawn as a reference line. */
 
-const STACK = ['M0', 'F6', 'F5', 'F4', 'F3', 'F2', 'F1', 'D0'];
+const STACK = ['M0', 'E0', 'F6', 'F5', 'F4', 'F3', 'F2', 'F1', 'D0'];
 const BIN = 15;
 
 export function DialTimeline({

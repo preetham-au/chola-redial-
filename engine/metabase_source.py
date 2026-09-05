@@ -291,7 +291,38 @@ def _three_part_sql(text: str, sep: str, year_first: bool, month_first_default: 
             f" THEN MAKE_DATE({year}, {month}, {day}) ELSE NULL END")
 
 
-def red_parse_expression(column: str = "v.red", month_first_expr: str | None = None) -> str:
+_MONTH_ABBR = ("jan", "feb", "mar", "apr", "may", "jun",
+               "jul", "aug", "sep", "oct", "nov", "dec")
+
+
+def _day_month_sql(text: str, ref: str) -> str:
+    """`dd-Mon` carrying NO year -> the occurrence nearest `ref`.
+
+    Chola's 29-Aug upload (campaigns 1703/1706) writes RED as bare '04-Sep'.
+    The year is INFERRED rather than assumed to be the current one, so a
+    '05-Jan' read in December resolves to next January instead of eleven months
+    into the past — the difference between dialling that lead and never seeing it.
+
+    The near/far test compares `mmdd` integers, not dates, because the year is
+    exactly what is not yet known — and 600 (~6 months) is the halfway point, so
+    each value lands on whichever side of `ref` it is closer to. Anything that
+    far out is outside every dial window anyway, so the fuzziness of the
+    boundary costs nothing.
+    """
+    day = f"SPLIT_PART({text}, '-', 1)::int"
+    cases = " ".join(f"WHEN '{m}' THEN {i}" for i, m in enumerate(_MONTH_ABBR, 1))
+    month = f"(CASE LOWER(LEFT(SPLIT_PART({text}, '-', 2), 3)) {cases} ELSE NULL END)"
+    delta = (f"(({month}) * 100 + {day}"
+             f" - EXTRACT(MONTH FROM {ref})::int * 100 - EXTRACT(DAY FROM {ref})::int)")
+    year = (f"(EXTRACT(YEAR FROM {ref})::int"
+            f" + CASE WHEN {delta} > 600 THEN -1 WHEN {delta} < -600 THEN 1 ELSE 0 END)")
+    return (f"CASE WHEN {month} IS NOT NULL"
+            f" AND {day} BETWEEN 1 AND {_days_in_month_sql(year, month)}"
+            f" THEN MAKE_DATE({year}, {month}, {day}) ELSE NULL END")
+
+
+def red_parse_expression(column: str = "v.red", month_first_expr: str | None = None,
+                         today: date | None = None) -> str:
     """A CASE expression that turns Chola's free-text RED into a date.
 
     Kept in lockstep with `red_engine.parse_red`, verified against every distinct
@@ -306,13 +337,20 @@ def red_parse_expression(column: str = "v.red", month_first_expr: str | None = N
                                    day-first, 4,680 prove month-first), so the
                                    >12 and renewal-month rules decide each row
       * d-Mon-yyyy                1-Sep-2026
-      * 2-digit years, and '.' as a separator
+      * d-Mon                     4-Sep -- year missing, inferred from `today`
+      * 2-digit years, '.' as a separator, and a SPACE where a named month's
+        separator should be ('02 Sep', '02 September')
 
     Anything else, and anything self-contradictory, yields NULL rather than a
     wrong date. Nothing in here can raise.
     """
     text = f"NULLIF(BTRIM(REPLACE(({column})::text, '.', '-')), '')"
     slashed = f"NULLIF(BTRIM(({column})::text), '')"
+    # Named months only. Spaces cannot be normalised in `text` because the ISO
+    # branch matches the space between date and time ('2026-09-15 00:00:00').
+    named = (f"NULLIF(REGEXP_REPLACE(BTRIM(({column})::text), "
+             f"'[[:space:].]+', '-', 'g'), '')")
+    ref = f"DATE '{today.isoformat()}'" if today else "CURRENT_DATE"
     return f"""CASE
     WHEN {column} IS NULL OR LOWER(BTRIM(({column})::text)) IN ('', 'null', 'none', 'nan', '-') THEN NULL
     -- Machine-written timestamp: always ISO. Parsed via MAKE_DATE so an
@@ -325,10 +363,10 @@ def red_parse_expression(column: str = "v.red", month_first_expr: str | None = N
     WHEN {text} ~ '^[0-9]{{1,2}}-[0-9]{{1,2}}-([0-9]{{2}}|[0-9]{{4}})$' THEN
       {_three_part_sql(text, "-", year_first=False, month_first_default=False,
                        month_first_expr=month_first_expr)}
-    WHEN {text} ~ '^[0-9]{{1,2}}-[A-Za-z]{{3,}}-[0-9]{{4}}$' THEN TO_DATE({text}, 'FMDD-Mon-YYYY')
-    -- Year-less named month (e.g. '27-Aug'): current year, matches parse_red.
-    WHEN {text} ~ '^[0-9]{{1,2}}-[A-Za-z]{{3,}}$' THEN
-      TO_DATE({text} || '-' || EXTRACT(YEAR FROM CURRENT_DATE)::text, 'FMDD-Mon-YYYY')
+    WHEN {named} ~ '^[0-9]{{1,2}}-[A-Za-z]{{3,}}-[0-9]{{4}}$' THEN TO_DATE({named}, 'FMDD-Mon-YYYY')
+    -- Year-less named month ('04-Sep', '02 Sep'): the year is inferred, never
+    -- assumed to be the current one. Matches red_engine.parse_red.
+    WHEN {named} ~ '^[0-9]{{1,2}}-[A-Za-z]{{3,}}$' THEN {_day_month_sql(named, ref)}
     WHEN {slashed} ~ '^[0-9]{{1,2}}/[0-9]{{1,2}}/([0-9]{{2}}|[0-9]{{4}})$' THEN
       {_three_part_sql(slashed, "/", year_first=False, month_first_default=False,
                        month_first_expr=month_first_expr)}
@@ -882,6 +920,7 @@ def build_leads_sql(
     stages: Sequence[str] | None = None,
     exclude_stages: Sequence[str] | None = None,
     require_red: bool = True,
+    keep_today: bool = False,
     include_queued_today: bool = True,
     limit: int = 200_000,
     after_id: int = 0,
@@ -963,7 +1002,8 @@ campaign_order AS MATERIALIZED (
          day_first_votes, month_first_votes
   FROM order_votes
 )"""
-    red_expr = red_parse_expression("v.red", month_first_expr="co.month_first")
+    red_expr = red_parse_expression("v.red", month_first_expr="co.month_first",
+                                    today=today or date.today())
 
     # A specific RED date (or RED date range) is a more direct way to express
     # "dial only the 31 Aug expiries" than converting to a dte window by hand,
@@ -975,8 +1015,9 @@ campaign_order AS MATERIALIZED (
     red_on = _blank_to_none(red_on)
     red_from = _blank_to_none(red_from)
     red_to = _blank_to_none(red_to)
+    red_cond = ""
     if red_on:
-        red_filter = f"  AND red.d = DATE '{_iso_date(red_on, 'red_on')}'\n"
+        red_cond = f"red.d = DATE '{_iso_date(red_on, 'red_on')}'"
     elif red_from or red_to:
         clauses = []
         if red_from:
@@ -985,11 +1026,17 @@ campaign_order AS MATERIALIZED (
             clauses.append(f"red.d <= DATE '{_iso_date(red_to, 'red_to')}'")
         if red_from and red_to and _iso_date(red_from, "red_from") > _iso_date(red_to, "red_to"):
             raise MetabaseError("red_from cannot be later than red_to")
-        red_filter = "  AND " + " AND ".join(clauses) + "\n"
+        red_cond = " AND ".join(clauses)
     elif require_red:
-        red_filter = f"  AND (red.d - {today_sql}) BETWEEN {int(dte_min)} AND {int(dte_max)}\n"
-    else:
-        red_filter = ""
+        red_cond = f"(red.d - {today_sql}) BETWEEN {int(dte_min)} AND {int(dte_max)}"
+
+    # A lead the main system already has on today's clock has to come back even
+    # when its RED puts it outside the window, or the local store loses the one
+    # fact that stops the console booking a second call on top of it.
+    if red_cond and keep_today:
+        red_cond = (f"({red_cond}\n       OR COALESCE(h.queued_today, 0) > 0"
+                    f"\n       OR COALESCE(h.calls_today, 0) > 0)")
+    red_filter = f"  AND {red_cond}\n" if red_cond else ""
     # NOTE: this aggregate lives inside the `history` CTE, whose FROM is
     # `scoped s` — it must reference `s`, not `i`.
     queued_select = (

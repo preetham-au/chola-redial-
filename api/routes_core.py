@@ -86,11 +86,30 @@ def _anchor(day: date, dcfg: DispatchConfig) -> datetime:
     return min(max(now_ist(), start), end)
 
 
+# Formi refuses to schedule an interaction less than five minutes out — it
+# answers 400 "Scheduled time must be at least 5 minutes from now". So "not in
+# the past" is not the real floor; this is. Slots planned or posted inside it
+# are guaranteed rejections, not calls.
+FORMI_LEAD_MINUTES = 5
+
+
+def _earliest_dialable(now: datetime) -> datetime:
+    """The first whole minute Formi will accept a schedule for.
+
+    Rounded *up*: Formi re-checks the floor against its own clock when the POST
+    lands, so truncating 16:31:40 down to 16:31 would ask for a minute that has
+    already fallen inside the five.
+    """
+    return (now + timedelta(minutes=FORMI_LEAD_MINUTES, seconds=59)
+            ).replace(second=0, microsecond=0)
+
+
 def _floor_min(now: datetime, day: date, dcfg: DispatchConfig) -> Optional[int]:
     """Earliest dialable minute-of-day, or None to mean 'the window start'."""
     if day != now_ist().date():
         return None
-    return max(dcfg.start_min, now.hour * 60 + now.minute)
+    first = _earliest_dialable(now)
+    return max(dcfg.start_min, first.hour * 60 + first.minute)
 
 
 def _configs(body: dict[str, Any]) -> tuple[RedConfig, DispatchConfig]:
@@ -124,7 +143,8 @@ def _item_json(row: sqlite3.Row) -> dict[str, Any]:
 
 def _campaign_json(row: sqlite3.Row) -> dict[str, Any]:
     return {"id": row["id"], "agent_id": row["agent_id"], "warehouse_id": row["warehouse_id"],
-            "name": row["name"], "enabled": bool(row["enabled"]), "paused": bool(row["paused"])}
+            "name": row["name"], "enabled": bool(row["enabled"]), "paused": bool(row["paused"]),
+            "autopilot": bool(row["autopilot"]), "autopilot_note": row["autopilot_note"]}
 
 
 @router.get("/api/campaigns")
@@ -546,9 +566,11 @@ def _commit(conn: sqlite3.Connection, run: sqlite3.Row, campaign: sqlite3.Row,
     # call at a time that has already gone, so they are retired here instead.
     # The rest of the run still goes out — one stale slot must not block the
     # afternoon. Re-plan to put the retired leads back on the clock.
-    # Truncated to the minute: Formi schedules by the minute, so a slot at
-    # 16:26 approved at 16:26:40 is still on time, not stale.
-    cutoff = now_ist().strftime("%Y-%m-%dT%H:%M:00")
+    # The cutoff is Formi's five-minute floor, not "now": a slot four minutes
+    # out is not dialable either, it is a 400 waiting to happen. Retiring it
+    # here puts the lead back in the next plan instead of burning it on a
+    # rejection nobody reads.
+    cutoff = _earliest_dialable(now_ist()).strftime("%Y-%m-%dT%H:%M:00")
     stale = [r for r in every if (r["scheduled_time"] or "") < cutoff]
     items = [r for r in every if (r["scheduled_time"] or "") >= cutoff]
     if stale and not items:
@@ -841,8 +863,8 @@ def _resolve_lead(conn: sqlite3.Connection, phone: str,
 
 
 def _next_slot(dcfg: DispatchConfig) -> str:
-    """The next minute inside the dial window; tomorrow's opening if it has shut."""
-    now = now_ist()
+    """The next dialable minute inside the window; tomorrow's opening if it has shut."""
+    now = _earliest_dialable(now_ist())
     day, minute = now.date(), now.hour * 60 + now.minute
     if minute < dcfg.start_min:
         minute = dcfg.start_min
@@ -857,8 +879,8 @@ def _chosen_slot(text: str, dcfg: DispatchConfig) -> str:
     A test call is still a real call to a real handset, so "pick your own time"
     cannot become a way around dialling hours or a way to post a time that has
     already gone. Any date is fine -- rehearsing tomorrow morning is legitimate.
-    Truncated to the minute: Formi schedules by the minute, so choosing 16:26 at
-    16:26:40 is on time, not late.
+    "Not in the past" is not enough: Formi refuses anything under five minutes
+    out, so a rehearsal booked for two minutes' time is a 400, not a call.
     """
     try:
         raw = text.strip().replace(" ", "T")
@@ -870,11 +892,12 @@ def _chosen_slot(text: str, dcfg: DispatchConfig) -> str:
         raise HTTPException(
             422, f"{hhmm(minute)} is outside this campaign's dial window "
                  f"{hhmm(dcfg.start_min)}-{hhmm(dcfg.end_min)}")
-    now = now_ist()
-    if parsed < now.replace(second=0, microsecond=0):
+    first = _earliest_dialable(now_ist())
+    if parsed < first:
         raise HTTPException(
-            422, f"{parsed.strftime('%Y-%m-%d %H:%M')} has already passed "
-                 f"(it is {now.strftime('%Y-%m-%d %H:%M')})")
+            422, f"{parsed.strftime('%Y-%m-%d %H:%M')} is not dialable — Formi "
+                 f"needs {FORMI_LEAD_MINUTES} minutes' notice, so the earliest is "
+                 f"{first.strftime('%Y-%m-%d %H:%M')}")
     return parsed.strftime("%Y-%m-%dT%H:%M:%S")
 
 

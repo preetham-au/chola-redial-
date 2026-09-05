@@ -3,6 +3,7 @@
 
 import type {
   Agent,
+  AutopilotStatus,
   BucketsResponse,
   Campaign,
   Config,
@@ -16,7 +17,7 @@ import type {
   TestCallResult,
   TestNumber,
 } from './types';
-import { agentsFrom, classOf, today } from './domain';
+import { agentsFrom, classOf, isIntensive, today } from './domain';
 
 /** Deterministic PRNG so counts do not jitter between renders. */
 function rng(seed: number) {
@@ -69,6 +70,14 @@ export const mockTestNumbers: TestNumber[] = [
   { phone: '9845012345', label: 'QA handset — no seeded lead', campaign_id: null, lead_uuid: null, found: false },
 ];
 
+export const mockAutopilot: AutopilotStatus = {
+  passes: [{ kind: 'auto', at: '10:00' }, { kind: 'auto_pm', at: '15:00' }],
+  urgent_buckets: ['M0', 'E0', 'F6', 'F5'],
+  review_buckets: ['F4', 'F3', 'F2', 'F1', 'D0'],
+  now: '09:00',
+  fired_today: [],
+};
+
 export const mockHealth: Health = {
   ok: true,
   dry_run: true,
@@ -83,14 +92,15 @@ export const mockConfig: Config = {
   created_at: `${D}T09:12:00`,
   dial_window: { start: '09:30', end: '19:00' },
   frequency_table: [
-    { bucket: 'F1', label: 'Warm-up', from_dte: 45, to_dte: 32, calls_per_week: 1, calls_per_day: 0 },
+    { bucket: 'F1', label: 'Warm-up', from_dte: 45, to_dte: 32, calls_per_week: 2, calls_per_day: 0 },
     { bucket: 'F2', label: 'Early engagement', from_dte: 31, to_dte: 24, calls_per_week: 2, calls_per_day: 0 },
     { bucket: 'F3', label: 'Building urgency', from_dte: 23, to_dte: 16, calls_per_week: 3, calls_per_day: 0 },
-    { bucket: 'F4', label: 'High frequency', from_dte: 15, to_dte: 8, calls_per_week: 5, calls_per_day: 0 },
-    { bucket: 'F5', label: 'Critical window', from_dte: 7, to_dte: 0, calls_per_week: 0, calls_per_day: 2 },
-    { bucket: 'F6', label: 'Grace period', from_dte: -1, to_dte: -3, calls_per_week: 0, calls_per_day: 2 },
+    { bucket: 'F4', label: 'High frequency', from_dte: 15, to_dte: 8, calls_per_week: 3, calls_per_day: 0 },
+    { bucket: 'F5', label: 'Critical window', from_dte: 7, to_dte: 1, calls_per_week: 0, calls_per_day: 2 },
+    { bucket: 'E0', label: 'Expiry window', from_dte: 0, to_dte: -1, calls_per_week: 0, calls_per_day: 2 },
+    { bucket: 'F6', label: 'Grace period', from_dte: -2, to_dte: -3, calls_per_week: 0, calls_per_day: 2 },
   ],
-  bucket_priority: ['M0', 'F6', 'F5', 'F4', 'F3', 'F2', 'F1', 'D0'],
+  bucket_priority: ['M0', 'E0', 'F6', 'F5', 'F4', 'F3', 'F2', 'F1', 'D0'],
   auto_dispositions: [
     'did_not_pick',
     'hung_up',
@@ -145,6 +155,7 @@ const BUCKET_LABEL: Record<string, string> = {
   F3: 'Building urgency',
   F4: 'High frequency',
   F5: 'Critical window',
+  E0: 'Expiry window',
   F6: 'Grace period',
   M0: 'Mandatory (RED-1 / RED)',
   D0: 'Disposition callback',
@@ -155,8 +166,9 @@ const BUCKET_DTE: Record<string, [number, number]> = {
   F2: [31, 24],
   F3: [23, 16],
   F4: [15, 8],
-  F5: [7, 0],
-  F6: [-1, -3],
+  F5: [7, 1],
+  E0: [0, -1],
+  F6: [-2, -3],
   M0: [1, 0],
   D0: [40, 2],
 };
@@ -196,6 +208,7 @@ const BUCKET_TOTALS: Record<string, number> = {
   F3: 1560,
   F4: 1420,
   F5: 1180,
+  E0: 260,
   F6: 402,
   M0: 336,
   D0: 724,
@@ -220,7 +233,7 @@ function buildMatrix() {
       if (cls === 'fresh') k = w * (b === 'F1' || b === 'F2' ? 2.2 : 0.5);
       // renewals accumulate near expiry
       if (slug === 'renewed' || slug === 'already_paid_to_chola')
-        k = w * (b === 'F5' || b === 'F6' || b === 'M0' ? 2.4 : 0.7);
+        k = w * (isIntensive(b) ? 2.4 : 0.7);
       return k * (0.75 + r() * 0.5);
     });
     const sum = weights.reduce((a, c) => a + c, 0);
@@ -235,7 +248,7 @@ function buildMatrix() {
       dispAgg[slug].total += count;
       if (auto) {
         // some of the auto-eligible pool is still inside its cadence gap
-        const waitRate = b === 'F5' || b === 'F6' || b === 'M0' ? 0.18 : 0.62;
+        const waitRate = isIntensive(b) ? 0.18 : 0.62;
         const waiting = Math.round(count * waitRate);
         bucketAgg[b].waiting += waiting;
         bucketAgg[b].eligible += count - waiting;
@@ -253,7 +266,7 @@ const M = buildMatrix();
 export const mockBuckets: BucketsResponse = {
   date: D,
   total_leads: Object.values(M.bucketAgg).reduce((a, c) => a + c.total, 0),
-  buckets: ['M0', 'F6', 'F5', 'F4', 'F3', 'F2', 'F1', 'D0'].map((b) => ({
+  buckets: ['M0', 'E0', 'F6', 'F5', 'F4', 'F3', 'F2', 'F1', 'D0'].map((b) => ({
     bucket: b,
     label: BUCKET_LABEL[b],
     ...M.bucketAgg[b],
@@ -292,7 +305,7 @@ const LAST = ['Kumar', 'Sharma', 'Iyer', 'Reddy', 'Nair', 'Patel', 'Verma', 'Men
 function buildItems(runId: number, seed: number, count: number): PlanItem[] {
   const r = rng(seed);
   const order = mockConfig.bucket_priority;
-  const share: Record<string, number> = { M0: 0.11, F6: 0.07, F5: 0.29, F4: 0.19, F3: 0.14, F2: 0.11, F1: 0.06, D0: 0.03 };
+  const share: Record<string, number> = { M0: 0.11, E0: 0.06, F6: 0.05, F5: 0.24, F4: 0.19, F3: 0.14, F2: 0.11, F1: 0.07, D0: 0.03 };
   const autoSlugs = mockConfig.auto_dispositions;
 
   const plan: Array<{ bucket: string; priority: number }> = [];
@@ -310,7 +323,7 @@ function buildItems(runId: number, seed: number, count: number): PlanItem[] {
     const slug = autoSlugs[Math.floor(r() * (autoSlugs.length - 1))];
     const [hi, lo] = BUCKET_DTE[p.bucket];
     const dte = hi === lo ? hi : lo + Math.floor(r() * (hi - lo + 1));
-    const intensive = p.bucket === 'F5' || p.bucket === 'F6' || p.bucket === 'M0';
+    const intensive = isIntensive(p.bucket);
     const slotNo = intensive && r() < 0.45 ? 2 : 1;
     // urgent buckets front-load; second slots land in the afternoon
     const base = intensive ? (slotNo === 2 ? 0.55 : 0.03) : 0.18;
@@ -560,7 +573,7 @@ export function mockManualPreview(dispositions: string[], buckets: string[]) {
     (c) => dispositions.includes(c.disposition) && buckets.includes(c.bucket),
   );
   const count = cells.reduce((a, c) => a + c.count, 0);
-  const intensive = buckets.filter((b) => b === 'F5' || b === 'F6' || b === 'M0').length > 0;
+  const intensive = buckets.filter(isIntensive).length > 0;
   const sample: ManualSample[] = mockItems(41)
     .filter((i) => buckets.includes(i.bucket))
     .slice(0, 8)

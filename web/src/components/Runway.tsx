@@ -19,8 +19,8 @@ export function Runway({
   onSelect?: (b: string | null) => void;
   metric?: 'total' | 'eligible';
 }) {
-  const span: Record<string, number> = { F1: 14, F2: 8, F3: 8, F4: 8, F5: 8, F6: 3 };
-  const onAxis = ['F1', 'F2', 'F3', 'F4', 'F5', 'F6']
+  const span: Record<string, number> = { F1: 14, F2: 8, F3: 8, F4: 8, F5: 7, E0: 2, F6: 2 };
+  const onAxis = ['F1', 'F2', 'F3', 'F4', 'F5', 'E0', 'F6']
     .map((b) => buckets.find((x) => x.bucket === b))
     .filter(Boolean) as BucketRow[];
   const offAxis = ['M0', 'D0']

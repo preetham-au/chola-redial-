@@ -15,7 +15,7 @@ import type { BucketsResponse } from '../lib/types';
    column's own bucket hue on a square-root scale against the single largest
    cell in the table, so magnitudes stay comparable across columns. */
 
-const COLS = ['F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'M0', 'D0'];
+const COLS = ['F1', 'F2', 'F3', 'F4', 'F5', 'E0', 'F6', 'M0', 'D0'];
 
 export function Crosstab({ data }: { data: BucketsResponse }) {
   const [onlyAuto, setOnlyAuto] = useState(false);

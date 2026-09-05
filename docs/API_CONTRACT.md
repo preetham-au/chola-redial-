@@ -14,20 +14,22 @@ can badge it. Only an explicit `DRY_RUN=0` in the environment enables live diall
 ```jsonc
 // Campaign
 { "id": 1, "agent_id": 125, "warehouse_id": 1650, "name": "0308Redial -PV Hindi",
-  "enabled": true, "paused": false }
+  "enabled": true, "paused": false,
+  "autopilot": false, "autopilot_note": "" }   // see Autopilot below
 
 // Config (versioned; PUT creates a new version, never mutates)
 { "version": 3, "created_at": "2026-08-28T09:12:00",
   "dial_window": { "start": "09:30", "end": "19:00" },   // clamped to 09:00-19:00
   "frequency_table": [
-    { "bucket": "F1", "label": "Warm-up",          "from_dte": 45, "to_dte": 32, "calls_per_week": 1, "calls_per_day": 0 },
+    { "bucket": "F1", "label": "Warm-up",          "from_dte": 45, "to_dte": 32, "calls_per_week": 2, "calls_per_day": 0 },
     { "bucket": "F2", "label": "Early engagement", "from_dte": 31, "to_dte": 24, "calls_per_week": 2, "calls_per_day": 0 },
     { "bucket": "F3", "label": "Building urgency", "from_dte": 23, "to_dte": 16, "calls_per_week": 3, "calls_per_day": 0 },
-    { "bucket": "F4", "label": "High frequency",   "from_dte": 15, "to_dte": 8,  "calls_per_week": 5, "calls_per_day": 0 },
-    { "bucket": "F5", "label": "Critical window",  "from_dte": 7,  "to_dte": 0,  "calls_per_week": 0, "calls_per_day": 2 },
-    { "bucket": "F6", "label": "Grace period",     "from_dte": -1, "to_dte": -3, "calls_per_week": 0, "calls_per_day": 2 }
+    { "bucket": "F4", "label": "High frequency",   "from_dte": 15, "to_dte": 8,  "calls_per_week": 3, "calls_per_day": 0 },
+    { "bucket": "F5", "label": "Critical window",  "from_dte": 7,  "to_dte": 1,  "calls_per_week": 0, "calls_per_day": 2 },
+    { "bucket": "E0", "label": "Expiry window",    "from_dte": 0,  "to_dte": -1, "calls_per_week": 0, "calls_per_day": 2 },
+    { "bucket": "F6", "label": "Grace period",     "from_dte": -2, "to_dte": -3, "calls_per_week": 0, "calls_per_day": 2 }
   ],
-  "bucket_priority": ["M0","F6","F5","F4","F3","F2","F1","D0"],
+  "bucket_priority": ["M0","E0","F6","F5","F4","F3","F2","F1","D0"],
   "auto_dispositions": ["did_not_pick","hung_up","unreachable","rnr",
                         "beep_tone_number_busy_not_reachable_switched_off",
                         "voicemail","telephony_failed","dialer_nc",
@@ -43,6 +45,16 @@ can badge it. Only an explicit `DRY_RUN=0` in the environment enables live diall
     "F1": ["did_not_pick"]
   },
   "mandatory_days": [1, 0],
+  // On a mandatory day the client's rule inverts the exclusion ladder: "for all
+  // cases excluding the renewed and DND cases, calls needs to be initiated on
+  // RED−1 and RED date, irrespective of the disposition status". So RED−1 and
+  // RED dial a `not_interested` or `human_review` lead, and `never_dial` lists
+  // the only slugs that still veto — consent, already renewed, bad number.
+  // `extra_exclusions` slugs are added to this set automatically.
+  // `other_language` and unmapped dispositions also still veto: a call no agent
+  // can hold, or one whose disposition we do not recognise, is not a last chance.
+  "never_dial": ["do_not_call","dnc","dnd","renewed","already_paid_to_chola",
+                 "wrong_number","number_not_working","invalid_number"],
   "calls_per_day_cap": 2,
   "same_day_gap_hours": 3.0,
   "shift_from_last_hours": 2.0,   // time rotation: yesterday 09:00 -> today 11:00
@@ -80,6 +92,34 @@ can badge it. Only an explicit `DRY_RUN=0` in the environment enables live diall
 | `GET` | `/api/campaigns/{id}/config` | current version |
 | `PUT` | `/api/campaigns/{id}/config` | body = config; **422** if `dial_window` outside 09:00–19:00 or `start >= end`; returns new version |
 | `GET` | `/api/campaigns/{id}/config/history` | `[{version, created_at}]` |
+| `DELETE` | `/api/campaigns/{id}` | removes the campaign with its leads, config and runs |
+
+### Autopilot
+
+Switched on per campaign; the server then runs that campaign until there is
+nothing left to call. Two passes a day, each preceded by a re-sync of that
+campaign's leads so the afternoon call only goes to leads that did not pick up.
+
+* `M0 E0 F6 F5` (RED−7 … RED+3) are planned **and dialled** unattended.
+* `F4 F3 F2 F1 D0` are planned as a `review` run and wait for `POST /api/runs/{id}/approve`.
+
+The line between the two is `URGENT` / `REVIEW_BUCKETS` in `api/autopilot.py`.
+Pass times come from `AUTOPILOT_AM` (default `10:00`) and `AUTOPILOT_PM`
+(default `15:00`), IST.
+
+It stops by itself when the campaign is paused, when it is killed in Formi, or
+when the warehouse holds no lead with a RED at or above `dte_min` (−3) whose
+stage is not terminal. A warehouse it cannot reach never counts as "finished",
+and a pass whose re-sync failed is skipped rather than run against stale leads.
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/api/autopilot` | `{passes, urgent_buckets, review_buckets, now, fired_today, campaigns[]}`. `now` is the server's IST clock as `HH:MM` — pass times are IST and the browser is not, so "has 10:00 gone by?" is only answerable here. A pass whose `at` is `<= now` and is absent from `fired_today` was missed; it fires once a day and is never retried. |
+| `POST` | `/api/campaigns/{id}/autopilot` | `{ "on": true \| false }` → the campaign; **409** if disabled |
+| `POST` | `/api/autopilot/run` | `{ "kind": "auto" \| "auto_pm", "date"? }` — fire a pass now; safe to repeat, an already-committed pass answers `already_ran` |
+
+Run kinds: `auto` (morning, dialled), `auto_pm` (afternoon, dialled), `review`
+(morning, awaiting approval), `manual`.
 
 ### Planning & review
 | Method | Path | Notes |
@@ -137,10 +177,22 @@ even if the UI asks for them. This is regulatory (TRAI/NCPR), not a preference.
 
 Both preview endpoints return `{ "would_change": N, "unchanged": N, "by_stage": {...}, "sample": [...] }`.
 
+Both commit endpoints return
+`{ "applied": N, "applied_formi": N, "applied_local": N, "rejected_formi": N, "job_id": N, "dry_run": bool }`.
+Stage writes always go to Formi regardless of `LEADS_SOURCE`; `applied_local` counts only
+seeded rows (`campaign_id != warehouse_id`), which have no lead id Formi would recognise.
+A single `applied` that mixes the two reads as success when nothing reached Formi.
+
+`applied_formi` and `rejected_formi` come from Formi's response **body**, not its status
+code. `/bulk-update-stage` answers a partially applied batch with HTTP 200 and the real
+numbers in `payload.successful_updates` / `failed_updates` — a lead belonging to another
+agent or outlet is skipped into `errors`, not rejected. Counting the 200 would report 200
+applied when 12 were.
+
 ### Agents
 
 Campaigns belong to an `agent_id` and the console is always scoped to one agent.
-Two agents are in use: **15** and **127**. Mixing their campaigns in one view is
+Two agents are in use: **125** and **127**. Mixing their campaigns in one view is
 how you dial a Hindi script at a Tamil cohort, so the agent is a first-class
 selector, not a filter chip.
 
@@ -176,6 +228,12 @@ alive before approving a real run.
   "http_status": null, "response": null }
 ```
 
+`scheduled_time` is naive IST, and it must be at least **five minutes** ahead: Formi's
+`/schedule` answers 400 "Scheduled time must be at least 5 minutes from now". The console
+holds that floor itself — planned slots inside it are retired as `expired` at approve time
+rather than posted, an omitted `scheduled_time` defaults to the first minute past the
+floor, and an operator-picked one inside it is a 422 before anything reaches the network.
+
 `preview` returns the same shape with `"status": "preview"` — it resolves and
 builds, it never dispatches and never writes to the history, so claiming
 `simulated` there would badge a no-op as an attempt. Only `trigger` yields
@@ -201,4 +259,4 @@ rehearse) but never ignores exclusions or the allow-list.
 
 ### Misc
 `GET /api/health` → `{ "ok": true, "dry_run": true, "db": "redial.db",
-"leads_source": "seed", "agents": [15, 127], "test_numbers": ["9379747274"] }`
+"leads_source": "warehouse", "agents": [125, 127], "test_numbers": ["9379747274"] }`

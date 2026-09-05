@@ -304,7 +304,7 @@ export function ConfigScreen({ focusBucket = null }: { focusBucket?: string | nu
                   className={`btn btn-sm ${second.length ? 'btn-ghost' : 'btn-primary'}`}
                   onClick={() => patch({ second_call_dispositions: [] })}
                 >
-                  Everyone in F5 / F6 / M0
+                  Everyone in F5 / E0 / F6 / M0
                 </button>
                 {[...new Set(draft.auto_dispositions)].sort().map((slug) => (
                   <button

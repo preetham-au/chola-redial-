@@ -7,6 +7,12 @@ export interface Campaign {
   name: string;
   enabled: boolean;
   paused: boolean;
+  /** Switched on here and only here: the server dials this campaign's urgent
+   *  buckets twice a day until nothing is left to call. Optional so a backend
+   *  that predates it still typechecks. */
+  autopilot?: boolean;
+  /** Why it last stopped, or the result of its last pass. */
+  autopilot_note?: string;
 }
 
 /** The console is scoped to exactly one agent at a time. `paused` is true only
@@ -49,6 +55,8 @@ export interface Config {
    *  those buckets, which is the historic behaviour. */
   second_call_dispositions?: string[];
   mandatory_days: number[];
+  /** Dispositions a mandatory day may NOT override. Absent on an older server. */
+  never_dial?: string[];
   calls_per_day_cap: number;
   same_day_gap_hours: number;
   shift_from_last_hours: number;
@@ -94,7 +102,7 @@ export interface RunCounts {
   dropped?: number;
 }
 
-export type RunStatus = 'planned' | 'approved' | 'committed' | 'failed';
+export type RunStatus = 'planned' | 'approved' | 'committed' | 'paused' | 'failed';
 
 export interface Run {
   id: number;
@@ -137,6 +145,18 @@ export interface BucketsResponse {
   dispositions: DispositionRow[];
   matrix: MatrixCell[];
   skips: Record<string, number>;
+}
+
+/** `GET /api/autopilot` — when the passes fire, and which have fired today.
+ *  A pass fires once per day; a pass whose time has gone by and is not in
+ *  `fired_today` was missed (the warehouse was down) and can be re-fired. */
+export interface AutopilotStatus {
+  passes: { kind: string; at: string }[];
+  urgent_buckets: string[];
+  review_buckets: string[];
+  /** Server clock, IST HH:MM. The pass times are IST too; the browser is not. */
+  now: string;
+  fired_today: string[];
 }
 
 export interface Health {

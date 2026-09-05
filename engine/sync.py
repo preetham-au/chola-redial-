@@ -220,14 +220,27 @@ LIMIT {ms.ROW_CAP}
 # ---------------------------------------------------------------------------
 
 def upsert_campaign(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
-    """The warehouse campaign id IS the local id — one less mapping to get wrong."""
+    """The warehouse campaign id IS the local id — one less mapping to get wrong.
+
+    `paused` is taken from the warehouse the FIRST time a campaign is seen and
+    never again: it is the console's own stop switch, and copying the warehouse
+    value on every sync meant an operator who paused a campaign here found it
+    running again after the next sync — the console could not hold a decision.
+
+    `enabled` IS still taken, because a campaign killed in Formi must leave the
+    roster, and killing it also switches the autopilot off. That is the "or i
+    delete it in the redial platform" stop, enforced where it cannot be missed.
+    """
     enabled, paused = campaign_status_flags(row.get("campaign_status"))
     campaign_id = int(row["campaign_id"])
     conn.execute(
         "INSERT INTO campaigns (id, agent_id, warehouse_id, name, enabled, paused) "
         "VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
         "agent_id=excluded.agent_id, warehouse_id=excluded.warehouse_id, "
-        "name=excluded.name, enabled=excluded.enabled, paused=excluded.paused",
+        "name=excluded.name, enabled=excluded.enabled, "
+        "autopilot=CASE WHEN excluded.enabled=0 THEN 0 ELSE campaigns.autopilot END, "
+        "autopilot_note=CASE WHEN excluded.enabled=0 AND campaigns.autopilot=1 "
+        "  THEN 'stopped: campaign killed in Formi' ELSE campaigns.autopilot_note END",
         (campaign_id, int(row["agent_id"]), campaign_id,
          str(row.get("campaign_name") or f"campaign {campaign_id}"), enabled, paused))
 
@@ -289,6 +302,43 @@ def store_leads(conn: sqlite3.Connection, campaign_id: int, leads: Iterable[dict
         ":callback_date,:appointment_date)", rows)
     conn.commit()
     return len(rows)
+
+
+def refresh_campaign_leads(conn: sqlite3.Connection, campaign_id: int,
+                           config: ms.MetabaseConfig, schema: Any,
+                           today: date | None = None, max_leads: int = DEFAULT_MAX_LEADS,
+                           all_leads: bool = False) -> int:
+    """Re-pull ONE campaign's leads into the local store. Returns rows stored.
+
+    Two reads, merged, because neither is complete on its own:
+
+      * `fetch_redial_leads` starts from `public.interactions`, so it carries the
+        cadence counters — and cannot see a lead nobody has dialled yet. On a
+        campaign uploaded this morning that is every lead.
+      * `fetch_fresh_leads` reads the lead view directly and sees everyone, but
+        reports zero history for all of them, which would reset the counters of
+        leads that HAVE been called and re-dial them today.
+
+    So history wins and fresh only fills the gaps. This used to be an either/or
+    branch on --force-campaigns, which meant an ordinary sync silently dropped
+    every never-dialled lead in a new campaign.
+
+    The RED window comes from the campaign's OWN saved strategy, not the engine
+    defaults: an operator who widened the frequency table would otherwise find
+    the leads they just asked for missing from the local store.
+    """
+    window = config_from_settings(current_config(conn, campaign_id))
+    dte_min = None if all_leads else window.dte_min
+    dte_max = None if all_leads else window.dte_max
+    leads = retry(f"leads {campaign_id}", ms.fetch_redial_leads,
+                  [campaign_id], config, schema, limit=max_leads, today=today,
+                  require_red=not all_leads, keep_today=not all_leads,
+                  dte_min=dte_min, dte_max=dte_max)
+    seen = {row.get("warehouse_lead_id") for row in leads}
+    leads = list(leads) + [row for row in fetch_fresh_leads(
+        campaign_id, config, dte_min=dte_min, dte_max=dte_max, today=today)
+        if row.get("warehouse_lead_id") not in seen]
+    return store_leads(conn, campaign_id, leads, fetch_contacts(campaign_id, config))
 
 
 # ---------------------------------------------------------------------------
@@ -361,24 +411,14 @@ def sync(agents: Sequence[int] = tuple(AGENTS),
 
         for row in chosen:
             campaign_id = int(row["campaign_id"])
-            # The window is read from the campaign's OWN saved strategy, not from
-            # the engine defaults: an operator who widened the frequency table
-            # would otherwise find the leads they just asked for missing from the
-            # local store.
-            window = config_from_settings(current_config(conn, campaign_id))
-            if campaign_id in forced_ids:
-                leads = fetch_fresh_leads(
-                    campaign_id, config, today=today,
-                    dte_min=None if all_leads else window.dte_min,
-                    dte_max=None if all_leads else window.dte_max)
-            else:
-                leads = retry(f"leads {campaign_id}", ms.fetch_redial_leads,
-                              [campaign_id], config, schema, limit=max_leads,
-                              today=today, require_red=not all_leads,
-                              keep_today=not all_leads,
-                              dte_min=window.dte_min, dte_max=window.dte_max)
-            contacts = fetch_contacts(campaign_id, config)
-            stored = store_leads(conn, campaign_id, leads, contacts)
+            # A campaign is force-synced *because* of the lead we want in it —
+            # the test number, or one an operator named. Applying the RED window
+            # to it then drops that very lead and stores the campaign with zero,
+            # which is how /api/test-call/numbers came to answer "no lead on this
+            # number" for a number the sync had just gone out of its way to find.
+            stored = refresh_campaign_leads(conn, campaign_id, config, schema, today=today,
+                                            max_leads=max_leads,
+                                            all_leads=all_leads or campaign_id in always)
             with_phone = conn.execute(
                 "SELECT COUNT(*) FROM leads WHERE campaign_id=? AND phone IS NOT NULL",
                 (campaign_id,)).fetchone()[0]

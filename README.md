@@ -60,7 +60,7 @@ environment. There is no other switch.
 | Variable | Default | Meaning |
 |---|---|---|
 | `DRY_RUN` | `1` | `0` (or `false`) enables live dialling. Anything else is a dry run. |
-| `LEADS_SOURCE` | `seed` | `seed` reads the local `leads` table — whatever `engine.sync` or `engine.seed` last put there; `metabase` re-queries the warehouse live on every plan. Test-call resolution always uses the local table. |
+| `LEADS_SOURCE` | — | **Not read.** Planning always uses the local `leads` table — whatever `engine.sync` or `engine.seed` last put there. A live per-plan warehouse re-query was documented here but never built; `engine.sync` is how leads get in. `/api/health` reports `seed` or `warehouse` by looking at the campaign ids it actually holds, so it cannot disagree with the data. |
 | `REDIAL_DB` | `./redial.db` | SQLite path. |
 | `FORMI_API_KEY` | — | Only read on a live (`DRY_RUN=0`) write. The name the rest of the Chola tooling uses; `FORMI_TOKEN` is honoured too and wins if both are set. |
 

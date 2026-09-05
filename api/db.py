@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from engine.red_engine import NEVER_DIAL
 from engine.seed import TEST_NUMBERS
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -125,6 +126,11 @@ def init_db(conn: sqlite3.Connection | None = None) -> sqlite3.Connection:
     item_columns = {r["name"] for r in conn.execute("PRAGMA table_info(plan_items)")}
     if item_columns and "phone" not in item_columns:
         conn.execute("ALTER TABLE plan_items ADD COLUMN phone TEXT")
+    campaign_columns = {r["name"] for r in conn.execute("PRAGMA table_info(campaigns)")}
+    if campaign_columns and "autopilot" not in campaign_columns:
+        conn.execute("ALTER TABLE campaigns ADD COLUMN autopilot INTEGER NOT NULL DEFAULT 0")
+    if campaign_columns and "autopilot_note" not in campaign_columns:
+        conn.execute("ALTER TABLE campaigns ADD COLUMN autopilot_note TEXT NOT NULL DEFAULT ''")
     conn.executescript(SCHEMA.read_text(encoding="utf-8"))
     conn.commit()
     return conn
@@ -156,10 +162,10 @@ def now_iso() -> str:
 DEFAULT_CONFIG: dict[str, Any] = {
     "dial_window": {"start": "09:30", "end": "19:00"},
     "frequency_table": [
-        {"bucket": "F1", "label": "Warm-up",          "from_dte": 45, "to_dte": 32, "calls_per_week": 1, "calls_per_day": 0},
+        {"bucket": "F1", "label": "Warm-up",          "from_dte": 45, "to_dte": 32, "calls_per_week": 2, "calls_per_day": 0},
         {"bucket": "F2", "label": "Early engagement", "from_dte": 31, "to_dte": 24, "calls_per_week": 2, "calls_per_day": 0},
         {"bucket": "F3", "label": "Building urgency", "from_dte": 23, "to_dte": 16, "calls_per_week": 3, "calls_per_day": 0},
-        {"bucket": "F4", "label": "High frequency",   "from_dte": 15, "to_dte": 8,  "calls_per_week": 5, "calls_per_day": 0},
+        {"bucket": "F4", "label": "High frequency",   "from_dte": 15, "to_dte": 8,  "calls_per_week": 3, "calls_per_day": 0},
         {"bucket": "F5", "label": "Critical window",  "from_dte": 7,  "to_dte": 1,  "calls_per_week": 0, "calls_per_day": 2},
         {"bucket": "E0", "label": "Expiry window",    "from_dte": 0,  "to_dte": -1, "calls_per_week": 0, "calls_per_day": 2},
         {"bucket": "F6", "label": "Grace period",     "from_dte": -2, "to_dte": -3, "calls_per_week": 0, "calls_per_day": 2},
@@ -172,11 +178,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # bucket -> slugs that bucket alone may auto-dial. Absent or empty = inherit
     # `auto_dispositions`, so {} is exactly the previous behaviour.
     "bucket_dispositions": {},
-    # Who gets the SECOND call of the day in F5/E0/F6/M0. Empty = everyone in those
-    # buckets, which is the historic behaviour. List the no-contact slugs to give
-    # the afternoon call only to leads that were not reached.
-    "second_call_dispositions": [],
+    # Who gets the SECOND call of the day in F5/E0/F6/M0. The client's rule is
+    # "2nd call only if the 1st was not answered", so this is the no-contact set:
+    # a lead who picked up this morning is not called again this afternoon.
+    # Empty would mean everyone, which is the historic (wrong) behaviour.
+    "second_call_dispositions": ["did_not_pick", "hung_up", "hung_up_no_contact",
+                                 "unreachable", "rnr",
+                                 "beep_tone_number_busy_not_reachable_switched_off",
+                                 "voicemail", "voicemail_ivr", "telephony_failed",
+                                 "dialer_nc", "new", "fresh", "not_dialed", ""],
     "mandatory_days": [1, 0],
+    # The only dispositions a mandatory day (RED−1, RED) may NOT override. The
+    # client's rule is "all cases excluding the renewed and DND cases" — so on
+    # those two days everything else is called whatever its disposition says.
+    "never_dial": list(NEVER_DIAL),
     "calls_per_day_cap": 2,
     "same_day_gap_hours": 3.0,
     "shift_from_last_hours": 2.0,
@@ -189,13 +204,56 @@ DEFAULT_CONFIG: dict[str, Any] = {
 }
 
 
+# Every frequency table this app has shipped as a default and has since
+# corrected, as (bucket, from_dte, to_dte, calls_per_week, calls_per_day). Both
+# predate the client's own table: F1 once a week where the client asks twice, F4
+# five times where the client asks three, and the first has no bucket at all for
+# RED day itself. A campaign storing one of these verbatim never had it edited.
+SUPERSEDED_FREQUENCY = {
+    (("F1", 45, 32, 1, 0), ("F2", 31, 24, 2, 0), ("F3", 23, 16, 3, 0),
+     ("F4", 15, 8, 5, 0), ("F5", 7, 0, 0, 2), ("F6", -1, -3, 0, 2)),
+    (("F1", 45, 32, 1, 0), ("F2", 31, 24, 2, 0), ("F3", 23, 16, 3, 0),
+     ("F4", 15, 8, 5, 0), ("F5", 7, 1, 0, 2), ("E0", 0, -1, 0, 2),
+     ("F6", -2, -3, 0, 2)),
+}
+
+
+def _signature(table: Any) -> tuple:
+    try:
+        return tuple((str(r["bucket"]), int(r["from_dte"]), int(r["to_dte"]),
+                      int(r["calls_per_week"]), int(r["calls_per_day"])) for r in table)
+    except (TypeError, KeyError, ValueError):
+        return ()
+
+
+def with_defaults(body: dict[str, Any]) -> dict[str, Any]:
+    """A stored config body brought up to today's defaults.
+
+    A config row is a *snapshot*, not a set of overrides — a campaign keeps
+    whatever DEFAULT_CONFIG said on the day it was created. So a key added later
+    is missing for every existing campaign (`never_dial`, `second_call_dispositions`
+    were, which silently disabled the client's mandatory-day and second-call
+    rules on all 22 live campaigns), and a value corrected later stays wrong
+    there forever.
+
+    Merging the defaults underneath fixes the first. `SUPERSEDED_FREQUENCY`
+    fixes the second for the one value we can prove nobody chose, because it is
+    a verbatim copy of a default we used to ship. An operator's own table does
+    not match any of those, so it is left alone.
+    """
+    if _signature(body.get("frequency_table")) in SUPERSEDED_FREQUENCY:
+        body = {**body, "frequency_table": DEFAULT_CONFIG["frequency_table"]}
+    return {**DEFAULT_CONFIG, **body}
+
+
 def current_config(conn: sqlite3.Connection, campaign_id: int) -> dict[str, Any]:
     row = conn.execute(
         "SELECT version, created_at, body FROM config WHERE campaign_id=? "
         "ORDER BY version DESC LIMIT 1", (campaign_id,)).fetchone()
     if row is None:
         return insert_config(conn, campaign_id, DEFAULT_CONFIG)
-    return {"version": row["version"], "created_at": row["created_at"], **json.loads(row["body"])}
+    return {"version": row["version"], "created_at": row["created_at"],
+            **with_defaults(json.loads(row["body"]))}
 
 
 def insert_config(conn: sqlite3.Connection, campaign_id: int, body: dict[str, Any]) -> dict[str, Any]:

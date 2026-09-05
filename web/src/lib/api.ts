@@ -4,6 +4,7 @@
 
 import type {
   Agent,
+  AutopilotStatus,
   BucketsResponse,
   Campaign,
   Config,
@@ -23,6 +24,7 @@ import { agentsFrom } from './domain';
 import {
   mockAgentPause,
   mockAgents,
+  mockAutopilot,
   mockBuckets,
   mockCampaigns,
   mockConfig,
@@ -52,7 +54,9 @@ export class ApiError extends Error {
 // the app is served from the domain root. Behind the tunnel it is served under
 // /redial/, so prefix with vite's base. BASE_URL is '/' in dev and '/redial/'
 // in that build; the trailing slash is stripped so we never emit '//api'.
-const API_PREFIX = import.meta.env.BASE_URL.replace(/\/$/, '');
+// Read defensively: `npm run check` bundles this to CJS, where `import.meta`
+// is empty, and a hard read there crashes the self-check before it runs.
+export const API_PREFIX = (import.meta.env?.BASE_URL ?? '/').replace(/\/$/, '');
 
 let offline = false;
 const listeners = new Set<(v: boolean) => void>();
@@ -174,6 +178,30 @@ export const api = {
       paused: false,
     })),
 
+  /** The one switch. On = the server plans and dials this campaign's urgent
+   *  buckets morning and afternoon until every policy is past the grace window. */
+  setAutopilot: (id: number, on: boolean) =>
+    req<Campaign>(`/api/campaigns/${id}/autopilot`, json({ on }), () => {
+      const c = mockCampaigns.find((x) => x.id === id) ?? mockCampaigns[0];
+      Object.assign(c, { autopilot: on, autopilot_note: on ? 'started by operator' : 'stopped by operator' });
+      return { ...c };
+    }),
+
+  /** When the passes fire and which have fired today. A pass is fired once a
+   *  day and never retried, so a missed one shows here and nowhere else. */
+  autopilotStatus: () =>
+    req<AutopilotStatus>('/api/autopilot', undefined, () => mockAutopilot),
+
+  /** Re-fire a pass the server missed. The documented recovery path -- without
+   *  it the only way back is curl. */
+  runPass: (kind: string) =>
+    req<unknown>('/api/autopilot/run', json({ kind }), () => {
+      // Every other fallback here invents a plausible read. This one would be
+      // inventing a dial that did not happen, on the one screen that exists to
+      // tell an operator a pass was missed.
+      throw new ApiError('The server is unreachable — nothing was re-run.', 503);
+    }),
+
   config: (id: number) => req<Config>(`/api/campaigns/${id}/config`, undefined, () => mockConfig),
 
   saveConfig: (id: number, cfg: Config) =>
@@ -186,7 +214,7 @@ export const api = {
   configHistory: (id: number) =>
     req<ConfigVersion[]>(`/api/campaigns/${id}/config/history`, undefined, () => mockConfigHistory),
 
-  // `buckets` empty = every schedulable bucket. Pass e.g. ['M0','F6','F5'] to put
+  // `buckets` empty = every schedulable bucket. Pass e.g. ['M0','E0','F6','F5'] to put
   // only the urgent ones on the clock for the day.
   // `window` narrows the dial hours for this run only — it never edits the config.
   plan: (id: number, date: string, buckets: string[] = [], window?: { start: string; end: string }) =>
@@ -250,6 +278,25 @@ export const api = {
         i.status = 'simulated';
       });
       return done;
+    }),
+
+  /** Take the rest of a committed run back off Formi's clock so it can be edited. */
+  pauseRun: (runId: number) =>
+    req<Run & { cancelled: number; cancel_failed: number; left_running: number }>(
+      `/api/runs/${runId}/pause`, { method: 'POST' }, () => {
+        const r = mockRuns.find((x) => x.id === runId) ?? mockRuns[0];
+        const live = mockItems(runId).filter((i) => i.status !== 'planned');
+        live.forEach((i) => { i.status = 'planned'; });
+        Object.assign(r, { status: 'paused' });
+        return { ...r, status: 'paused' as const, cancelled: live.length, cancel_failed: 0, left_running: 0 };
+      }),
+
+  resumeRun: (runId: number) =>
+    req<Run & { dry_run: boolean }>(`/api/runs/${runId}/resume`, { method: 'POST' }, () => {
+      const r = mockRuns.find((x) => x.id === runId) ?? mockRuns[0];
+      mockItems(runId).forEach((i) => { if (i.status === 'planned') i.status = 'simulated'; });
+      Object.assign(r, { status: 'committed' });
+      return { ...r, status: 'committed' as const, dry_run: true };
     }),
 
   manualPreview: (body: { campaign_id: number; dispositions: string[]; buckets: string[]; date?: string }) =>

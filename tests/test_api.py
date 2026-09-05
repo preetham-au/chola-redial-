@@ -8,7 +8,7 @@ import sqlite3
 import pytest
 import requests
 
-from api.db import NO_TOKEN, db_path, formi_token
+from api.db import DEFAULT_CONFIG, NO_TOKEN, db_path, formi_token, with_defaults
 
 # The seed anchors every RED to the day it was written, so bucket-sensitive
 # assertions have to ask about today.
@@ -170,7 +170,11 @@ def test_plan_produces_a_prioritised_non_empty_run(client):
     for item in items:
         hour = int(item["scheduled_time"][11:13])
         assert 9 <= hour <= 19
-    order = {"M0": 0, "F6": 1, "F5": 2, "F4": 3, "F3": 4, "F2": 5, "F1": 6, "D0": 7}
+    # Read from the campaign's own config rather than a copy of it, so adding a
+    # bucket to the default table does not silently make this a no-op.
+    priority = client.get("/api/campaigns/1/config").json()["bucket_priority"]
+    order = {b: i for i, b in enumerate(priority)}
+    assert "E0" in order
     assert all(item["priority"] == order[item["bucket"]] for item in items)
     # No connected lead reached an auto plan.
     assert all(item["disposition_class"] in ("dnp", "fresh") or item["bucket"] == "M0"
@@ -379,6 +383,46 @@ def test_a_lead_booked_in_formi_is_never_double_dialled(client):
         conn.close()
 
 
+def test_a_committed_run_can_be_paused_edited_and_resumed(client):
+    """Pause hands the rest of the day back as editable slots; resume re-sends it."""
+    run = _plan_today(client, 5)
+    before = client.get(f"/api/runs/{run['id']}/items?page_size=500").json()["items"]
+    if len(before) < 2:
+        pytest.skip("nothing due today in the seed")
+
+    assert client.post(f"/api/runs/{run['id']}/approve").status_code == 200
+    # Only a committed run can be paused, and only a paused one resumed.
+    assert client.post(f"/api/runs/{run['id']}/resume").status_code == 409
+
+    paused = client.post(f"/api/runs/{run['id']}/pause")
+    assert paused.status_code == 200, paused.text
+    paused = paused.json()
+    assert paused["status"] == "paused"
+    assert client.post(f"/api/runs/{run['id']}/pause").status_code == 409
+
+    items = client.get(f"/api/runs/{run['id']}/items?page_size=500").json()["items"]
+    live = [i for i in items if i["status"] == "planned"]
+    assert live, "pausing must return the un-dialled slots to planned"
+    # Everything still on the clock came back; nothing in the past was disturbed.
+    assert all(i["status"] in ("posted", "simulated", "expired")
+               for i in items if i["status"] != "planned")
+
+    # Editable while paused -- that is the whole point of pausing.
+    moved = live[-1]
+    new_time = moved["scheduled_time"][:11] + "18:45:00"
+    edit = client.patch(f"/api/runs/{run['id']}/items/{moved['id']}",
+                        json={"scheduled_time": new_time})
+    if edit.status_code == 422:
+        pytest.skip("18:45 is outside this campaign's window or already gone")
+    assert edit.status_code == 200, edit.text
+
+    done = client.post(f"/api/runs/{run['id']}/resume")
+    assert done.status_code == 200, done.text
+    assert done.json()["status"] == "committed"
+    after = client.get(f"/api/runs/{run['id']}/items?page_size=500").json()["items"]
+    assert not [i for i in after if i["status"] == "planned"]
+
+
 def test_paused_campaign_cannot_be_approved(client):
     run = client.post("/api/campaigns/2/plan", json={"date": "2026-09-02"}).json()
     client.post("/api/campaigns/2/pause")
@@ -404,7 +448,9 @@ def no_network(monkeypatch):
 
 
 def test_approve_under_dry_run_simulates_and_never_dials(client, no_network):
-    run = client.post("/api/campaigns/3/plan", json={"date": "2026-09-03"}).json()
+    # TODAY, not a fixed date: approving a run whose slots are all in the past is
+    # a 409, so a hardcoded date turns this into a failure the day after it lands.
+    run = client.post("/api/campaigns/3/plan", json={"date": TODAY}).json()
     approved = client.post(f"/api/runs/{run['id']}/approve").json()
 
     assert approved["dry_run"] is True
@@ -670,3 +716,48 @@ class TestFormiToken:
         monkeypatch.delenv("FORMI_API_KEY", raising=False)
         assert formi_token() is None
         assert "FORMI_API_KEY" in NO_TOKEN and "FORMI_TOKEN" in NO_TOKEN
+
+
+class TestStoredConfigsTrackTheDefaults:
+    """A config row is a snapshot, so every campaign froze on the day it synced.
+
+    All 22 live campaigns were still running the pre-client frequency table (F1
+    once a week, F4 five times) with no `never_dial` and no
+    `second_call_dispositions` -- which meant the mandatory-day rule and the
+    "2nd call only if the 1st was not answered" rule were switched off
+    everywhere they mattered.
+    """
+
+    def test_a_key_added_after_the_campaign_was_created_still_reaches_it(self):
+        old = {k: v for k, v in DEFAULT_CONFIG.items()
+               if k not in ("never_dial", "second_call_dispositions")}
+        merged = with_defaults(old)
+        assert merged["never_dial"] == DEFAULT_CONFIG["never_dial"]
+        assert merged["second_call_dispositions"] == DEFAULT_CONFIG["second_call_dispositions"]
+
+    @pytest.mark.parametrize("table", [
+        # the two frequency tables this app shipped before the client's own
+        [{"bucket": "F1", "label": "Warm-up", "from_dte": 45, "to_dte": 32, "calls_per_week": 1, "calls_per_day": 0},
+         {"bucket": "F2", "label": "Early engagement", "from_dte": 31, "to_dte": 24, "calls_per_week": 2, "calls_per_day": 0},
+         {"bucket": "F3", "label": "Building urgency", "from_dte": 23, "to_dte": 16, "calls_per_week": 3, "calls_per_day": 0},
+         {"bucket": "F4", "label": "High frequency", "from_dte": 15, "to_dte": 8, "calls_per_week": 5, "calls_per_day": 0},
+         {"bucket": "F5", "label": "Critical window", "from_dte": 7, "to_dte": 0, "calls_per_week": 0, "calls_per_day": 2},
+         {"bucket": "F6", "label": "Grace period", "from_dte": -1, "to_dte": -3, "calls_per_week": 0, "calls_per_day": 2}],
+        [{"bucket": "F1", "label": "Warm-up", "from_dte": 45, "to_dte": 32, "calls_per_week": 1, "calls_per_day": 0},
+         {"bucket": "F2", "label": "Early engagement", "from_dte": 31, "to_dte": 24, "calls_per_week": 2, "calls_per_day": 0},
+         {"bucket": "F3", "label": "Building urgency", "from_dte": 23, "to_dte": 16, "calls_per_week": 3, "calls_per_day": 0},
+         {"bucket": "F4", "label": "High frequency", "from_dte": 15, "to_dte": 8, "calls_per_week": 5, "calls_per_day": 0},
+         {"bucket": "F5", "label": "Critical window", "from_dte": 7, "to_dte": 1, "calls_per_week": 0, "calls_per_day": 2},
+         {"bucket": "E0", "label": "Expiry window", "from_dte": 0, "to_dte": -1, "calls_per_week": 0, "calls_per_day": 2},
+         {"bucket": "F6", "label": "Grace period", "from_dte": -2, "to_dte": -3, "calls_per_week": 0, "calls_per_day": 2}],
+    ])
+    def test_a_superseded_default_table_is_replaced_by_the_clients(self, table):
+        merged = with_defaults({**DEFAULT_CONFIG, "frequency_table": table})
+        assert merged["frequency_table"] == DEFAULT_CONFIG["frequency_table"]
+
+    def test_an_operators_own_table_is_left_alone(self):
+        # Same shape as a shipped default but one number changed by hand: that
+        # is a choice, and a choice outranks the default it was made against.
+        mine = [dict(r) for r in DEFAULT_CONFIG["frequency_table"]]
+        mine[0]["calls_per_week"] = 4
+        assert with_defaults({**DEFAULT_CONFIG, "frequency_table": mine})["frequency_table"] == mine

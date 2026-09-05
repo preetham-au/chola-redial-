@@ -6,6 +6,7 @@ imports `requests` only after that check passes.
 """
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -23,11 +24,21 @@ from .routes_stage import router as stage_router
 # test that exports LEADS_SOURCE=seed is not overridden by the .env on disk.
 load_env()
 
+# After load_env(): the module reads AUTOPILOT_AM/PM at call time, but keeping
+# the import here documents the ordering the rest of this file depends on.
+from .autopilot import loop as autopilot_loop, router as autopilot_router  # noqa: E402
+
 
 @asynccontextmanager
 async def _lifespan(_app: "FastAPI"):
     init_db().close()
-    yield
+    # The autopilot's clock. Inert unless a campaign has been switched on for it,
+    # and under DRY_RUN=1 its dials are simulated like every other path here.
+    task = asyncio.create_task(autopilot_loop())
+    try:
+        yield
+    finally:
+        task.cancel()
 
 
 app = FastAPI(title="chola-redial", version="1.0", lifespan=_lifespan)
@@ -61,10 +72,19 @@ def health() -> dict[str, object]:
     with session() as conn:
         agents = [r["agent_id"] for r in conn.execute(
             "SELECT DISTINCT agent_id FROM campaigns ORDER BY agent_id")]
+        # What is in the table, not what .env last claimed. LEADS_SOURCE is a
+        # hand-set string nobody edits after a sync, so the banner an operator
+        # checks before a live dial read "seed" over 22 real campaigns and 1848
+        # real leads. Seed ids are 1-16, warehouse ids 1400+ (`purge_campaigns`),
+        # so the data answers this without being asked.
+        row = conn.execute("SELECT COUNT(*) AS n, MAX(id) AS top FROM campaigns").fetchone()
+    source = leads_source() if not row["n"] else \
+        ("warehouse" if row["top"] >= 1000 else "seed")
     return {"ok": True, "dry_run": dry_run(), "db": Path(db_path()).name,
-            "leads_source": leads_source(), "agents": agents,
+            "leads_source": source, "agents": agents,
             "test_numbers": list(DEFAULT_CONFIG["test_numbers"])}
 
 
 app.include_router(core_router)
 app.include_router(stage_router)
+app.include_router(autopilot_router)

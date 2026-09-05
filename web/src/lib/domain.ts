@@ -417,3 +417,16 @@ export function dteLabel(dte: number): string {
   if (dte === 0) return 'expires today';
   return `${Math.abs(dte)}d past`;
 }
+
+/** Where a daily autopilot pass stands right now.
+ *
+ *  A pass fires once a day and is never retried: if the warehouse was down at
+ *  10:00 those calls simply did not go out. `missed` is the only place the
+ *  console says so. `now` must be the SERVER's IST clock — the pass times are
+ *  IST and the operator's laptop may not be. An empty `now` (server too old to
+ *  send one) reads as "waiting", which claims nothing. */
+export function passState(at: string, fired: string[], kind: string, now: string):
+  'ran' | 'missed' | 'waiting' {
+  if (fired.includes(kind)) return 'ran';
+  return now >= at && now !== '' ? 'missed' : 'waiting';
+}

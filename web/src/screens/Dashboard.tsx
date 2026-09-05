@@ -9,6 +9,7 @@ import {
   friendlyBucket,
   n,
   narrowedBuckets,
+  passState,
   RUN_STATUS_TONE,
   skipMeta,
   timeOf,
@@ -56,6 +57,8 @@ export function Dashboard() {
           </button>
         </div>
       </div>
+
+      <Autopilot />
 
       <Hero
         run={todays}
@@ -138,6 +141,120 @@ export function Dashboard() {
           }}
         />
       )}
+    </div>
+  );
+}
+
+/** The one switch that makes this campaign run itself.
+ *
+ *  On: the server re-syncs the leads and dials RED−7…RED+3 twice a day, and
+ *  leaves the calmer buckets as a plan to approve. It stops on its own when
+ *  every policy is past the grace window, and the moment the campaign is paused
+ *  or removed in Formi. Everything below this card still works by hand. */
+function Autopilot() {
+  const campaign = useCampaign();
+  const { campaigns, setCampaigns, toast } = useStore();
+  const [busy, setBusy] = useState(false);
+  if (!campaign) return null;
+
+  const on = campaign.autopilot === true;
+  const toggle = async () => {
+    setBusy(true);
+    try {
+      const next = await api.setAutopilot(campaign.id, !on);
+      setCampaigns(campaigns.map((c) => (c.id === next.id ? next : c)));
+      toast(
+        on ? 'info' : 'ok',
+        on
+          ? `Autopilot off for ${next.name}. Nothing runs unless you plan it.`
+          : `Autopilot on for ${next.name}. Urgent buckets dial themselves until the policies run out.`,
+      );
+    } catch (e) {
+      toast('bad', (e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Card
+      title="Autopilot"
+      eyebrow={on ? 'running · urgent buckets dial themselves' : 'off · everything is manual'}
+    >
+      <div className="row" style={{ gap: 14, alignItems: 'flex-start' }}>
+        <p className="hero-sub" style={{ margin: 0, flex: 1 }}>
+          {on
+            ? 'Morning and afternoon, this campaign re-syncs and dials RED−7 to RED+3 by itself. The calmer buckets are planned and wait for you. It stops when every policy is past the grace window, or when you pause it.'
+            : 'Turn this on once and this campaign keeps calling on its own until every policy expires. You still approve the calmer buckets.'}
+          {campaign.autopilot_note ? (
+            <>
+              {' '}
+              <span className="cell-dim">Last: {campaign.autopilot_note}</span>
+            </>
+          ) : null}
+        </p>
+        <button
+          className={`btn ${on ? 'btn-ghost' : 'btn-primary'}`}
+          onClick={toggle}
+          disabled={busy || !campaign.enabled}
+        >
+          {busy ? <Loader2 /> : <PlayCircle />} {on ? 'Stop autopilot' : 'Start autopilot'}
+        </button>
+      </div>
+      {on ? <Passes /> : null}
+    </Card>
+  );
+}
+
+/** The two daily passes, and the one that did not happen.
+ *
+ *  A pass fires once per day and is never retried -- if the warehouse was down
+ *  at 10:00 the morning calls simply did not go out, and nothing else in the
+ *  console says so. Until now the documented recovery was a curl command. */
+function Passes() {
+  const { toast } = useStore();
+  const status = useAsync(() => api.autopilotStatus(), []);
+  const [firing, setFiring] = useState('');
+  const passes = status.data?.passes ?? [];
+  const fired = status.data?.fired_today ?? [];
+  const now = status.data?.now ?? '';
+
+  if (!passes.length) return null;
+
+  const refire = async (kind: string) => {
+    setFiring(kind);
+    try {
+      await api.runPass(kind);
+      toast('ok', `Pass ${kind} re-run. Its urgent buckets have been dialled.`);
+      status.reload();
+    } catch (e) {
+      toast('bad', (e as Error).message);
+    } finally {
+      setFiring('');
+    }
+  };
+
+  return (
+    <div className="row" style={{ gap: 10, marginTop: 12, flexWrap: 'wrap' }}>
+      {passes.map((p) => {
+        const state = passState(p.at, fired, p.kind, now);
+        return (
+          <span key={p.kind} className="row" style={{ gap: 6 }}>
+            <span className="cell-dim">
+              {p.at} {state === 'missed' ? 'did not run' : state}
+            </span>
+            {state === 'missed' ? (
+              <button
+                className="btn btn-ghost"
+                onClick={() => refire(p.kind)}
+                disabled={firing !== ''}
+              >
+                {firing === p.kind ? <Loader2 /> : <RefreshCw />} Run it now
+              </button>
+            ) : null}
+          </span>
+        );
+      })}
     </div>
   );
 }

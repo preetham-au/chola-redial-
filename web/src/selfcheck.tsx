@@ -18,6 +18,7 @@ import {
   configurableBuckets,
   effectiveDispositions,
   narrowedBuckets,
+  passState,
 } from './lib/domain';
 import type { Config, TestCallResult } from './lib/types';
 
@@ -243,6 +244,21 @@ ok(
     `the stylesheet ramp matches BUCKET_COLOR${drifted.length ? ` (drifted: ${drifted.join(', ')})` : ''}`,
     drifted.length === 0,
   );
+}
+
+// --- autopilot pass state --------------------------------------------------
+// A pass fires once a day and is never retried, so "10:00 has gone by and it is
+// not in fired_today" is the ONLY signal that this morning's calls never went
+// out. The clock has to be the server's: the times are IST.
+{
+  const fired = ['auto'];
+  ok('a pass that fired reads as ran', passState('10:00', fired, 'auto', '16:00') === 'ran');
+  ok('a pass still ahead of the server clock is waiting',
+     passState('15:00', fired, 'auto_pm', '11:20') === 'waiting');
+  ok('a pass whose time has gone by and never fired is flagged missed',
+     passState('15:00', fired, 'auto_pm', '15:00') === 'missed');
+  ok('a server too old to send its clock claims nothing',
+     passState('15:00', fired, 'auto_pm', '') === 'waiting');
 }
 
 // --- scope leak guard (async: exercises the api layer's offline fallback) ----

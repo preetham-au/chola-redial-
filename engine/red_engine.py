@@ -169,7 +169,7 @@ class RedWindow:
 
     @property
     def intensive(self) -> bool:
-        """True for the 2-calls-per-day windows (F5/F6)."""
+        """True for the 2-calls-per-day windows (F5/E0/F6)."""
         return self.calls_per_day > 0
 
     @property
@@ -191,8 +191,12 @@ DEFAULT_FREQUENCY_TABLE: tuple[RedWindow, ...] = (
     RedWindow("F2", "Early engagement", from_dte=31, to_dte=24, calls_per_week=2),
     RedWindow("F3", "Building urgency", from_dte=23, to_dte=16, calls_per_week=3),
     RedWindow("F4", "High frequency",   from_dte=15, to_dte=8,  calls_per_week=5),
-    RedWindow("F5", "Critical window",  from_dte=7,  to_dte=0,  calls_per_day=2),
-    RedWindow("F6", "Grace period",     from_dte=-1, to_dte=-3, calls_per_day=2),
+    RedWindow("F5", "Critical window",  from_dte=7,  to_dte=1,  calls_per_day=2),
+    # Expiry day and the day after, split out of F5/F6 because it is the moment
+    # the policy actually lapses: same intensity, but its own bucket so it can
+    # carry its own disposition allow-list and be counted on its own.
+    RedWindow("E0", "Expiry window",    from_dte=0,  to_dte=-1, calls_per_day=2),
+    RedWindow("F6", "Grace period",     from_dte=-2, to_dte=-3, calls_per_day=2),
 )
 
 
@@ -331,6 +335,17 @@ DEFAULT_DISPOSITION_RULES: dict[str, DispositionRule] = _rules(
 # Configuration
 # ---------------------------------------------------------------------------
 
+# Dispositions that survive a mandatory day. See `RedConfig.never_dial`.
+NEVER_DIAL: tuple[str, ...] = (
+    # consent withdrawn — regulatory (TRAI/NCPR), never overridable
+    "do_not_call", "dnc", "dnd",
+    # the business outcome already happened
+    "renewed", "already_paid_to_chola",
+    # the number on file does not reach this customer
+    "wrong_number", "number_not_working", "invalid_number",
+)
+
+
 @dataclass(frozen=True)
 class RedConfig:
     """Everything a run needs, all overridable per saved strategy."""
@@ -341,6 +356,16 @@ class RedConfig:
 
     # dte values that force a call (RED−1 and RED itself).
     mandatory_days: tuple[int, ...] = (1, 0)
+
+    # The slugs a mandatory day may NOT override. The client's rule is "for all
+    # cases excluding the renewed and DND cases, calls need to be initiated on
+    # RED−1 and RED date, irrespective of the disposition status" -- so on those
+    # two days an exclusion or a hold is not a veto, it is a preference. These
+    # are the exceptions, and they are the three kinds that stay exceptions:
+    # consent withdrawn, the policy already renewed, and a number known to be
+    # wrong. Dialling one of those on RED−1 is not a last chance to save the
+    # policy, it is a complaint or a stranger's phone ringing.
+    never_dial: frozenset[str] = frozenset(NEVER_DIAL)
 
     # Hard per-calendar-day ceiling inside the intensive windows.
     calls_per_day_cap: int = 2
@@ -376,11 +401,12 @@ class RedConfig:
     # lead. Adding CALLBACK here restores the old auto-callback behaviour.
     auto_classes: tuple[str, ...] = (DNP, FRESH)
 
-    # Dial order, most urgent first. F6/F5 (RED-3 .. RED+7) are the critical
+    # Dial order, most urgent first. E0/F6/F5 (RED-3 .. RED+7) are the critical
     # window and are planned before anything else, so if a run is capped or the
     # dialler falls behind it is the far-from-expiry leads that get dropped,
-    # never the ones about to lapse.
-    bucket_priority: tuple[str, ...] = ("M0", "F6", "F5", "F4", "F3", "F2", "F1", "D0")
+    # never the ones about to lapse. E0 (expiry day and the day after) outranks
+    # the rest of that window: it is the last moment renewal is still routine.
+    bucket_priority: tuple[str, ...] = ("M0", "E0", "F6", "F5", "F4", "F3", "F2", "F1", "D0")
 
     # --- per-bucket disposition allow-list ----------------------------------
     # bucket -> the disposition slugs that bucket may auto-dial. A bucket absent
@@ -395,7 +421,7 @@ class RedConfig:
     bucket_dispositions: dict[str, frozenset[str]] = field(default_factory=dict)
 
     # --- who earns the SECOND call of the day -------------------------------
-    # Slugs that qualify a lead in an intensive bucket (F5/F6/M0) for its second
+    # Slugs that qualify a lead in an intensive bucket (F5/E0/F6/M0) for its second
     # daily slot. Empty = every lead in those buckets gets both, which is the
     # historic behaviour. Set it to the no-contact slugs and a lead that has
     # already been reached is called once and left alone.
@@ -453,9 +479,27 @@ DEFAULT_CONFIG = RedConfig()
 RENEWAL_MONTH_HINT = (8, 9)
 
 _MONTH_NAMES = ("%d-%b-%Y", "%d-%B-%Y")
-# ponytail: year-less named-month like "27-Aug". Meaning is obvious in-year;
-# stored raw by the warehouse for freshly-uploaded campaigns.
+# Year-less named month — the shape Chola's 29-Aug upload uses ('04-Sep').
 _MONTH_NAMES_NO_YEAR = ("%d-%b", "%d-%B")
+
+
+def _nearest_year(month: int, day: int, today: Optional[date] = None) -> Optional[date]:
+    """Resolve a year-less day/month to the occurrence nearest `today`.
+
+    Mirrors `metabase_source._day_month_sql`. Picking the current year outright
+    would read a '05-Jan' seen in December as eleven months past instead of a
+    fortnight away, and a RED in the past is a lead the engine never dials.
+    """
+    today = today or date.today()
+    best: Optional[date] = None
+    for year in (today.year - 1, today.year, today.year + 1):
+        try:
+            candidate = date(year, month, day)
+        except ValueError:
+            continue                      # 29 Feb in a non-leap year
+        if best is None or abs(candidate - today) < abs(best - today):
+            best = candidate
+    return best
 
 
 def _resolve_three_part(a: int, b: int, year: int, month_first_default: bool,
@@ -499,7 +543,8 @@ def _resolve_three_part(a: int, b: int, year: int, month_first_default: bool,
         return None
 
 
-def parse_red(value: Any, month_first: Optional[bool] = None) -> Optional[date]:
+def parse_red(value: Any, month_first: Optional[bool] = None,
+              today: Optional[date] = None) -> Optional[date]:
     """Parse Chola's free-text RED into a date, or None when unusable.
 
     Mirrors `metabase_source.red_parse_expression` exactly, verified against
@@ -512,6 +557,7 @@ def parse_red(value: Any, month_first: Optional[bool] = None) -> Optional[date]:
         8/9/2026              genuinely MIXED between campaigns, so `month_first`
                               carries that campaign's proven convention
         1-Sep-2026            named month
+        02 Sep / 4-Sep        named month, NO year -> nearest occurrence to today
         15.09.2026            '.' separator
         15/9/26               2-digit year -> 20xx
 
@@ -543,19 +589,25 @@ def parse_red(value: Any, month_first: Optional[bool] = None) -> Optional[date]:
         except ValueError:
             return None
 
-    # Named month, e.g. 1-Sep-2026.
+    # Named month, e.g. 1-Sep-2026. Read off the whole string with spaces and
+    # dots folded to '-', so '02 Sep' and '1.Sep.2026' land here too — `head` is
+    # cut at the first space and would otherwise be just the day.
+    named = re.sub(r"[\s.]+", "-", text)
     for fmt in _MONTH_NAMES:
         try:
-            return datetime.strptime(head, fmt).date()
+            return datetime.strptime(named, fmt).date()
         except (ValueError, TypeError):
             continue
-    # Year-less named month, e.g. "27-Aug" -> current year.
+    # Year-less named month, e.g. '04-Sep'. The year is INFERRED from today,
+    # never assumed to be the current one.
     for fmt in _MONTH_NAMES_NO_YEAR:
         try:
-            parsed = datetime.strptime(head, fmt).date()
-            return parsed.replace(year=date.today().year)
+            # A year is appended (2024, a leap year, so '29-Feb' still parses)
+            # because bare day/month parsing is deprecated from Python 3.15.
+            stub = datetime.strptime(f"{named}-2024", fmt + "-%Y")
         except (ValueError, TypeError):
             continue
+        return _nearest_year(stub.month, stub.day, today)
 
     # Three numeric parts. The separator decides the DEFAULT order only; the
     # >12 and renewal-month rules take precedence.
@@ -822,10 +874,17 @@ def decide(lead: dict[str, Any], now: datetime, config: RedConfig = DEFAULT_CONF
                         disposition_class=klass, meta=meta, **kw)
 
     # --- Priority 1: exclusions -------------------------------------------
-    if klass == EXCLUDED:
+    # On RED−1 and RED the client's rule inverts this: every case except renewed
+    # and DND is called "irrespective of the disposition status". So on those two
+    # days an exclusion or a hold no longer vetoes — only `never_dial` does.
+    # `other_language` and unmapped slugs still veto: a call an agent cannot hold,
+    # or one whose disposition we do not recognise, is not a last chance.
+    forced = (dte is not None and dte in config.mandatory_days
+              and stage not in config.never_dial)
+    if klass == EXCLUDED and not forced:
         note = rule.note if rule else ""
         return out(SKIP_EXCLUDED, f"{SKIP_EXCLUDED} ({stage}){f' — {note}' if note else ''}")
-    if klass == HOLD:
+    if klass == HOLD and not forced:
         return out(SKIP_HOLD, f"{SKIP_HOLD} ({stage}) — {rule.note if rule else 'paused'}")
     if klass == REASSIGN:
         return out(SKIP_REASSIGN, f"{SKIP_REASSIGN} ({stage}) — route to a language-capable agent")
@@ -929,7 +988,7 @@ def decide(lead: dict[str, Any], now: datetime, config: RedConfig = DEFAULT_CONF
     meta["calls_per_day"] = window.calls_per_day
 
     if window.intensive:
-        # F5 / F6: one call per cron pass. The 2nd call of the day is reactive —
+        # F5 / E0 / F6: one call per cron pass. The 2nd call of the day is reactive —
         # the DNP handler fires it, so we never pre-schedule it here.
         cap = min(window.calls_per_day, config.calls_per_day_cap) or 1
         if calls_today >= cap and not config.allow_second_daily_slot:
@@ -1135,14 +1194,27 @@ def config_from_settings(settings: dict[str, Any] | None) -> RedConfig:
     if numeric:
         config = replace(config, **numeric)
 
+    raw_never = settings.get("never_dial")
+    if raw_never is not None:
+        if not isinstance(raw_never, (list, tuple, set, frozenset)):
+            raise ValueError("never_dial must be a list of disposition slugs")
+        cleaned = {str(s).strip().lower() for s in raw_never}
+        cleaned.discard("")
+        config = replace(config, never_dial=frozenset(cleaned))
+
     extra_excluded = settings.get("extra_exclusions") or []
     if extra_excluded:
         rules = dict(config.disposition_rules)
+        added: set[str] = set()
         for slug in extra_excluded:
             slug = str(slug).strip().lower()
             if slug:
                 rules[slug] = DispositionRule(slug, EXCLUDED, note="Excluded by strategy")
-        config = replace(config, disposition_rules=rules)
+                added.add(slug)
+        # An operator adding an exclusion means "stop calling these". A mandatory
+        # day must not quietly undo that, so they join `never_dial` too.
+        config = replace(config, disposition_rules=rules,
+                         never_dial=config.never_dial | added)
 
     return config
 
