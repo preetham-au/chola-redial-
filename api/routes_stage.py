@@ -77,7 +77,8 @@ def _applied(result: dict[str, Any], applied: int) -> dict[str, Any]:
     """The commit response, with the Formi/local split spelled out."""
     return {"applied": applied,
             "applied_formi": result.get("applied_formi", 0),
-            "applied_local": result.get("applied_local", 0)}
+            "applied_local": result.get("applied_local", 0),
+            "rejected_formi": result.get("rejected_formi", 0)}
 
 
 def _commit(conn: sqlite3.Connection, result: dict[str, Any]) -> int:
@@ -119,12 +120,17 @@ def _commit(conn: sqlite3.Connection, result: dict[str, Any]) -> int:
     # "Formi accepted it" with "written to a local copy" is the same lie in a
     # smaller font.
     result["applied_local"] = apply_stage(conn, seeded, result["target_stage"]) if seeded else 0
-    applied = 0
+    applied = rejected = 0
     reason = f"chola-redial console: {result['target_stage']}"
     for agent_id, ids in by_agent.items():
-        ok, _failed = bulk_update(agent_id, ids, result["target_stage"], reason, dry_run=False)
+        ok, failed = bulk_update(agent_id, ids, result["target_stage"], reason, dry_run=False)
         applied += ok
+        rejected += failed
     result["applied_formi"] = applied
+    # Formi accepts a batch (HTTP 200) while skipping the leads inside it that
+    # belong to another agent or outlet. Those skips are reported, not swallowed:
+    # a commit that changed nothing must not read like one that changed everything.
+    result["rejected_formi"] = rejected
     return applied + result["applied_local"]
 
 

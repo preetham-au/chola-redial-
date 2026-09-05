@@ -167,10 +167,17 @@ even if the UI asks for them. This is regulatory (TRAI/NCPR), not a preference.
 
 Both preview endpoints return `{ "would_change": N, "unchanged": N, "by_stage": {...}, "sample": [...] }`.
 
-Both commit endpoints return `{ "applied": N, "applied_formi": N, "applied_local": N, "job_id": N, "dry_run": bool }`.
+Both commit endpoints return
+`{ "applied": N, "applied_formi": N, "applied_local": N, "rejected_formi": N, "job_id": N, "dry_run": bool }`.
 Stage writes always go to Formi regardless of `LEADS_SOURCE`; `applied_local` counts only
 seeded rows (`campaign_id != warehouse_id`), which have no lead id Formi would recognise.
 A single `applied` that mixes the two reads as success when nothing reached Formi.
+
+`applied_formi` and `rejected_formi` come from Formi's response **body**, not its status
+code. `/bulk-update-stage` answers a partially applied batch with HTTP 200 and the real
+numbers in `payload.successful_updates` / `failed_updates` — a lead belonging to another
+agent or outlet is skipped into `errors`, not rejected. Counting the 200 would report 200
+applied when 12 were.
 
 ### Agents
 
@@ -210,6 +217,12 @@ alive before approving a real run.
   "status": "simulated",        // simulated | posted | failed | not_found
   "http_status": null, "response": null }
 ```
+
+`scheduled_time` is naive IST, and it must be at least **five minutes** ahead: Formi's
+`/schedule` answers 400 "Scheduled time must be at least 5 minutes from now". The console
+holds that floor itself — planned slots inside it are retired as `expired` at approve time
+rather than posted, an omitted `scheduled_time` defaults to the first minute past the
+floor, and an operator-picked one inside it is a 422 before anything reaches the network.
 
 `preview` returns the same shape with `"status": "preview"` — it resolves and
 builds, it never dispatches and never writes to the history, so claiming

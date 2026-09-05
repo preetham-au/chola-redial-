@@ -23,7 +23,7 @@ from typing import Any, Iterable, Sequence
 from .red_engine import parse_red
 
 __all__ = ["DEFAULT_KEEP", "BULK_URL", "CHUNK", "read_policies", "preview_policies",
-           "preview_expired", "apply_stage", "bulk_update"]
+           "preview_expired", "apply_stage", "batch_counts", "bulk_update"]
 
 BULK_URL = "https://api.formi.co.in/v2/campaign/leads/{agent_id}/bulk-update-stage"
 CHUNK = 200
@@ -118,6 +118,26 @@ def apply_stage(conn: sqlite3.Connection, lead_ids: Sequence[int], target_stage:
     return cur.rowcount
 
 
+def batch_counts(response: Any, size: int) -> tuple[int, int]:
+    """(ok, failed) for one bulk-update batch, read from the body — not the status.
+
+    Formi answers a *partially* applied batch with HTTP 200 and
+    `payload.successful_updates` / `failed_updates`: a lead on another agent or
+    outlet is skipped and merely listed under `errors`. Trusting the 200 counts
+    those skips as applied, which is the same silent success the seed-source bug
+    produced. A 200 whose body we cannot read is not evidence of anything, so it
+    counts as failed.
+    """
+    if response.status_code != 200:
+        return 0, size
+    try:
+        body = response.json().get("payload") or {}
+        ok = int(body["successful_updates"])
+    except Exception:
+        return 0, size
+    return ok, size - ok
+
+
 def bulk_update(agent_id: int, lead_ids: Sequence[int], stage: str, reason: str,
                 dry_run: bool = True) -> tuple[int, int]:
     """POST to Formi in chunks of 200. Returns (ok, failed).
@@ -143,8 +163,7 @@ def bulk_update(agent_id: int, lead_ids: Sequence[int], stage: str, reason: str,
             json={"lead_ids": batch, "stage": stage, "reason": reason},
             timeout=120,
         )
-        if response.status_code == 200:
-            ok += len(batch)
-        else:
-            failed += len(batch)
+        applied, missed = batch_counts(response, len(batch))
+        ok += applied
+        failed += missed
     return ok, failed

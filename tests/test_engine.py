@@ -329,3 +329,74 @@ def test_a_missing_name_is_not_treated_as_a_test_campaign():
     from engine.sync import is_production_campaign
     assert is_production_campaign(None)
     assert is_production_campaign("")
+
+
+# ---------------------------------------------------------------------------
+# What counts as an applied stage write
+# ---------------------------------------------------------------------------
+# Formi's /bulk-update-stage answers a partially applied batch with HTTP 200 and
+# the real numbers in the body: a lead belonging to another agent or outlet is
+# skipped into `errors`. Counting the 200 as "all 200 applied" is the same
+# silent success the seed-source bug produced, one layer down.
+
+class _Resp:
+    def __init__(self, status, body=None):
+        self.status_code, self._body = status, body
+
+    def json(self):
+        if self._body is None:
+            raise ValueError("not json")
+        return self._body
+
+
+def test_a_partially_applied_batch_is_not_counted_as_fully_applied():
+    from engine.stage_ops import batch_counts
+    body = {"success": True, "payload": {"total_requested": 200,
+                                         "successful_updates": 12,
+                                         "failed_updates": 188}}
+    assert batch_counts(_Resp(200, body), 200) == (12, 188)
+
+
+def test_a_fully_applied_batch_counts_every_lead():
+    from engine.stage_ops import batch_counts
+    body = {"success": True, "payload": {"successful_updates": 200, "failed_updates": 0}}
+    assert batch_counts(_Resp(200, body), 200) == (200, 0)
+
+
+@pytest.mark.parametrize("response", [
+    _Resp(400, {"success": False, "message": "Invalid stage"}),
+    _Resp(404, {"success": False, "message": "Agent not found"}),
+    _Resp(200, None),                              # 200, unreadable body
+    _Resp(200, {"success": True}),                 # 200, no payload at all
+    _Resp(200, {"payload": {"failed_updates": 3}}),  # 200, no count we can use
+])
+def test_anything_we_cannot_read_as_applied_is_failed(response):
+    """A 200 we cannot parse is not evidence of a write. Never assume success."""
+    from engine.stage_ops import batch_counts
+    assert batch_counts(response, 200) == (0, 200)
+
+
+# ---------------------------------------------------------------------------
+# Formi's five-minute notice
+# ---------------------------------------------------------------------------
+# /schedule answers 400 "Scheduled time must be at least 5 minutes from now".
+# Planning or posting inside that window is a guaranteed rejection, so the
+# console's floor has to be Formi's floor, not "later than now".
+
+@pytest.mark.parametrize("now, expected", [
+    ("2026-09-05T10:00:00", "2026-09-05T10:05:00"),   # exact minute, no rounding
+    ("2026-09-05T10:00:01", "2026-09-05T10:06:00"),   # any second rounds *up*
+    ("2026-09-05T10:26:40", "2026-09-05T10:32:00"),
+    ("2026-09-05T23:58:00", "2026-09-06T00:03:00"),   # crosses midnight
+])
+def test_the_earliest_dialable_minute_clears_formis_floor(now, expected):
+    from datetime import datetime, timedelta
+    from api.routes_core import FORMI_LEAD_MINUTES, _earliest_dialable
+
+    start = datetime.fromisoformat(now)
+    first = _earliest_dialable(start)
+    assert first.isoformat() == expected
+    # The property that matters: Formi rejects `scheduled < now + 5min`, and it
+    # re-checks against its own clock when the POST lands, so never round down.
+    assert first >= start + timedelta(minutes=FORMI_LEAD_MINUTES)
+    assert first.second == 0
