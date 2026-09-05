@@ -3,6 +3,7 @@
 
 import type {
   Agent,
+  AutopilotStatus,
   BucketsResponse,
   Campaign,
   Config,
@@ -69,6 +70,14 @@ export const mockTestNumbers: TestNumber[] = [
   { phone: '9845012345', label: 'QA handset — no seeded lead', campaign_id: null, lead_uuid: null, found: false },
 ];
 
+export const mockAutopilot: AutopilotStatus = {
+  passes: [{ kind: 'auto', at: '10:00' }, { kind: 'auto_pm', at: '15:00' }],
+  urgent_buckets: ['M0', 'E0', 'F6', 'F5'],
+  review_buckets: ['F4', 'F3', 'F2', 'F1', 'D0'],
+  now: '09:00',
+  fired_today: [],
+};
+
 export const mockHealth: Health = {
   ok: true,
   dry_run: true,
@@ -83,13 +92,13 @@ export const mockConfig: Config = {
   created_at: `${D}T09:12:00`,
   dial_window: { start: '09:30', end: '19:00' },
   frequency_table: [
-    { bucket: 'F1', label: 'Warm-up', from_dte: 45, to_dte: 32, calls_per_week: 1, calls_per_day: 0 },
+    { bucket: 'F1', label: 'Warm-up', from_dte: 45, to_dte: 32, calls_per_week: 2, calls_per_day: 0 },
     { bucket: 'F2', label: 'Early engagement', from_dte: 31, to_dte: 24, calls_per_week: 2, calls_per_day: 0 },
     { bucket: 'F3', label: 'Building urgency', from_dte: 23, to_dte: 16, calls_per_week: 3, calls_per_day: 0 },
-    { bucket: 'F4', label: 'High frequency', from_dte: 15, to_dte: 8, calls_per_week: 5, calls_per_day: 0 },
+    { bucket: 'F4', label: 'High frequency', from_dte: 15, to_dte: 8, calls_per_week: 3, calls_per_day: 0 },
     { bucket: 'F5', label: 'Critical window', from_dte: 7, to_dte: 1, calls_per_week: 0, calls_per_day: 2 },
     { bucket: 'E0', label: 'Expiry window', from_dte: 0, to_dte: -1, calls_per_week: 0, calls_per_day: 2 },
-    { bucket: 'F6', label: 'Grace period', from_dte: -1, to_dte: -3, calls_per_week: 0, calls_per_day: 2 },
+    { bucket: 'F6', label: 'Grace period', from_dte: -2, to_dte: -3, calls_per_week: 0, calls_per_day: 2 },
   ],
   bucket_priority: ['M0', 'E0', 'F6', 'F5', 'F4', 'F3', 'F2', 'F1', 'D0'],
   auto_dispositions: [
@@ -159,7 +168,7 @@ const BUCKET_DTE: Record<string, [number, number]> = {
   F4: [15, 8],
   F5: [7, 1],
   E0: [0, -1],
-  F6: [-1, -3],
+  F6: [-2, -3],
   M0: [1, 0],
   D0: [40, 2],
 };

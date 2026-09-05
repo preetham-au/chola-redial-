@@ -236,6 +236,9 @@ def autopilot_status() -> dict[str, Any]:
         rows = conn.execute("SELECT * FROM campaigns ORDER BY id").fetchall()
     return {"passes": [{"kind": k, "at": at} for k, at in pass_times()],
             "urgent_buckets": list(URGENT), "review_buckets": list(REVIEW_BUCKETS),
+            # Pass times are IST and the browser is on whatever the operator's
+            # laptop says, so "has 10:00 gone by?" is only answerable here.
+            "now": now_ist().strftime("%H:%M"),
             "fired_today": sorted(k for d, k in _fired if d == now_ist().date()),
             "campaigns": [_campaign_json(r) for r in rows if r["autopilot"]]}
 

@@ -9,6 +9,7 @@ import {
   friendlyBucket,
   n,
   narrowedBuckets,
+  passState,
   RUN_STATUS_TONE,
   skipMeta,
   timeOf,
@@ -200,7 +201,61 @@ function Autopilot() {
           {busy ? <Loader2 /> : <PlayCircle />} {on ? 'Stop autopilot' : 'Start autopilot'}
         </button>
       </div>
+      {on ? <Passes /> : null}
     </Card>
+  );
+}
+
+/** The two daily passes, and the one that did not happen.
+ *
+ *  A pass fires once per day and is never retried -- if the warehouse was down
+ *  at 10:00 the morning calls simply did not go out, and nothing else in the
+ *  console says so. Until now the documented recovery was a curl command. */
+function Passes() {
+  const { toast } = useStore();
+  const status = useAsync(() => api.autopilotStatus(), []);
+  const [firing, setFiring] = useState('');
+  const passes = status.data?.passes ?? [];
+  const fired = status.data?.fired_today ?? [];
+  const now = status.data?.now ?? '';
+
+  if (!passes.length) return null;
+
+  const refire = async (kind: string) => {
+    setFiring(kind);
+    try {
+      await api.runPass(kind);
+      toast('ok', `Pass ${kind} re-run. Its urgent buckets have been dialled.`);
+      status.reload();
+    } catch (e) {
+      toast('bad', (e as Error).message);
+    } finally {
+      setFiring('');
+    }
+  };
+
+  return (
+    <div className="row" style={{ gap: 10, marginTop: 12, flexWrap: 'wrap' }}>
+      {passes.map((p) => {
+        const state = passState(p.at, fired, p.kind, now);
+        return (
+          <span key={p.kind} className="row" style={{ gap: 6 }}>
+            <span className="cell-dim">
+              {p.at} {state === 'missed' ? 'did not run' : state}
+            </span>
+            {state === 'missed' ? (
+              <button
+                className="btn btn-ghost"
+                onClick={() => refire(p.kind)}
+                disabled={firing !== ''}
+              >
+                {firing === p.kind ? <Loader2 /> : <RefreshCw />} Run it now
+              </button>
+            ) : null}
+          </span>
+        );
+      })}
+    </div>
   );
 }
 

@@ -4,6 +4,7 @@
 
 import type {
   Agent,
+  AutopilotStatus,
   BucketsResponse,
   Campaign,
   Config,
@@ -23,6 +24,7 @@ import { agentsFrom } from './domain';
 import {
   mockAgentPause,
   mockAgents,
+  mockAutopilot,
   mockBuckets,
   mockCampaigns,
   mockConfig,
@@ -183,6 +185,21 @@ export const api = {
       const c = mockCampaigns.find((x) => x.id === id) ?? mockCampaigns[0];
       Object.assign(c, { autopilot: on, autopilot_note: on ? 'started by operator' : 'stopped by operator' });
       return { ...c };
+    }),
+
+  /** When the passes fire and which have fired today. A pass is fired once a
+   *  day and never retried, so a missed one shows here and nowhere else. */
+  autopilotStatus: () =>
+    req<AutopilotStatus>('/api/autopilot', undefined, () => mockAutopilot),
+
+  /** Re-fire a pass the server missed. The documented recovery path -- without
+   *  it the only way back is curl. */
+  runPass: (kind: string) =>
+    req<unknown>('/api/autopilot/run', json({ kind }), () => {
+      // Every other fallback here invents a plausible read. This one would be
+      // inventing a dial that did not happen, on the one screen that exists to
+      // tell an operator a pass was missed.
+      throw new ApiError('The server is unreachable — nothing was re-run.', 503);
     }),
 
   config: (id: number) => req<Config>(`/api/campaigns/${id}/config`, undefined, () => mockConfig),

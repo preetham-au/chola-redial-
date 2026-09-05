@@ -72,8 +72,16 @@ def health() -> dict[str, object]:
     with session() as conn:
         agents = [r["agent_id"] for r in conn.execute(
             "SELECT DISTINCT agent_id FROM campaigns ORDER BY agent_id")]
+        # What is in the table, not what .env last claimed. LEADS_SOURCE is a
+        # hand-set string nobody edits after a sync, so the banner an operator
+        # checks before a live dial read "seed" over 22 real campaigns and 1848
+        # real leads. Seed ids are 1-16, warehouse ids 1400+ (`purge_campaigns`),
+        # so the data answers this without being asked.
+        row = conn.execute("SELECT COUNT(*) AS n, MAX(id) AS top FROM campaigns").fetchone()
+    source = leads_source() if not row["n"] else \
+        ("warehouse" if row["top"] >= 1000 else "seed")
     return {"ok": True, "dry_run": dry_run(), "db": Path(db_path()).name,
-            "leads_source": leads_source(), "agents": agents,
+            "leads_source": source, "agents": agents,
             "test_numbers": list(DEFAULT_CONFIG["test_numbers"])}
 
 

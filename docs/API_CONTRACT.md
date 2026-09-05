@@ -114,7 +114,7 @@ and a pass whose re-sync failed is skipped rather than run against stale leads.
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET` | `/api/autopilot` | `{passes, urgent_buckets, review_buckets, fired_today, campaigns[]}` |
+| `GET` | `/api/autopilot` | `{passes, urgent_buckets, review_buckets, now, fired_today, campaigns[]}`. `now` is the server's IST clock as `HH:MM` — pass times are IST and the browser is not, so "has 10:00 gone by?" is only answerable here. A pass whose `at` is `<= now` and is absent from `fired_today` was missed; it fires once a day and is never retried. |
 | `POST` | `/api/campaigns/{id}/autopilot` | `{ "on": true \| false }` → the campaign; **409** if disabled |
 | `POST` | `/api/autopilot/run` | `{ "kind": "auto" \| "auto_pm", "date"? }` — fire a pass now; safe to repeat, an already-committed pass answers `already_ran` |
 
@@ -192,7 +192,7 @@ applied when 12 were.
 ### Agents
 
 Campaigns belong to an `agent_id` and the console is always scoped to one agent.
-Two agents are in use: **15** and **127**. Mixing their campaigns in one view is
+Two agents are in use: **125** and **127**. Mixing their campaigns in one view is
 how you dial a Hindi script at a Tamil cohort, so the agent is a first-class
 selector, not a filter chip.
 
@@ -259,4 +259,4 @@ rehearse) but never ignores exclusions or the allow-list.
 
 ### Misc
 `GET /api/health` → `{ "ok": true, "dry_run": true, "db": "redial.db",
-"leads_source": "seed", "agents": [15, 127], "test_numbers": ["9379747274"] }`
+"leads_source": "warehouse", "agents": [125, 127], "test_numbers": ["9379747274"] }`
