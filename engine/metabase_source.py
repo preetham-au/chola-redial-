@@ -116,6 +116,30 @@ MACHINE_DISPOSITIONS = (
     "beep_tone_number_busy_not_reachable_switched_off",
 )
 
+# Both tuples above are spelled as SUBS, so the column they are matched against
+# has to be one. `LOWER(lead_stage_computed)`, which is what these queries used,
+# is a sub in neither era:
+#
+#   from 31 Aug 2026  the sub moved into lead_stage_reasoning and `computed` was
+#                     left holding the coarse group. On 3 Sep that is 3,179 rows
+#                     reading `contacted` and 169 reading `not_contacted` out of
+#                     7,268 -- none of which is in either tuple, so the label arm
+#                     of _connected_predicate never fired and voicemail lost its
+#                     veto, leaving a 70s greeting to count as a conversation.
+#   until 30 Aug 2026 the sub WAS in `computed`, but under a `sub_` prefix that
+#                     no entry above carries: `sub_hung_up`, not `hung_up`.
+#
+# So the label arm has been dead in one direction or the other for the whole
+# history. Same expression as build_day_overview_daily.py :: DISPOSITION_SQL and
+# dashboard/server/src/db/syncSql.ts, minus their `immediate_did_not_pick` arm --
+# that one moves rows out of MACHINE_DISPOSITIONS and so changes this file's
+# duration-evidence arm, which is redial's alone. Separate question, left open.
+DISPOSITION_SQL = """regexp_replace(
+           COALESCE(
+             NULLIF(LOWER((regexp_match(i.lead_stage_reasoning, 'sub=([A-Za-z0-9_]+)'))[1]), ''),
+             LOWER(COALESCE(i.lead_stage_computed, ''))
+           ), '^sub_', '')"""
+
 
 def _connected_predicate(alias: str) -> str:
     """SQL for "a human was actually reached", for rows of the `activity` CTE.
@@ -702,7 +726,7 @@ WITH mine AS (
 ),
 activity AS (
   SELECT i.campaign_id, i.lead_id, i.call_stage, i.scheduled_time,
-         LOWER(COALESCE(i.lead_stage_computed, '')) AS disposition,
+         {DISPOSITION_SQL} AS disposition,
          COALESCE((i.interaction_metadata->>'call_duration')::numeric, 0) AS duration_sec
   FROM public.interactions i
   JOIN mine m ON m.id = i.campaign_id
@@ -845,7 +869,7 @@ lead_totals AS (
 -- Per-campaign redial readiness. One row per campaign_id.
 WITH activity AS (
   SELECT i.campaign_id, i.lead_id, i.call_stage, i.scheduled_time,
-         LOWER(COALESCE(i.lead_stage_computed, '')) AS disposition,
+         {DISPOSITION_SQL} AS disposition,
          COALESCE((i.interaction_metadata->>'call_duration')::numeric, 0) AS duration_sec
   FROM public.interactions i
   WHERE TRUE
