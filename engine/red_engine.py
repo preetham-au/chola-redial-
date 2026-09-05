@@ -482,6 +482,21 @@ _MONTH_NAMES = ("%d-%b-%Y", "%d-%B-%Y")
 # Year-less named month — the shape Chola's 29-Aug upload uses ('04-Sep').
 _MONTH_NAMES_NO_YEAR = ("%d-%b", "%d-%B")
 
+_ORDINALS = ("first second third fourth fifth sixth seventh eighth ninth tenth eleventh "
+             "twelfth thirteenth fourteenth fifteenth sixteenth seventeenth eighteenth "
+             "nineteenth").split()
+# Day spelled out in words: the shape the 05-Sep-2026 upload uses ('eleventh
+# september'), 4,514 leads across campaigns 1740/1744/1746. Every one of them
+# parsed to NULL before this existed, which zeroed those campaigns' RED counts
+# and so removed them from the console's list entirely -- see sync.py, which
+# only offers campaigns with `leads_with_red`.
+#
+# Keys are letters only, so 'twenty-first', 'twenty first' and 'twentyfirst'
+# all land on the same entry after the caller strips punctuation.
+DAY_WORDS: dict[str, int] = {w: i for i, w in enumerate(_ORDINALS, 1)}
+DAY_WORDS.update({"twentieth": 20, "thirtieth": 30, "thirtyfirst": 31})
+DAY_WORDS.update({f"twenty{w}": 20 + i for i, w in enumerate(_ORDINALS[:9], 1)})
+
 
 def _nearest_year(month: int, day: int, today: Optional[date] = None) -> Optional[date]:
     """Resolve a year-less day/month to the occurrence nearest `today`.
@@ -608,6 +623,19 @@ def parse_red(value: Any, month_first: Optional[bool] = None,
         except (ValueError, TypeError):
             continue
         return _nearest_year(stub.month, stub.day, today)
+
+    # Day in words, e.g. 'eleventh september'. Year-less like '04-Sep', so it is
+    # inferred the same way. Mirrors metabase_source._worded_day_month_sql.
+    worded = re.match(r"^([a-z][a-z -]*)[ -]+([a-z]{3,})$", text.lower())
+    if worded:
+        day = DAY_WORDS.get(re.sub(r"[^a-z]", "", worded.group(1)))
+        for fmt in _MONTH_NAMES_NO_YEAR if day else ():
+            try:
+                stub = datetime.strptime(f"{day}-{worded.group(2)}-2024", fmt + "-%Y")
+            except (ValueError, TypeError):
+                continue
+            return _nearest_year(stub.month, stub.day, today)
+        return None
 
     # Three numeric parts. The separator decides the DEFAULT order only; the
     # >12 and renewal-month rules take precedence.

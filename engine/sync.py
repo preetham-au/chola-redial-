@@ -385,6 +385,22 @@ def sync(agents: Sequence[int] = tuple(AGENTS),
     # ids are issued in creation order.
     has_leads = [r for r in everything if r["leads"] and r["leads_with_red"]]
     eligible = sorted(has_leads, key=lambda r: -int(r["campaign_id"]))
+
+    # A campaign with leads but no PARSEABLE RED drops out of `has_leads` and
+    # then out of the console with nothing said, which is how 1740/1744/1746
+    # went missing on 5 Sep 2026: that upload wrote RED as 'eleventh september'
+    # and every row parsed to NULL. The parser handles that shape now, but the
+    # next upload will invent another one, so the silence is what gets fixed
+    # here -- a campaign with real dials and zero REDs is a parser bug report,
+    # not a normal state, and it says so on the way past.
+    no_red = sorted((r for r in everything if r["leads"] and not r["leads_with_red"]),
+                    key=lambda r: -int(r["leads"]))
+    if no_red:
+        log(f"WARNING: {len(no_red)} campaign(s) have leads but NOT ONE parseable RED, so "
+            f"they are NOT synced and will not appear in the console. Check the RED format "
+            f"against red_engine.parse_red — " + ", ".join(
+                f"{r['campaign_id']} {str(r.get('campaign_name'))[:24]!r} ({r['leads']} leads)"
+                for r in no_red[:12]))
     flagged = [r for r in eligible if not is_production_campaign(r.get("campaign_name"))]
     if flagged:
         log(f"WARNING: {len(flagged)} campaign(s) whose name says test/dev are being "

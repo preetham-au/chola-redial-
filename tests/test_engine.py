@@ -263,6 +263,32 @@ def test_synced_red_keeps_the_warehouses_own_reading():
     assert _red({"red_raw": "", "red": None}) == ""
 
 
+def test_red_written_in_words_parses():
+    """'eleventh september' is a RED. The 05-Sep-2026 upload wrote 4,514 of them.
+
+    Every one parsed to NULL before this, which zeroed `leads_with_red` on
+    campaigns 1740/1744/1746 and so dropped them out of the console's list
+    without a word -- 2,351 real dials on 1744 alone, invisible.
+    """
+    from datetime import date
+
+    from engine.red_engine import parse_red
+
+    today = date(2026, 9, 6)
+    assert parse_red("eleventh september", today=today) == date(2026, 9, 11)
+    assert parse_red("Tenth September", today=today) == date(2026, 9, 10)
+    # The compound days, in each spelling the uploads have produced.
+    for text in ("twenty-first september", "twenty first september", "twentyfirst september"):
+        assert parse_red(text, today=today) == date(2026, 9, 21)
+    assert parse_red("thirty-first october", today=today) == date(2026, 10, 31)
+    # Year inferred, not assumed: read in September, 'second january' is next year.
+    assert parse_red("second january", today=today) == date(2027, 1, 2)
+    # Impossible and unrecognised stay None rather than becoming a wrong date.
+    assert parse_red("thirty-first february", today=today) is None
+    assert parse_red("eleventh smarch", today=today) is None
+    assert parse_red("not known", today=today) is None
+
+
 # ---------------------------------------------------------------------------
 # The Formi credential
 # ---------------------------------------------------------------------------

@@ -37,6 +37,11 @@ from typing import Any, Iterable, Optional, Sequence
 
 import requests
 
+# The one table both halves of the RED parser share. Everything else is
+# duplicated deliberately (SQL vs Python), but 31 day-words are not worth
+# writing twice and drifting apart.
+from .red_engine import DAY_WORDS
+
 __all__ = [
     "MetabaseError",
     "MetabaseConfig",
@@ -333,9 +338,33 @@ def _day_month_sql(text: str, ref: str) -> str:
     far out is outside every dial window anyway, so the fuzziness of the
     boundary costs nothing.
     """
-    day = f"SPLIT_PART({text}, '-', 1)::int"
+    return _infer_year_sql(f"SPLIT_PART({text}, '-', 1)::int",
+                           _month_number_sql(f"SPLIT_PART({text}, '-', 2)"), ref)
+
+
+def _month_number_sql(expr: str) -> str:
+    """A named month -> 1-12, matched on its first three letters. NULL if unknown."""
     cases = " ".join(f"WHEN '{m}' THEN {i}" for i, m in enumerate(_MONTH_ABBR, 1))
-    month = f"(CASE LOWER(LEFT(SPLIT_PART({text}, '-', 2), 3)) {cases} ELSE NULL END)"
+    return f"(CASE LOWER(LEFT({expr}, 3)) {cases} ELSE NULL END)"
+
+
+def _worded_day_month_sql(column: str, ref: str) -> str:
+    """`<day in words> <month>` -> a date. Mirrors red_engine.parse_red.
+
+    'eleventh september', the whole of the 05-Sep-2026 upload. Year-less like
+    '04-Sep', so the year is inferred by the same rule.
+    """
+    low = f"LOWER(BTRIM(({column})::text))"
+    # Greedy prefix, so the LAST word is the month and everything before it is
+    # the day -- 'twenty-first september' splits where a naive one would not.
+    day_words = f"REGEXP_REPLACE(SUBSTRING({low} FROM '^(.*)[^a-z]+[a-z]+$'), '[^a-z]', '', 'g')"
+    cases = " ".join(f"WHEN '{w}' THEN {n}" for w, n in sorted(DAY_WORDS.items()))
+    return _infer_year_sql(f"(CASE {day_words} {cases} ELSE NULL END)",
+                           _month_number_sql(f"SUBSTRING({low} FROM '([a-z]+)$')"), ref)
+
+
+def _infer_year_sql(day: str, month: str, ref: str) -> str:
+    """Day and month known, year not: the occurrence nearest `ref`."""
     delta = (f"(({month}) * 100 + {day}"
              f" - EXTRACT(MONTH FROM {ref})::int * 100 - EXTRACT(DAY FROM {ref})::int)")
     year = (f"(EXTRACT(YEAR FROM {ref})::int"
@@ -391,6 +420,10 @@ def red_parse_expression(column: str = "v.red", month_first_expr: str | None = N
     -- Year-less named month ('04-Sep', '02 Sep'): the year is inferred, never
     -- assumed to be the current one. Matches red_engine.parse_red.
     WHEN {named} ~ '^[0-9]{{1,2}}-[A-Za-z]{{3,}}$' THEN {_day_month_sql(named, ref)}
+    -- Day spelled out ('eleventh september'). Letters only, so nothing numeric
+    -- reaches here; an unrecognised word yields NULL like any other bad RED.
+    WHEN LOWER(BTRIM(({column})::text)) ~ '^[a-z][a-z -]*[ -][a-z]{{3,}}$' THEN
+      {_worded_day_month_sql(column, ref)}
     WHEN {slashed} ~ '^[0-9]{{1,2}}/[0-9]{{1,2}}/([0-9]{{2}}|[0-9]{{4}})$' THEN
       {_three_part_sql(slashed, "/", year_first=False, month_first_default=False,
                        month_first_expr=month_first_expr)}
