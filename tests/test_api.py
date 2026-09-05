@@ -68,6 +68,24 @@ def test_dry_run_toggle_costs_a_typed_word_one_way_only(client):
         os.environ["DRY_RUN"] = "1"
 
 
+def test_sync_endpoint_does_not_start_a_second_pull(client):
+    """Pressing the button twice must not run two syncs against the warehouse.
+
+    The pull takes minutes with no visible change until it lands, so a second
+    press is the expected human response, not a misuse. Never starts a real
+    pull here -- the state is faked as already-running.
+    """
+    from api import main
+
+    assert client.get("/api/sync").json()["running"] is False
+    main._sync_state.update(running=True, ok=None, error="", campaigns=0, leads=0)
+    try:
+        assert client.post("/api/sync").json() == {"running": True, "ok": None, "error": "",
+                                                   "campaigns": 0, "leads": 0}
+    finally:
+        main._sync_state["running"] = False
+
+
 def test_campaigns_and_pause(client):
     from engine.seed import CAMPAIGNS
 

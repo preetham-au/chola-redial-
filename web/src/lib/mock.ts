@@ -13,6 +13,7 @@ import type {
   PlanItem,
   Run,
   StageJob,
+  SyncStatus,
   TestCallAttempt,
   TestCallResult,
   TestNumber,
@@ -85,6 +86,16 @@ export const mockHealth: Health = {
   leads_source: 'seed',
   agents: [...new Set(mockCampaigns.map((c) => c.agent_id))],
   test_numbers: mockTestNumbers.map((t) => t.phone),
+};
+
+/* Offline there is no warehouse to pull from, so the button reports "idle" and
+   never a success it did not have. */
+export const mockSyncIdle: SyncStatus = {
+  running: false,
+  ok: null,
+  error: '',
+  campaigns: 0,
+  leads: 0,
 };
 
 export const mockConfig: Config = {

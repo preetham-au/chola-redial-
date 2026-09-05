@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import { CircleSlash, Loader2, Play, Users } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
+import { CircleSlash, Loader2, Play, RefreshCw, Users } from 'lucide-react';
 import { api } from '../lib/api';
 import { n } from '../lib/domain';
 import { useAgent, useStore } from '../lib/store';
@@ -177,6 +177,60 @@ export function AgentPauseConfirm({
 }
 
 /** Rail block: switch scope, see the agent's state, pause the whole agent. */
+/** Pull campaigns and leads from the warehouse now, instead of waiting up to an
+ *  hour for chola-redial-sync.timer.
+ *
+ *  The pull takes minutes, so the button starts it and polls. Polling stops on
+ *  unmount, and a second press while one is in flight is a no-op server-side —
+ *  the endpoint returns the run already going rather than starting another. */
+function SyncNowButton() {
+  const bootstrap = useStore((s) => s.bootstrap);
+  const toast = useStore((s) => s.toast);
+  const [running, setRunning] = useState(false);
+  const alive = useRef(true);
+
+  useEffect(() => () => { alive.current = false; }, []);
+
+  const start = async () => {
+    setRunning(true);
+    try {
+      await api.startSync();
+      toast('info', 'Pulling campaigns from the warehouse. This takes a few minutes.');
+      // 5s: the pull runs in minutes, so anything tighter is just noise on the
+      // wire. No timeout — a pull that never ends is a server problem the
+      // spinner should keep showing, not one this button should paper over.
+      while (alive.current) {
+        await new Promise((r) => setTimeout(r, 5000));
+        const s = await api.syncStatus();
+        if (s.running) continue;
+        if (!alive.current) return;
+        // Re-read the scope: the whole point was new campaigns in the picker.
+        await bootstrap();
+        toast(
+          s.ok === false ? 'bad' : 'ok',
+          s.ok === false
+            ? `Sync failed: ${s.error}`
+            : `Synced ${n(s.campaigns)} campaigns, ${n(s.leads)} leads.`,
+        );
+        break;
+      }
+    } catch (e) {
+      toast('bad', (e as Error).message);
+    } finally {
+      if (alive.current) setRunning(false);
+    }
+  };
+
+  return (
+    <button className="btn btn-sm btn-ghost" onClick={start} disabled={running}
+            title="Pull new campaigns and leads from the warehouse now">
+      {running ? <Loader2 className="spin" /> : <RefreshCw />}
+      <span>{running ? 'Syncing…' : 'Sync now'}</span>
+    </button>
+  );
+}
+
+
 export function AgentScope() {
   const { agents, agentId, campaigns, setAgent, toast } = useStore();
   const agent = useAgent();
@@ -236,6 +290,9 @@ export function AgentScope() {
             {agent.paused ? <Play /> : <CircleSlash />}
             <span>{agent.paused ? 'Resume all' : 'Pause all'}</span>
           </button>
+          {/* Directly under the list it refreshes, because "the campaign I just
+              made is not here" is the only reason anyone presses it. */}
+          <SyncNowButton />
         </>
       )}
 

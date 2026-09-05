@@ -169,6 +169,15 @@ export interface Health {
   test_numbers?: string[];
 }
 
+/** GET/POST /api/sync. `ok` is null while running and after a restart. */
+export interface SyncStatus {
+  running: boolean;
+  ok: boolean | null;
+  error: string;
+  campaigns: number;
+  leads: number;
+}
+
 /* --- Test call -------------------------------------------------------------
    A rehearsal against one allow-listed number. `found` says the phone resolved
    to a real lead; the allow-list itself is server-side (`config.test_numbers`)

@@ -16,6 +16,7 @@ import type {
   Run,
   StageJob,
   StagePreview,
+  SyncStatus,
   TestCallAttempt,
   TestCallResult,
   TestNumber,
@@ -36,6 +37,7 @@ import {
   mockRuns,
   mockStageJobs,
   mockStagePreview,
+  mockSyncIdle as idleSync,
   mockTestCall,
   mockTestHistory,
   mockTestNumbers,
@@ -139,6 +141,10 @@ export const api = {
       json({ enabled, confirm }),
       () => ({ dry_run: enabled }),
     ),
+
+  /* Returns as soon as the pull starts; poll syncStatus for the outcome. */
+  startSync: () => req<SyncStatus>('/api/sync', json({}), () => idleSync),
+  syncStatus: () => req<SyncStatus>('/api/sync', undefined, () => idleSync),
 
   campaigns: listCampaigns,
 

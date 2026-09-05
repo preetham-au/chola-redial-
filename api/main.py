@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import os
+import threading
 
 from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -122,6 +123,58 @@ def set_dry_run(body: DryRunBody = Body(...)) -> dict[str, object]:
           f"({'LIVE DIALLING' if going_live else 'dry run'}) via /api/config/dry-run",
           flush=True)
     return {"dry_run": dry_run()}
+
+
+# chola-redial-sync.timer runs the same pull hourly at :15. That is the floor,
+# not the ceiling: a campaign created at 20:20 is invisible until 21:15, and
+# "I made a campaign and it isn't there" is exactly the report that costs an
+# operator their afternoon. So the console can ask for the pull itself.
+#
+# Plain module state and a thread rather than a job table: one process owns the
+# console, the answer is only interesting for the minutes the pull takes, and a
+# restart losing it is correct -- a restart also kills the thread.
+_sync_lock = threading.Lock()
+_sync_state: dict[str, object] = {"running": False, "ok": None, "error": "",
+                                  "campaigns": 0, "leads": 0}
+
+
+def _run_sync() -> None:
+    from engine.seed import AGENTS
+    from engine.sync import sync
+
+    try:
+        # Mirrors chola-redial-sync.service. keep_local matters: this pull must
+        # not delete campaigns it happens not to reach.
+        result = sync(list(AGENTS), 90, 5000, keep_local=True)
+        _sync_state.update(ok=True, error="",
+                           campaigns=result["campaigns"], leads=result["leads"])
+    except Exception as exc:  # noqa: BLE001 -- a failed pull is a status, not a crash
+        _sync_state.update(ok=False, error=f"{type(exc).__name__}: {exc}"[:300])
+    finally:
+        _sync_state["running"] = False
+
+
+@app.post("/api/sync")
+def start_sync() -> dict[str, object]:
+    """Pull campaigns and leads from the warehouse now. Returns immediately.
+
+    Poll GET /api/sync for the outcome; the pull takes minutes. Asking twice is
+    not an error, it just returns the run already in flight -- a button pressed
+    again because nothing visibly happened should not produce a second sync.
+
+    Reads only. Nothing here dials, so it is safe under any DRY_RUN.
+    """
+    with _sync_lock:
+        if _sync_state["running"]:
+            return dict(_sync_state)
+        _sync_state.update(running=True, ok=None, error="", campaigns=0, leads=0)
+    threading.Thread(target=_run_sync, daemon=True).start()
+    return dict(_sync_state)
+
+
+@app.get("/api/sync")
+def sync_status() -> dict[str, object]:
+    return dict(_sync_state)
 
 
 app.include_router(core_router)
