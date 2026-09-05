@@ -131,6 +131,14 @@ async function listCampaigns(agent_id?: number): Promise<Campaign[]> {
 
 export const api = {
   health: () => req<Health>('/api/health', undefined, () => mockHealth),
+  /* Switching dialling ON needs confirm='GO LIVE'; switching it off needs nothing.
+     The server holds this in its environment, so it lasts until the next restart. */
+  setDryRun: (enabled: boolean, confirm = '') =>
+    req<{ dry_run: boolean }>(
+      '/api/config/dry-run',
+      json({ enabled, confirm }),
+      () => ({ dry_run: enabled }),
+    ),
 
   campaigns: listCampaigns,
 

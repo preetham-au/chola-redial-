@@ -46,6 +46,28 @@ def test_health(client):
                     "agents": sorted(AGENTS), "test_numbers": TEST_NUMBERS}
 
 
+def test_dry_run_toggle_costs_a_typed_word_one_way_only(client):
+    """Going live is guarded; going back to a dry run is not.
+
+    The whole point of the control is that the safe direction is cheap. Restores
+    DRY_RUN to 1 whatever happens -- the rest of this suite assumes it.
+    """
+    import os
+
+    try:
+        assert client.post("/api/config/dry-run", json={"enabled": False}).status_code == 400
+        assert client.get("/api/health").json()["dry_run"] is True
+
+        live = client.post("/api/config/dry-run", json={"enabled": False, "confirm": "go live"})
+        assert live.status_code == 200 and live.json() == {"dry_run": False}
+        assert client.get("/api/health").json()["dry_run"] is False
+
+        # Back to safe: no word, no argument.
+        assert client.post("/api/config/dry-run", json={"enabled": True}).json() == {"dry_run": True}
+    finally:
+        os.environ["DRY_RUN"] = "1"
+
+
 def test_campaigns_and_pause(client):
     from engine.seed import CAMPAIGNS
 

@@ -10,10 +10,13 @@ import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request
+import os
+
+from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from .db import (DEFAULT_CONFIG, db_path, dry_run, init_db, leads_source,
                  load_env, session)
@@ -83,6 +86,42 @@ def health() -> dict[str, object]:
     return {"ok": True, "dry_run": dry_run(), "db": Path(db_path()).name,
             "leads_source": source, "agents": agents,
             "test_numbers": list(DEFAULT_CONFIG["test_numbers"])}
+
+
+class DryRunBody(BaseModel):
+    enabled: bool
+    # Only checked when switching dialling ON. Going back to a dry run is the safe
+    # direction and takes one click.
+    confirm: str = ""
+
+
+@app.post("/api/config/dry-run")
+def set_dry_run(body: DryRunBody = Body(...)) -> dict[str, object]:
+    """Turn live dialling on or off without a restart.
+
+    `db.dry_run()` reads the environment at call time, and every dialling helper
+    checks it as its first statement, so writing os.environ here reaches all
+    fifteen call sites immediately -- no restart, no second source of truth.
+
+    Deliberately NOT written to .env. A restart returns to whatever the file says,
+    which means the blast radius of leaving this switched on is one process life
+    rather than forever. The UI says so; do not "fix" it by persisting without
+    deciding that is what you want.
+
+    Turning dialling ON costs the typed word GO LIVE, matching the approve dialog
+    which costs DIAL. Turning it off is free -- a switch that is hard to flip back
+    to safe is a switch nobody flips in a hurry.
+    """
+    going_live = not body.enabled
+    if going_live and body.confirm.strip().upper() != "GO LIVE":
+        raise HTTPException(400, "Type GO LIVE to enable live dialling")
+    os.environ["DRY_RUN"] = "0" if going_live else "1"
+    # Printed, not just returned: this is the one control that decides whether real
+    # customers get called, and the journal is where that question gets answered later.
+    print(f"DRY_RUN set to {os.environ['DRY_RUN']} "
+          f"({'LIVE DIALLING' if going_live else 'dry run'}) via /api/config/dry-run",
+          flush=True)
+    return {"dry_run": dry_run()}
 
 
 app.include_router(core_router)

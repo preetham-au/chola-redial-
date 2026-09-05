@@ -18,6 +18,7 @@ import { API_PREFIX, retryLive } from './lib/api';
 import { navigate, useAgent, useCampaign, useRoute, useStore } from './lib/store';
 import { AgentChip, AgentScope, CampaignPauseButton } from './components/AgentBar';
 import { CloseButton } from './components/ui';
+import { DryRunToggle } from './components/DryRunToggle';
 import { Dashboard } from './screens/Dashboard';
 import { TestCall } from './screens/TestCall';
 import { PlanReview } from './screens/PlanReview';
@@ -93,13 +94,7 @@ export function App() {
         </div>
 
         <div className="rail-foot">
-          <div className={`dry-badge${live ? ' is-live' : ''}`}>
-            {live ? <Radio /> : <FlaskConical />}
-            <div>
-              <span>{live ? 'Live dialling' : 'Dry run'}</span>
-              <small>{live ? 'Approve posts to Formi' : 'Approve only simulates'}</small>
-            </div>
-          </div>
+          <DryRunToggle />
           {health && (
             <div className="eyebrow" style={{ paddingLeft: 2 }}>
               db {health.db} · {health.leads_source}

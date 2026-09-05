@@ -738,6 +738,19 @@ input[type='datetime-local'] {
   text-transform: uppercase;
 }
 
+/* The rail's badge is a <button> (DryRunToggle); the topbar's is a plain div
+   reading the same state, so the button styles are scoped to the element. */
+button.dry-badge {
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+}
+
+.dry-badge:disabled {
+  cursor: progress;
+  opacity: 0.6;
+}
+
 .dry-badge.is-live {
   border: 1px solid var(--live);
   border-style: solid;
