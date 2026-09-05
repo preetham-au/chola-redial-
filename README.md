@@ -19,9 +19,14 @@ dataset, so the console is demoable offline. Each command clears the other's
 campaigns, so the store is only ever all-real or all-synthetic.
 
 ```bash
-python -m engine.sync --campaigns 40 --leads 20000   # widen the default caps
+python -m engine.sync --campaigns 90 --leads 20000   # widen the default caps
 python -m engine.sync --keep-local                   # keep untouched campaigns
 ```
+
+Pick the cap generously. Ordering is newest-first and test campaigns are no
+longer filtered out of the sync, so they take the top slots -- 56 campaigns are
+eligible and a cap of 40 silently drops eleven real ones. `chola-redial-sync.timer`
+on the VM runs `--campaigns 90` for that reason.
 
 Defaults: the 20 newest campaigns that have leads with a parseable RED, 5,000
 leads each, plus whichever campaign currently holds a `test_numbers` lead. Both
