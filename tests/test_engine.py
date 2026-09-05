@@ -297,16 +297,17 @@ def test_formi_token_ignores_a_blank_value(monkeypatch):
 # ---------------------------------------------------------------------------
 # Which campaigns the sync is allowed to offer
 # ---------------------------------------------------------------------------
-# "Newest first, has leads, has a RED" also describes a test campaign perfectly,
-# so the console listed `test 26` next to the real cohorts. Approving one of
-# those under DRY_RUN=0 dials whatever real numbers are sitting in it.
+# These names are no longer filtered out of the sync -- every campaign with leads
+# and a RED is offered, test ones included. The predicate now only decides which
+# ones `sync` prints a WARNING about, so what these cases pin is the wording of
+# that warning, not what reaches the console.
 
 @pytest.mark.parametrize("name", [
     "test", "test 1", "test 26", "link test", "send_payment_link-test",
     "Test campagin", "24_July_Dev_Campaign", "Dev_Test_06-08-2026",
     "audit_redial (killed)", "paymnet link (link plumbing)",
 ])
-def test_non_production_campaigns_are_not_offered(name):
+def test_non_production_campaigns_are_flagged(name):
     from engine.sync import is_production_campaign
     assert not is_production_campaign(name)
 
@@ -319,7 +320,7 @@ def test_non_production_campaigns_are_not_offered(name):
     # apply to names nobody has reviewed.
     "Contest_Aug",
 ])
-def test_real_campaigns_survive_the_filter(name):
+def test_real_campaigns_are_not_flagged(name):
     from engine.sync import is_production_campaign
     assert is_production_campaign(name)
 

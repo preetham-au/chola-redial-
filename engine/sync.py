@@ -37,17 +37,27 @@ from .seed import AGENTS, TEST_NUMBERS
 DEFAULT_MAX_CAMPAIGNS = 20
 DEFAULT_MAX_LEADS = 5_000
 
-# Campaigns whose name says they are not production. "Newest first with leads
-# and a RED" is otherwise a perfect description of a test campaign, so the
-# console used to offer `test 26`, `test 1` and `Dev_Test_06-08-2026` alongside
-# the real cohorts -- and under DRY_RUN=0 approving one of those dials whatever
-# real numbers happen to be sitting in it.
+# Campaigns whose name says they are not production.
 #
-# Matched on the name rather than a list of ids on purpose. The reports kept an
-# explicit exclusion list and it went stale every time someone made a new test
-# campaign; a name pattern covers the one that gets created tomorrow. A campaign
-# that is genuinely production must not be named like a test, which is a rule
-# worth having anyway. --force-campaigns overrides this for a specific id.
+# This used to remove them from the sync. It no longer does -- every campaign the
+# agents have is synced and offered, because dropping one on a name guess also
+# dropped real cohorts nobody could then see, and a console that hides campaigns
+# is harder to trust than one that labels them.
+#
+# So the words below now only decide what `sync` PRINTS. That is a real reduction
+# in safety and is worth naming: "newest first with leads and a RED" describes a
+# test campaign perfectly, so `test 26` and `Dev_Test_06-08-2026` now sit in the
+# list beside the real cohorts, and under DRY_RUN=0 approving one dials whatever
+# real numbers are sitting in it. The name in the list is the only thing standing
+# between an operator and that call -- read it before approving.
+#
+# ponytail: a printed warning, not a guard. If a test campaign is ever approved
+# by accident, put the filter back on the approve path (routes_core) rather than
+# on the sync, so the campaign stays visible but cannot be dialled.
+#
+# Matched on the name rather than a list of ids on purpose: an id list goes stale
+# every time someone makes a new test campaign, a name pattern covers the one
+# created tomorrow.
 NON_PRODUCTION_WORDS = {
     "test", "tests", "testing", "dev", "demo", "dummy", "sample", "sandbox",
     "staging", "scratch",
@@ -374,16 +384,13 @@ def sync(agents: Sequence[int] = tuple(AGENTS),
     # Newest first: a redial console is about this week's cohorts, and campaign
     # ids are issued in creation order.
     has_leads = [r for r in everything if r["leads"] and r["leads_with_red"]]
-    eligible = sorted((r for r in has_leads
-                       if is_production_campaign(r.get("campaign_name"))),
-                      key=lambda r: -int(r["campaign_id"]))
-    kept_ids = {int(r["campaign_id"]) for r in eligible}
-    dropped = [r for r in has_leads if int(r["campaign_id"]) not in kept_ids]
-    if dropped:
-        log(f"non-production: skipping {len(dropped)} campaign(s) whose name says "
-            f"test/dev — " + ", ".join(
+    eligible = sorted(has_leads, key=lambda r: -int(r["campaign_id"]))
+    flagged = [r for r in eligible if not is_production_campaign(r.get("campaign_name"))]
+    if flagged:
+        log(f"WARNING: {len(flagged)} campaign(s) whose name says test/dev are being "
+            f"synced and WILL be offered for approval — " + ", ".join(
                 f"{r['campaign_id']} {str(r.get('campaign_name'))[:24]!r}"
-                for r in sorted(dropped, key=lambda r: -int(r["campaign_id"]))[:12]))
+                for r in flagged[:12]))
     chosen = eligible[:max_campaigns]
     chosen_ids = {int(r["campaign_id"]) for r in chosen}
     always = set(forced.values()) | forced_ids
