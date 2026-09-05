@@ -6,7 +6,7 @@ import { useAsync, useStore } from '../lib/store';
 import { BucketTag, Modal } from './ui';
 
 /** The urgent buckets: mandatory, grace period, critical window. */
-export const URGENT_BUCKETS = ['M0', 'F6', 'F5'];
+export const URGENT_BUCKETS = ['M0', 'E0', 'F6', 'F5'];
 
 const today = () => new Date().toLocaleDateString('en-CA');
 /** Local "HH:MM", rounded UP to the next 5 minutes — the floor has to be a time

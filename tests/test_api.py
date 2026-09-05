@@ -170,7 +170,11 @@ def test_plan_produces_a_prioritised_non_empty_run(client):
     for item in items:
         hour = int(item["scheduled_time"][11:13])
         assert 9 <= hour <= 19
-    order = {"M0": 0, "F6": 1, "F5": 2, "F4": 3, "F3": 4, "F2": 5, "F1": 6, "D0": 7}
+    # Read from the campaign's own config rather than a copy of it, so adding a
+    # bucket to the default table does not silently make this a no-op.
+    priority = client.get("/api/campaigns/1/config").json()["bucket_priority"]
+    order = {b: i for i, b in enumerate(priority)}
+    assert "E0" in order
     assert all(item["priority"] == order[item["bucket"]] for item in items)
     # No connected lead reached an auto plan.
     assert all(item["disposition_class"] in ("dnp", "fresh") or item["bucket"] == "M0"
@@ -379,6 +383,46 @@ def test_a_lead_booked_in_formi_is_never_double_dialled(client):
         conn.close()
 
 
+def test_a_committed_run_can_be_paused_edited_and_resumed(client):
+    """Pause hands the rest of the day back as editable slots; resume re-sends it."""
+    run = _plan_today(client, 5)
+    before = client.get(f"/api/runs/{run['id']}/items?page_size=500").json()["items"]
+    if len(before) < 2:
+        pytest.skip("nothing due today in the seed")
+
+    assert client.post(f"/api/runs/{run['id']}/approve").status_code == 200
+    # Only a committed run can be paused, and only a paused one resumed.
+    assert client.post(f"/api/runs/{run['id']}/resume").status_code == 409
+
+    paused = client.post(f"/api/runs/{run['id']}/pause")
+    assert paused.status_code == 200, paused.text
+    paused = paused.json()
+    assert paused["status"] == "paused"
+    assert client.post(f"/api/runs/{run['id']}/pause").status_code == 409
+
+    items = client.get(f"/api/runs/{run['id']}/items?page_size=500").json()["items"]
+    live = [i for i in items if i["status"] == "planned"]
+    assert live, "pausing must return the un-dialled slots to planned"
+    # Everything still on the clock came back; nothing in the past was disturbed.
+    assert all(i["status"] in ("posted", "simulated", "expired")
+               for i in items if i["status"] != "planned")
+
+    # Editable while paused -- that is the whole point of pausing.
+    moved = live[-1]
+    new_time = moved["scheduled_time"][:11] + "18:45:00"
+    edit = client.patch(f"/api/runs/{run['id']}/items/{moved['id']}",
+                        json={"scheduled_time": new_time})
+    if edit.status_code == 422:
+        pytest.skip("18:45 is outside this campaign's window or already gone")
+    assert edit.status_code == 200, edit.text
+
+    done = client.post(f"/api/runs/{run['id']}/resume")
+    assert done.status_code == 200, done.text
+    assert done.json()["status"] == "committed"
+    after = client.get(f"/api/runs/{run['id']}/items?page_size=500").json()["items"]
+    assert not [i for i in after if i["status"] == "planned"]
+
+
 def test_paused_campaign_cannot_be_approved(client):
     run = client.post("/api/campaigns/2/plan", json={"date": "2026-09-02"}).json()
     client.post("/api/campaigns/2/pause")
@@ -404,7 +448,9 @@ def no_network(monkeypatch):
 
 
 def test_approve_under_dry_run_simulates_and_never_dials(client, no_network):
-    run = client.post("/api/campaigns/3/plan", json={"date": "2026-09-03"}).json()
+    # TODAY, not a fixed date: approving a run whose slots are all in the past is
+    # a 409, so a hardcoded date turns this into a failure the day after it lands.
+    run = client.post("/api/campaigns/3/plan", json={"date": TODAY}).json()
     approved = client.post(f"/api/runs/{run['id']}/approve").json()
 
     assert approved["dry_run"] is True

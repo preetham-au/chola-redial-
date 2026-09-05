@@ -14,7 +14,7 @@ import {
   Tags,
   WifiOff,
 } from 'lucide-react';
-import { retryLive } from './lib/api';
+import { API_PREFIX, retryLive } from './lib/api';
 import { navigate, useAgent, useCampaign, useRoute, useStore } from './lib/store';
 import { AgentChip, AgentScope, CampaignPauseButton } from './components/AgentBar';
 import { CloseButton } from './components/ui';
@@ -157,7 +157,10 @@ export function App() {
           <div className="mock-strip">
             <WifiOff />
             <span>
-              Backend unreachable at 127.0.0.1:8000 — showing mock data. Nothing here is real.
+              {/* The real prefix, not a hardcoded guess: behind the tunnel this
+                  is /redial/api, and naming 127.0.0.1:8000 sent people to debug
+                  a port the console has never called. */}
+              Backend unreachable at {API_PREFIX || ''}/api — showing mock data. Nothing here is real.
             </span>
             <button
               onClick={() => {

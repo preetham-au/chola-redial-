@@ -25,7 +25,7 @@ export function ManualRedial() {
   const buckets = useAsync(() => api.buckets(campaignId, date), [campaignId, date]);
 
   const [dispositions, setDispositions] = useState<string[]>(['positive_followup', 'payment_link_sent']);
-  const [picked, setPicked] = useState<string[]>(['F5', 'F6', 'M0']);
+  const [picked, setPicked] = useState<string[]>(['F5', 'E0', 'F6', 'M0']);
   const [preview, setPreview] = useState<ManualPreview | null>(null);
   const [busy, setBusy] = useState(false);
   const [confirming, setConfirming] = useState(false);
@@ -164,7 +164,7 @@ export function ManualRedial() {
               <button className="btn btn-sm btn-ghost" onClick={() => setPicked([...BUCKET_ORDER])}>
                 Select all
               </button>
-              <button className="btn btn-sm btn-ghost" onClick={() => setPicked(['F5', 'F6', 'M0'])}>
+              <button className="btn btn-sm btn-ghost" onClick={() => setPicked(['F5', 'E0', 'F6', 'M0'])}>
                 Urgent only
               </button>
               <button className="btn btn-sm btn-ghost" onClick={() => setPicked([])}>

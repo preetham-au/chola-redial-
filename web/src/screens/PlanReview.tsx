@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useState } from 'react';
-import { ArrowLeft, CheckCircle2, Loader2, PlayCircle, RefreshCw, Trash2 } from 'lucide-react';
+import { ArrowLeft, CheckCircle2, Loader2, PauseCircle, PlayCircle, RefreshCw, Trash2 } from 'lucide-react';
 import { api } from '../lib/api';
 import {
   bucketColor,
   BUCKET_ORDER,
   dispLabel,
   dteLabel,
+  isIntensive,
   ITEM_STATUS_TONE,
   n,
   RUN_STATUS_TONE,
@@ -59,7 +60,7 @@ export function PlanReview({ runId }: { runId: number | null }) {
 
   const urgentSlots = useMemo(
     () =>
-      all.data?.items.filter((i) => i.bucket === 'F5' || i.bucket === 'F6' || i.bucket === 'M0').length ?? 0,
+      all.data?.items.filter((i) => isIntensive(i.bucket)).length ?? 0,
     [all.data],
   );
 
@@ -83,6 +84,34 @@ export function PlanReview({ runId }: { runId: number | null }) {
       toast('ok', `Deleted run ${resolved}.`);
       runs.reload();
       run.reload();
+    } catch (e) {
+      toast('bad', (e as Error).message);
+    }
+  };
+
+  const pauseRun = async () => {
+    if (!resolved) return;
+    if (!confirm(
+      `Pause run #${resolved}? Every call still ahead of the clock is cancelled in Formi and comes ` +
+      `back as an editable slot. Calls already dialled are left alone.`)) return;
+    try {
+      const out = await api.pauseRun(resolved);
+      toast('ok', `Paused. ${n(out.cancelled)} queued call(s) cancelled` +
+        (out.cancel_failed ? `, ${n(out.cancel_failed)} could not be` : '') + '.');
+      run.reload(); items.reload(); all.reload(); runs.reload();
+    } catch (e) {
+      toast('bad', (e as Error).message);
+    }
+  };
+
+  const resumeRun = async () => {
+    if (!resolved) return;
+    try {
+      const out = await api.resumeRun(resolved);
+      toast('ok', out.dry_run
+        ? `Resumed (dry run) — ${n(out.counts.slots)} slot(s) simulated, nothing dialled.`
+        : `Resumed. ${n(out.counts.posted)} call(s) on the clock.`);
+      run.reload(); items.reload(); all.reload(); runs.reload();
     } catch (e) {
       toast('bad', (e as Error).message);
     }
@@ -150,6 +179,9 @@ export function PlanReview({ runId }: { runId: number | null }) {
   }
 
   const approvable = r.status === 'planned';
+  // A paused run is a plan again: its slots are editable and it resumes rather
+  // than being approved a second time.
+  const editable = approvable || r.status === 'paused';
 
   return (
     <div className="page grid" style={{ gap: 16 }}>
@@ -188,9 +220,21 @@ export function PlanReview({ runId }: { runId: number | null }) {
               </button>
             </>
           )}
-          <button className="btn btn-primary" disabled={!approvable} onClick={() => setApproving(true)}>
-            <CheckCircle2 /> Approve run
-          </button>
+          {r.status === 'committed' && (
+            <button className="btn btn-ghost" onClick={pauseRun}
+                    title="Cancel the calls still ahead of the clock so the rest of the day can be edited">
+              <PauseCircle /> Pause run
+            </button>
+          )}
+          {r.status === 'paused' ? (
+            <button className="btn btn-primary" onClick={resumeRun}>
+              <PlayCircle /> Resume run
+            </button>
+          ) : (
+            <button className="btn btn-primary" disabled={!approvable} onClick={() => setApproving(true)}>
+              <CheckCircle2 /> Approve run
+            </button>
+          )}
         </div>
       </div>
 
@@ -208,7 +252,7 @@ export function PlanReview({ runId }: { runId: number | null }) {
         <div className="strip-cell">
           <span className="eyebrow">Call slots</span>
           <span className="strip-val">{n(r.counts.slots)}</span>
-          <span className="strip-sub">F5/F6/M0 get two</span>
+          <span className="strip-sub">F5/E0/F6/M0 get two</span>
         </div>
         <div className="strip-cell">
           <span className="eyebrow">Urgent slots</span>
@@ -318,7 +362,7 @@ export function PlanReview({ runId }: { runId: number | null }) {
                   {items.data.items.map((it) => (
                     <tr key={it.id}>
                       <td className="n" style={{ fontWeight: 600 }}>
-                        {approvable && it.status === 'planned' ? (
+                        {editable && it.status === 'planned' ? (
                           <input
                             // Keyed on the STORED value, not just the row id: after a
                             // rejected or normalised edit the reload returns the old

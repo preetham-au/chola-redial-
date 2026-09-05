@@ -86,7 +86,7 @@ DISPOSITIONS: list[tuple[str, int]] = [
 # the UI has to show OUTSIDE_WINDOW and NO_EXPIRY skips as real numbers.
 DTE_SPREAD: list[tuple[str, int, tuple[int, int]]] = [
     ("F1", 18, (32, 45)), ("F2", 14, (24, 31)), ("F3", 14, (16, 23)),
-    ("F4", 16, (8, 15)), ("F5", 18, (0, 7)), ("F6", 8, (-3, -1)),
+    ("F4", 16, (8, 15)), ("F5", 14, (1, 7)), ("E0", 6, (-1, 0)), ("F6", 6, (-3, -2)),
     ("future", 7, (46, 120)), ("lapsed", 2, (-40, -4)), ("bad_red", 3, (0, 0)),
 ]
 

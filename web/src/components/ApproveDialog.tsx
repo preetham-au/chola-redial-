@@ -106,7 +106,7 @@ export function ApproveDialog({
         <Fact k="Date" v={run.run_date} />
         <Fact k="Leads" v={n(run.counts.planned)} />
         <Fact k="Call slots" v={n(run.counts.slots)} />
-        <Fact k="Of which F5 / F6 / M0" v={n(urgentSlots)} tone="var(--b-F5)" />
+        <Fact k="Of which F5 / E0 / F6 / M0" v={n(urgentSlots)} tone="var(--b-F5)" />
         <Fact k="Config version" v={`v${run.config_version}`} />
       </div>
 

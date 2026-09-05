@@ -7,11 +7,11 @@ persists the result — so it is safe to run under DRY_RUN by construction.
 
 Four rules, in the order they are applied:
 
-  1. PRIORITY   — leads are ordered by `config.priority_of(bucket)`, so M0/F6/F5
+  1. PRIORITY   — leads are ordered by `config.priority_of(bucket)`, so M0/E0/F6/F5
                   are placed first. When `max_per_run` bites it is the
                   far-from-expiry leads that get shed, never the ones about to
                   lapse. The shed count is returned, not swallowed.
-  2. TWO SLOTS  — F5/F6 (`calls_per_day == 2`) get slot_no 1 and 2, with slot 2
+  2. TWO SLOTS  — F5/E0/F6 (`calls_per_day == 2`) get slot_no 1 and 2, with slot 2
                   at least `same_day_gap_hours` later. If that does not fit
                   inside the window we emit slot 1 only; a call outside the
                   window is worse than a call not made.
@@ -254,7 +254,7 @@ def dispatch(
         result.slots.append(slot)
         firsts.append((index, slot))
 
-    # --- rule 2: the second daily slot for F5/F6 ----------------------------
+    # --- rule 2: the second daily slot for F5/E0/F6 ----------------------------
     gap = int(round(dcfg.same_day_gap_hours * 60))
     for _index, first in firsts:
         if _slots_for(first.decision.bucket, config) < 2:
