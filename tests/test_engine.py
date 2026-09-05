@@ -400,3 +400,15 @@ def test_the_earliest_dialable_minute_clears_formis_floor(now, expected):
     # re-checks against its own clock when the POST lands, so never round down.
     assert first >= start + timedelta(minutes=FORMI_LEAD_MINUTES)
     assert first.second == 0
+
+
+def test_a_rejected_stage_write_stops_and_carries_formis_reason():
+    """`policy_expired` may not be in the agent's funnel config at all.
+
+    Every chunk after the first would be rejected identically, so grinding
+    through them to report "0 applied" hides the one sentence that explains it.
+    """
+    from engine.stage_ops import _why
+    reason = "Invalid stage. Valid stages are: renewed, did_not_pick"
+    assert _why(_Resp(400, {"success": False, "message": reason})) == reason
+    assert _why(_Resp(404, None)) == "HTTP 404"

@@ -118,6 +118,19 @@ def apply_stage(conn: sqlite3.Connection, lead_ids: Sequence[int], target_stage:
     return cur.rowcount
 
 
+def _why(response: Any) -> str:
+    """Formi's own explanation for a rejection.
+
+    Its "Invalid stage" message already spells out the agent's configured
+    stages, which is the whole answer to "why did nothing move", so it is
+    passed through rather than re-assembled.
+    """
+    try:
+        return str(response.json()["message"])
+    except Exception:
+        return f"HTTP {response.status_code}"
+
+
 def batch_counts(response: Any, size: int) -> tuple[int, int]:
     """(ok, failed) for one bulk-update batch, read from the body — not the status.
 
@@ -163,6 +176,13 @@ def bulk_update(agent_id: int, lead_ids: Sequence[int], stage: str, reason: str,
             json={"lead_ids": batch, "stage": stage, "reason": reason},
             timeout=120,
         )
+        # 400/404 are not partial failures, they are "this request will never
+        # work": an unconfigured stage, a wrong agent. Every remaining chunk
+        # would be rejected identically, so stop and say why. Formi puts the
+        # agent's actual stage list in the body — the one thing an operator
+        # staring at "0 applied" needs.
+        if response.status_code in (400, 404):
+            raise RuntimeError(f"Formi rejected the stage write: {_why(response)}")
         applied, missed = batch_counts(response, len(batch))
         ok += applied
         failed += missed

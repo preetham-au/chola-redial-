@@ -123,7 +123,12 @@ def _commit(conn: sqlite3.Connection, result: dict[str, Any]) -> int:
     applied = rejected = 0
     reason = f"chola-redial console: {result['target_stage']}"
     for agent_id, ids in by_agent.items():
-        ok, failed = bulk_update(agent_id, ids, result["target_stage"], reason, dry_run=False)
+        try:
+            ok, failed = bulk_update(agent_id, ids, result["target_stage"], reason, dry_run=False)
+        except RuntimeError as exc:
+            # A misconfigured target stage is the operator's problem to fix, so
+            # it is reported as one — not buried as "0 applied" in a 200.
+            raise HTTPException(502, str(exc)) from None
         applied += ok
         rejected += failed
     result["applied_formi"] = applied
