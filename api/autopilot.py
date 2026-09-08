@@ -1,31 +1,28 @@
-"""Per-campaign autopilot: switch it on once, it runs until the policies run out.
+"""The clock: switch a campaign on once and its plan is ready every morning.
 
-The console could always plan and approve a run; nothing ever *started* one. This
-is the missing scheduler. Turn `autopilot` on for a campaign and twice a day it
-re-syncs that campaign's leads, dials the urgent buckets itself, and leaves the
-rest as a plan for a human to approve. It switches itself off when there is
-nothing left to call.
+`campaigns.autopilot` means "include this campaign in the daily plan". Twice a
+day this module re-syncs those campaigns' leads and PREPARES a plan for each —
+and stops there. **Nothing here dials.** The plan waits for an operator to
+approve it on the day screen (api/day.py); if nobody does, no call goes out.
 
-Three passes, three run kinds, because `_write_run` refuses to replace a run for
-the same (campaign, date, kind) once it has been acted on — which is exactly the
-"already ran today" guard, so no extra bookkeeping column is needed:
+Two passes, two run kinds, because `_write_run` refuses to replace a run for the
+same (campaign, date, kind) once it has been acted on — which is exactly the
+"already prepared today" guard, so no extra bookkeeping column is needed:
 
-    auto      morning   URGENT buckets, dialled automatically
-    auto_pm   afternoon URGENT buckets again, AFTER a re-sync so the second call
-                        only goes to leads that genuinely did not pick up
-    review    morning   everything else, planned and left for approval
+    auto      morning   the day's plan, every schedulable bucket
+    auto_pm   afternoon a second plan, built AFTER a re-sync so it only reaches
+                        leads whose disposition still says nobody picked up
 
-It stops when the campaign is paused, when it is killed in Formi (see
-`sync.upsert_campaign`), or when no lead is left with a RED inside the grace
-window and a stage that is not terminal.
+A campaign leaves the daily plan when it is paused here, when it is paused or
+killed in Formi (see `sync.upsert_campaign`), or when no lead is left with a RED
+inside the grace window and a stage that is not terminal.
 """
 from __future__ import annotations
 
 import asyncio
 import os
 import sqlite3
-from dataclasses import replace
-from datetime import date
+from datetime import date, datetime, timedelta
 from typing import Any, Optional
 
 from fastapi import APIRouter, Body, HTTPException
@@ -34,17 +31,11 @@ from pydantic import BaseModel
 from engine.red_engine import EXCLUDED, config_from_settings
 
 from .db import current_config, now_ist, session
-from .routes_core import _campaign, _campaign_json, _commit, _evaluate, _floor_min, _write_run
+from .routes_core import _campaign, _campaign_json
 
 router = APIRouter()
 
-# The approval line, in one place. Buckets on the left dial themselves; buckets
-# on the right are planned and wait for a human. RED-7 .. RED+3 is the window
-# where a missed day cannot be made up, so it is the one that runs unattended.
-URGENT = ("M0", "E0", "F6", "F5")
-REVIEW_BUCKETS = ("F4", "F3", "F2", "F1", "D0")
-
-AM, PM, REVIEW = "auto", "auto_pm", "review"
+AM, PM = "auto", "auto_pm"
 
 
 def pass_times() -> list[tuple[str, str]]:
@@ -121,79 +112,35 @@ def _resync(campaign_id: int, day: date) -> int:
         return refresh_campaign_leads(conn, campaign_id, config, schema, today=day)
 
 
-def _plan(conn: sqlite3.Connection, campaign: sqlite3.Row, day: date, kind: str,
-          buckets, dial: bool) -> dict[str, Any]:
-    """Plan one bucket set, and (when `dial`) put it straight on Formi's clock."""
-    cfg, red, dcfg, now, leads, pairs = _evaluate(conn, campaign, day)
-    floor = _floor_min(now, day, dcfg)
-    if floor is not None and floor >= dcfg.end_min:
-        return {"status": "window_closed"}
-    # "2nd call only if the 1st is not answered" — so no pass may book both calls
-    # of the day up front. One slot per lead per pass; the afternoon call is
-    # earned in the afternoon, by a lead whose re-synced disposition still says
-    # nobody picked up. A connected lead is CALLBACK class by then and `decide`
-    # drops it before it ever reaches the dispatcher.
-    red = replace(red, calls_per_day_cap=1)
-    try:
-        run_id = _write_run(conn, campaign, day, kind, cfg["version"], pairs, red, dcfg,
-                            evaluated=len(leads), note=f"autopilot {kind}",
-                            floor_min=floor, buckets=list(buckets))
-    except HTTPException as exc:
-        # 409 = a run of this kind already went out today. That IS the "already
-        # ran" check; re-running the pass is a no-op rather than a double dial.
-        return {"status": "already_ran", "detail": str(exc.detail)}
-    if not dial:
-        return {"status": "planned", "run_id": run_id, "awaiting_approval": True}
-    run = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
-    try:
-        out = _commit(conn, run, campaign, "approving")
-    except HTTPException as exc:
-        return {"status": "not_dialled", "run_id": run_id, "detail": str(exc.detail)}
-    return {"status": "committed", "run_id": run_id, "dry_run": out["dry_run"],
-            "slots": out["counts"]["slots"], "posted": out["counts"]["posted"],
-            "failed": out["counts"]["failed"]}
+def _resync_status(day: date) -> list[int]:
+    """Re-read Formi's campaign status before a wave is planned. Raises on failure.
 
+    Without this the console only learns about a pause on the next full sync: a
+    campaign paused in Formi at 11:00 was still in the 15:00 plan, and approving
+    that plan dialled customers of a campaign the client had stopped. Returns the
+    campaign ids this call stopped.
+    """
+    from engine import metabase_source as ms          # noqa: PLC0415 — heavy import
+    from engine.sync import refresh_campaign_status   # noqa: PLC0415
 
-def _one(campaign_id: int, kind: str, day: date) -> dict[str, Any]:
-    """One campaign, one pass. Never raises — a bad campaign must not stop the rest."""
-    result: dict[str, Any] = {"campaign_id": campaign_id, "kind": kind}
-    try:
-        result["resynced"] = _resync(campaign_id, day)
-    except Exception as exc:                     # noqa: BLE001 — reported, not swallowed
-        # Planning off a stale local copy is worse than not planning: yesterday's
-        # counters would re-dial leads that already answered. Skip and say so.
-        with session() as conn:
-            _note(conn, campaign_id, f"{day} {kind}: skipped, re-sync failed: {exc}")
-        return {**result, "status": "resync_failed", "detail": str(exc)[:200]}
-
+    config = ms.load_config()
+    schema = ms.describe_schema(config)
     with session() as conn:
-        campaign = conn.execute("SELECT * FROM campaigns WHERE id=?", (campaign_id,)).fetchone()
-        if campaign is None or not campaign["autopilot"] or campaign["paused"] \
-                or not campaign["enabled"]:
-            return {**result, "status": "not_on_autopilot"}
-
-        left = remaining_leads(conn, campaign_id, day)
-        result["remaining"] = left
-        if left == 0:
-            _stop(conn, campaign_id,
-                  f"finished {day}: no lead left with a RED in the window and a "
-                  f"non-terminal stage")
-            return {**result, "status": "finished"}
-
-        result["urgent"] = _plan(conn, campaign, day, kind, URGENT, dial=True)
-        if kind == AM:
-            result["review"] = _plan(conn, campaign, day, REVIEW, REVIEW_BUCKETS, dial=False)
-        _note(conn, campaign_id, f"{day} {kind}: {result['urgent'].get('status')}")
-    return {**result, "status": "ran"}
+        agents = [r["agent_id"] for r in conn.execute(
+            "SELECT DISTINCT agent_id FROM campaigns WHERE autopilot=1 AND enabled=1")]
+        return refresh_campaign_status(conn, agents, config, schema, today=day)
 
 
-def run_pass(kind: str, day: Optional[date] = None) -> list[dict[str, Any]]:
-    """Run one pass across every campaign currently on autopilot."""
-    day = day or now_ist().date()
-    with session() as conn:
-        ids = [r["id"] for r in conn.execute(
-            "SELECT id FROM campaigns WHERE autopilot=1 AND enabled=1 AND paused=0 ORDER BY id")]
-    return [_one(campaign_id, kind, day) for campaign_id in ids]
+def run_pass(kind: str, day: Optional[date] = None) -> dict[str, Any]:
+    """Prepare one wave across every campaign in the daily plan. Dials nothing.
+
+    Delegates the whole of it to `day.prepare_day`, which is also what the
+    operator's Prepare button calls — one code path, so a pass fired by the clock
+    and a pass fired by hand cannot drift apart.
+    """
+    from .day import prepare_day                 # noqa: PLC0415 — avoids an import cycle
+
+    return prepare_day(day or now_ist().date(), kind, resync=True)
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +148,13 @@ def run_pass(kind: str, day: Optional[date] = None) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 _fired: set[tuple[date, str]] = set()
+
+# How often the log is read back against the warehouse, and until when. Calls
+# booked at 19:59 are dialled after the window shuts, so verification runs an
+# hour past it — otherwise the last hour of every day stays "not checked yet".
+VERIFY_EVERY_MIN = 10
+VERIFY_UNTIL_HOUR = 21
+_verified_at: Optional[datetime] = None
 
 
 async def loop() -> None:
@@ -210,6 +164,10 @@ async def loop() -> None:
     `_write_run` turns that into a no-op. One attempt per pass per day — if the
     warehouse was down at 10:00, re-fire it by hand with POST /api/autopilot/run
     rather than have the box retry silently every minute.
+
+    The same tick settles the dial log. Verification is read-only — SELECTs
+    against the warehouse, writes only to the local log — so it is unaffected by
+    DRY_RUN and can never place a call.
     """
     while True:
         now = now_ist()
@@ -219,6 +177,17 @@ async def loop() -> None:
                 continue
             _fired.add(key)
             await asyncio.to_thread(run_pass, kind, now.date())
+        global _verified_at
+        due = _verified_at is None or (now - _verified_at) >= timedelta(minutes=VERIFY_EVERY_MIN)
+        # Elapsed time, not "minute % 10": a tick that drifts past the tenth
+        # minute would skip the whole slot and leave the log unchecked for twenty.
+        if due and 9 <= now.hour < VERIFY_UNTIL_HOUR:
+            _verified_at = now
+            # Off-thread and self-skipping: a slow warehouse delays the next
+            # verify, never the next pass. No open row means no warehouse query
+            # and no log line, so an idle day costs nothing.
+            from .dial_log import verify_async         # noqa: PLC0415 — avoids a cycle
+            verify_async(now.date().isoformat())
         await asyncio.sleep(60)
 
 
@@ -235,7 +204,8 @@ def autopilot_status() -> dict[str, Any]:
     with session() as conn:
         rows = conn.execute("SELECT * FROM campaigns ORDER BY id").fetchall()
     return {"passes": [{"kind": k, "at": at} for k, at in pass_times()],
-            "urgent_buckets": list(URGENT), "review_buckets": list(REVIEW_BUCKETS),
+            # Said out loud so a screen can say it: a pass prepares, it never dials.
+            "dials": False,
             # Pass times are IST and the browser is on whatever the operator's
             # laptop says, so "has 10:00 gone by?" is only answerable here.
             "now": now_ist().strftime("%H:%M"),
@@ -245,7 +215,11 @@ def autopilot_status() -> dict[str, Any]:
 
 @router.post("/api/campaigns/{campaign_id}/autopilot")
 def set_autopilot(campaign_id: int, body: AutopilotBody) -> dict[str, Any]:
-    """Start or stop the autopilot for one campaign. The operator's only switch."""
+    """Put one campaign in, or out of, the daily plan. The operator's one switch.
+
+    Switching it ON never places a call: it only decides whose leads appear in
+    tomorrow's plan. The call happens when the day is approved.
+    """
     with session() as conn:
         campaign = _campaign(conn, campaign_id)
         if body.on and not campaign["enabled"]:
@@ -259,8 +233,11 @@ def set_autopilot(campaign_id: int, body: AutopilotBody) -> dict[str, Any]:
 
 @router.post("/api/autopilot/run")
 def trigger(kind: str = Body(AM, embed=True),
-            date_: Optional[str] = Body(None, embed=True, alias="date")) -> list[dict[str, Any]]:
-    """Fire a pass now — the manual re-try for a pass the warehouse ate."""
+            date_: Optional[str] = Body(None, embed=True, alias="date")) -> dict[str, Any]:
+    """Fire a pass now — the manual re-try for a pass the warehouse ate.
+
+    Prepares plans. Approving them is a separate, deliberate act.
+    """
     if kind not in (AM, PM):
         raise HTTPException(422, f"kind must be {AM!r} or {PM!r}, got {kind!r}")
     day = date.fromisoformat(date_) if date_ else None

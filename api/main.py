@@ -21,6 +21,8 @@ from pydantic import BaseModel
 
 from .db import (DEFAULT_CONFIG, db_path, dry_run, init_db, leads_source,
                  load_env, session)
+from .day import router as day_router
+from .dial_log import router as dial_log_router
 from .routes_core import router as core_router
 from .routes_stage import router as stage_router
 
@@ -180,3 +182,5 @@ def sync_status() -> dict[str, object]:
 app.include_router(core_router)
 app.include_router(stage_router)
 app.include_router(autopilot_router)
+app.include_router(dial_log_router)
+app.include_router(day_router)

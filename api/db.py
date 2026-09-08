@@ -127,10 +127,13 @@ def init_db(conn: sqlite3.Connection | None = None) -> sqlite3.Connection:
     if item_columns and "phone" not in item_columns:
         conn.execute("ALTER TABLE plan_items ADD COLUMN phone TEXT")
     campaign_columns = {r["name"] for r in conn.execute("PRAGMA table_info(campaigns)")}
-    if campaign_columns and "autopilot" not in campaign_columns:
-        conn.execute("ALTER TABLE campaigns ADD COLUMN autopilot INTEGER NOT NULL DEFAULT 0")
-    if campaign_columns and "autopilot_note" not in campaign_columns:
-        conn.execute("ALTER TABLE campaigns ADD COLUMN autopilot_note TEXT NOT NULL DEFAULT ''")
+    for column, ddl in (("autopilot", "INTEGER NOT NULL DEFAULT 0"),
+                        ("autopilot_note", "TEXT NOT NULL DEFAULT ''"),
+                        ("stopped_reason", "TEXT NOT NULL DEFAULT ''"),
+                        ("autopilot_latched", "INTEGER NOT NULL DEFAULT 0"),
+                        ("platform_status", "TEXT NOT NULL DEFAULT ''")):
+        if campaign_columns and column not in campaign_columns:
+            conn.execute(f"ALTER TABLE campaigns ADD COLUMN {column} {ddl}")
     conn.executescript(SCHEMA.read_text(encoding="utf-8"))
     conn.commit()
     return conn
@@ -160,7 +163,7 @@ def now_iso() -> str:
 # The contract's default config, verbatim. Every campaign starts at version 1
 # with this body; a PUT inserts version N+1 and nothing is ever mutated.
 DEFAULT_CONFIG: dict[str, Any] = {
-    "dial_window": {"start": "09:30", "end": "19:00"},
+    "dial_window": {"start": "09:00", "end": "20:00"},
     "frequency_table": [
         {"bucket": "F1", "label": "Warm-up",          "from_dte": 45, "to_dte": 32, "calls_per_week": 2, "calls_per_day": 0},
         {"bucket": "F2", "label": "Early engagement", "from_dte": 31, "to_dte": 24, "calls_per_week": 2, "calls_per_day": 0},
@@ -171,6 +174,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         {"bucket": "F6", "label": "Grace period",     "from_dte": -2, "to_dte": -3, "calls_per_week": 0, "calls_per_day": 2},
     ],
     "bucket_priority": ["M0", "E0", "F6", "F5", "F4", "F3", "F2", "F1", "D0"],
+    # Applied AHEAD of bucket_priority — see dispatcher.DEFAULT_RED_PRIORITY.
+    # Decides what survives when a run is capped or approved with too few hours
+    # left in the day.
+    "red_priority": [[3, 1], [0, -7]],
     "auto_dispositions": ["did_not_pick", "hung_up", "unreachable", "rnr",
                           "beep_tone_number_busy_not_reachable_switched_off",
                           "voicemail", "telephony_failed", "dialer_nc",
@@ -218,6 +225,14 @@ SUPERSEDED_FREQUENCY = {
 }
 
 
+# Every dial window this app has shipped as a default and has since widened. A
+# campaign storing one of these verbatim never had it edited, so it is the old
+# default rather than an operator's choice -- and leaving it means the client's
+# "calls only between 9am and 8pm" reaches none of the 22 live campaigns, which
+# all carry the 09:30-19:00 snapshot they were created with.
+SUPERSEDED_WINDOWS = {("09:30", "19:00")}
+
+
 def _signature(table: Any) -> tuple:
     try:
         return tuple((str(r["bucket"]), int(r["from_dte"]), int(r["to_dte"]),
@@ -243,6 +258,9 @@ def with_defaults(body: dict[str, Any]) -> dict[str, Any]:
     """
     if _signature(body.get("frequency_table")) in SUPERSEDED_FREQUENCY:
         body = {**body, "frequency_table": DEFAULT_CONFIG["frequency_table"]}
+    saved_window = body.get("dial_window") or {}
+    if (str(saved_window.get("start")), str(saved_window.get("end"))) in SUPERSEDED_WINDOWS:
+        body = {**body, "dial_window": dict(DEFAULT_CONFIG["dial_window"])}
     return {**DEFAULT_CONFIG, **body}
 
 

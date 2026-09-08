@@ -7,6 +7,12 @@ never POSTs to Formi — it records exactly what it *would* have sent and marks
 items `simulated`. Every commit-style response carries `"dry_run": true` so the UI
 can badge it. Only an explicit `DRY_RUN=0` in the environment enables live dialling.
 
+**The approval gate:** nothing in this console dials on its own. Two passes a day
+PREPARE a plan and stop; a call is placed only by `POST /api/day/approve` or
+`POST /api/runs/{id}/approve`, both of which an operator has to invoke. If nobody
+approves, no call goes out that day. Dialling hours are **09:00–20:00 IST**,
+enforced server-side.
+
 ---
 
 ## Core objects
@@ -15,11 +21,18 @@ can badge it. Only an explicit `DRY_RUN=0` in the environment enables live diall
 // Campaign
 { "id": 1, "agent_id": 125, "warehouse_id": 1650, "name": "0308Redial -PV Hindi",
   "enabled": true, "paused": false,
-  "autopilot": false, "autopilot_note": "" }   // see Autopilot below
+  "autopilot": false, "autopilot_note": "",    // see The daily plan below
+  // Why it is paused, in words a screen can print: "paused by operator",
+  // "paused in the Formi platform", "killed in the Formi platform".
+  "stopped_reason": "",
+  // The pause took autopilot away; a resume HERE puts it back. Nothing else
+  // does — see the pause/resume rows below.
+  "autopilot_latched": false,
+  "platform_status": "active" }                // last status Formi reported
 
 // Config (versioned; PUT creates a new version, never mutates)
 { "version": 3, "created_at": "2026-08-28T09:12:00",
-  "dial_window": { "start": "09:30", "end": "19:00" },   // clamped to 09:00-19:00
+  "dial_window": { "start": "09:30", "end": "20:00" },   // clamped to 09:00-20:00 IST
   "frequency_table": [
     { "bucket": "F1", "label": "Warm-up",          "from_dte": 45, "to_dte": 32, "calls_per_week": 2, "calls_per_day": 0 },
     { "bucket": "F2", "label": "Early engagement", "from_dte": 31, "to_dte": 24, "calls_per_week": 2, "calls_per_day": 0 },
@@ -30,6 +43,11 @@ can badge it. Only an explicit `DRY_RUN=0` in the environment enables live diall
     { "bucket": "F6", "label": "Grace period",     "from_dte": -2, "to_dte": -3, "calls_per_week": 0, "calls_per_day": 2 }
   ],
   "bucket_priority": ["M0","E0","F6","F5","F4","F3","F2","F1","D0"],
+  // RED bands, applied AHEAD of bucket_priority: renewals due in 3..1 days go
+  // first, then the RED day and the week after it, then everything else. This is
+  // what decides who survives when a day is capped or approved with few hours
+  // left, so it outranks the bucket order rather than living inside it.
+  "red_priority": [[3, 1], [0, -7]],
   "auto_dispositions": ["did_not_pick","hung_up","unreachable","rnr",
                         "beep_tone_number_busy_not_reachable_switched_off",
                         "voicemail","telephony_failed","dialer_nc",
@@ -68,12 +86,16 @@ can badge it. Only an explicit `DRY_RUN=0` in the environment enables live diall
   "lead_name": "…", "disposition": "did_not_pick", "disposition_class": "dnp",
   "dte": 5, "bucket": "F5", "bucket_label": "Critical window", "priority": 2,
   "slot_no": 1, "scheduled_time": "2026-08-28T09:34:00",
-  "status": "planned",           // planned | simulated | posted | failed | skipped
+  // planned | simulated | posted | failed | skipped
+  // expired = its slot fell inside Formi's 5-minute floor by the time the day was
+  // approved, so it was retired instead of posted. Not an error, and not a call.
+  "status": "planned",
   "http_status": null, "response": null }
 
 // Run
-{ "id": 4, "campaign_id": 1, "run_date": "2026-08-28", "kind": "auto",  // auto | manual
-  "status": "planned",           // planned | approved | committed | failed
+{ "id": 4, "campaign_id": 1, "run_date": "2026-08-28",
+  "kind": "auto",                // auto (morning wave) | auto_pm (afternoon) | manual
+  "status": "planned",           // planned | committed | paused
   "config_version": 3, "created_at": "…",
   "counts": { "evaluated": 9812, "planned": 1284, "slots": 1602,
               "posted": 0, "failed": 0 } }
@@ -87,39 +109,132 @@ can badge it. Only an explicit `DRY_RUN=0` in the environment enables live diall
 | Method | Path | Notes |
 |---|---|---|
 | `GET` | `/api/campaigns` | list |
-| `POST` | `/api/campaigns/{id}/pause` | sets `paused=true`; blocks approve/commit |
-| `POST` | `/api/campaigns/{id}/resume` | |
+| `POST` | `/api/campaigns/{id}/pause` | sets `paused=true`, blocks approve/commit, **and takes today's un-dialled calls back off Formi's clock**. A pause that leaves calls booked is not a pause. Latches `autopilot` and clears it. |
+| `POST` | `/api/campaigns/{id}/resume` | clears the pause and restores the latched `autopilot`. **The only way back** — see the platform-pause latch below. |
 | `GET` | `/api/campaigns/{id}/config` | current version |
-| `PUT` | `/api/campaigns/{id}/config` | body = config; **422** if `dial_window` outside 09:00–19:00 or `start >= end`; returns new version |
+| `PUT` | `/api/campaigns/{id}/config` | body = config; **422** if `dial_window` outside 09:00–20:00 or `start >= end`; returns new version |
 | `GET` | `/api/campaigns/{id}/config/history` | `[{version, created_at}]` |
 | `DELETE` | `/api/campaigns/{id}` | removes the campaign with its leads, config and runs |
 
-### Autopilot
+**The platform-pause latch.** Pausing a campaign in the Formi platform pauses it
+here too, on the EDGE into `paused` — the next sync or wave cancels its queued
+calls and sets `stopped_reason: "paused in the Formi platform"`. Un-pausing it in
+Formi does **not** start calls again here. That is deliberate and was asked for:
+the campaign stays held until somebody hits `POST /api/campaigns/{id}/resume` on
+this console. `autopilot_latched` is how the campaign remembers it was in the
+daily plan, so a resume puts it back exactly as it was rather than arming a
+campaign nobody armed.
 
-Switched on per campaign; the server then runs that campaign until there is
-nothing left to call. Two passes a day, each preceded by a re-sync of that
-campaign's leads so the afternoon call only goes to leads that did not pick up.
+### The daily plan (autopilot)
 
-* `M0 E0 F6 F5` (RED−7 … RED+3) are planned **and dialled** unattended.
-* `F4 F3 F2 F1 D0` are planned as a `review` run and wait for `POST /api/runs/{id}/approve`.
+`campaigns.autopilot` means **"include this campaign in the daily plan"**. It is
+not a dialler. Twice a day a pass re-reads campaign status, re-syncs those
+campaigns' leads and PREPARES a plan for each — and stops there, leaving the run
+`planned`. There is no path from a pass to Formi.
 
-The line between the two is `URGENT` / `REVIEW_BUCKETS` in `api/autopilot.py`.
 Pass times come from `AUTOPILOT_AM` (default `10:00`) and `AUTOPILOT_PM`
-(default `15:00`), IST.
+(default `15:00`), IST. Two waves because the client's rule is "second call only
+if the first is not answered": the afternoon plan is built *after* a re-sync, so
+it only reaches leads whose disposition still says nobody picked up. Each wave
+needs its own approval.
 
-It stops by itself when the campaign is paused, when it is killed in Formi, or
-when the warehouse holds no lead with a RED at or above `dte_min` (−3) whose
-stage is not terminal. A warehouse it cannot reach never counts as "finished",
-and a pass whose re-sync failed is skipped rather than run against stale leads.
+The same tick settles the dial log every 10 minutes between 09:00 and 21:00 (see
+Call log). Verification is read-only and cannot place a call.
+
+A campaign leaves the daily plan when it is paused here, when it is paused or
+killed in Formi, or when the warehouse holds no lead with a RED at or above
+`dte_min` (−3) whose stage is not terminal. A warehouse it cannot reach never
+counts as "finished", and a pass whose re-sync failed skips that campaign rather
+than planning against stale leads.
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET` | `/api/autopilot` | `{passes, urgent_buckets, review_buckets, now, fired_today, campaigns[]}`. `now` is the server's IST clock as `HH:MM` — pass times are IST and the browser is not, so "has 10:00 gone by?" is only answerable here. A pass whose `at` is `<= now` and is absent from `fired_today` was missed; it fires once a day and is never retried. |
-| `POST` | `/api/campaigns/{id}/autopilot` | `{ "on": true \| false }` → the campaign; **409** if disabled |
-| `POST` | `/api/autopilot/run` | `{ "kind": "auto" \| "auto_pm", "date"? }` — fire a pass now; safe to repeat, an already-committed pass answers `already_ran` |
+| `GET` | `/api/autopilot` | `{passes, dials: false, now, fired_today, campaigns[]}`. `dials` is always `false` and is said out loud so a screen can repeat it. `now` is the server's IST clock as `HH:MM` — pass times are IST and the browser is not, so "has 10:00 gone by?" is only answerable here. A pass whose `at` is `<= now` and is absent from `fired_today` was missed; it fires once a day and is never retried. |
+| `POST` | `/api/campaigns/{id}/autopilot` | `{ "on": true \| false }` → the campaign; **409** if disabled. Switching it on never places a call. |
+| `POST` | `/api/autopilot/run` | `{ "kind": "auto" \| "auto_pm", "date"? }` — prepare a wave now; safe to repeat, an already-approved wave answers `already_ran` |
 
-Run kinds: `auto` (morning, dialled), `auto_pm` (afternoon, dialled), `review`
-(morning, awaiting approval), `manual`.
+Run kinds: `auto` (morning wave), `auto_pm` (afternoon wave), `manual`.
+
+### The day
+
+One page for the whole day across every campaign in the plan, and one approval.
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/api/day?date=&kind=` | the whole day. Cheap by construction — two `GROUP BY`s over rows the console already wrote, so a screen may poll it all day without costing a warehouse query. Never re-runs the engine. |
+| `POST` | `/api/day/prepare` | `{date?, kind?, resync?}` → builds `planned` runs for every campaign in the plan. **Dials nothing.** `resync: true` (what a pass sets) re-reads campaign status and re-pulls leads first. |
+| `POST` | `/api/day/approve` | `{date?, kind?, buckets?[], campaign_ids?[]}` → **dials.** Empty `buckets` means every bucket; empty `campaign_ids` means every campaign with a plan waiting. |
+
+`status` is one of `no_campaigns` · `not_prepared` · `awaiting_approval` ·
+`approved`, so the screen has one thing to switch on rather than four counters to
+interpret.
+
+```jsonc
+// GET /api/day
+{ "date": "2026-09-09", "kind": "auto", "wave": "morning",
+  "now": "11:04", "dry_run": true,
+  "window": { "start": "09:00", "end": "20:00" }, "window_open": true,
+  "status": "awaiting_approval",
+  "totals": { "campaigns": 4, "ready": 633, "posted": 0, "failed": 0, "dropped": 0 },
+  // A ceiling, not a promise: minutes left in the window x max_per_minute.
+  // Approve re-plans, so the real number is decided then — but an operator
+  // opening this at 18:00 has to see the day no longer fits BEFORE approving.
+  "capacity_before_close": 633,
+  "red_bands": [ { "rank": 0, "dte_from": 3, "dte_to": 1,
+                   "label": "renewal due in 1-3 days", "ready": 210 },
+                 { "rank": 2, "dte_from": null, "dte_to": null,
+                   "label": "outside the priority bands", "ready": 12 } ],
+  // Best RED band first, then the bucket order inside it — the same order
+  // approve dials in, so the screen cannot promise a sequence the dispatcher
+  // will not honour.
+  "buckets": [ { "bucket": "M0", "label": "Mandatory day", "ready": 196, "best_rank": 0 } ],
+  "campaigns": [ { "id": 1650, "name": "…", "run_id": 912,
+                   "run_status": "planned",   // or "not_prepared"
+                   "ready": 312, "by_bucket": { "M0": 96 },
+                   "posted": 0, "failed": 0, "dropped": 0 } ],
+  // "Why is nothing happening for X" — armed campaigns now held, with the reason.
+  "stopped": [ { "id": 1644, "name": "…", "why": "paused in the Formi platform" } ],
+  "dial_log": { "dialled": 88, "queued": 12, "missing": 1 } }
+```
+
+**Approving late does not dial into the night.** `approve` RE-PLANS each campaign
+from the current minute with the buckets the operator ticked, then commits it, so
+only what genuinely fits before the window shuts is scheduled — best RED band
+first. Whatever does not fit is not dialled today and returns in tomorrow's plan
+(`not_dialled` in the response). Approving a wave twice does not dial twice: a run
+that is no longer `planned` answers `already_committed`.
+
+```jsonc
+// POST /api/day/approve
+{ "date": "2026-09-09", "kind": "auto", "wave": "morning", "dry_run": true,
+  "buckets": ["M0","F5"],        // or "all"
+  "approved": 4, "posted": 461, "failed": 0, "not_dialled": 172,
+  "campaigns": [ { "campaign_id": 1650, "name": "…", "status": "approved",
+                   "run_id": 913, "posted": 210, "failed": 0, "dropped": 0,
+                   "expired": 0, "simulated": 210 } ] }
+```
+
+### Call log
+
+Two separate facts, never merged — merging them is why the console could not
+answer "did the call actually happen?".
+
+* **`outcome`** — what Formi's API answered when we POSTed: `posted` · `failed` ·
+  `simulated`. A 2xx says the request was *accepted*, nothing more.
+* **`verified`** — what the warehouse says later: `pending` (sent, not checked
+  yet) · `queued` (Formi holds the slot, has not dialled it) · `dialled` (an
+  interaction with a call stage exists — **the only proof a call happened**) ·
+  `missing` (sent, nothing came back) · `simulated` (nothing was sent).
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/api/dial-log?date=&campaign_id=&run_id=&verified=&outcome=&limit=&offset=` | `{total, limit, offset, rows[]}` |
+| `GET` | `/api/dial-log/summary?date=&campaign_id=` | `{date, campaigns:[{campaign_id, sent, outcome{}, verified{}, talk_time_sec}]}` — the rolled-up counts the day screen shows, so two screens cannot disagree |
+| `POST` | `/api/dial-log/verify?date=&wait=` | read the warehouse back now. Read-only there, writes only to the local log, so it is unaffected by `DRY_RUN` and **can never place a call**. `wait=true` blocks for the result; otherwise it returns immediately and settles off-thread. |
+
+A row is written for every call the console sends, dry runs included, at the
+moment it is sent — never from an inference afterwards. Rows are pruned after
+`DIAL_LOG_RETENTION_DAYS` (default 30).
 
 ### Planning & review
 | Method | Path | Notes |
@@ -129,7 +244,10 @@ Run kinds: `auto` (morning, dialled), `auto_pm` (afternoon, dialled), `review`
 | `GET` | `/api/runs?campaign_id=&limit=` | history |
 | `GET` | `/api/runs/{id}` | run + counts |
 | `GET` | `/api/runs/{id}/items?bucket=&disposition=&status=&page=&page_size=` | paged; default page_size 50 |
-| `POST` | `/api/runs/{id}/approve` | **the only path that dials.** 409 if campaign paused or run not `planned`. Under DRY_RUN marks items `simulated`. |
+| `POST` | `/api/runs/{id}/approve` | **dials** — one campaign's run, the per-campaign twin of `POST /api/day/approve`. 409 if the campaign is paused or the run is not `planned`. Under DRY_RUN marks items `simulated`. |
+| `POST` | `/api/runs/{id}/pause` | takes a `committed` run's un-dialled calls back off Formi's clock and marks it `paused`. Already-dialled calls stay in history. 409 if not `committed`. |
+| `POST` | `/api/runs/{id}/resume` | puts a `paused` run's remainder back on Formi's clock, edits included. 409 if not `paused`, or if the campaign is paused. **Dials.** |
+| `DELETE` | `/api/runs/{id}` | discard a plan. 409 for anything not `planned` — a committed run is dial history and is kept. |
 
 `GET /api/campaigns/{id}/buckets` returns both dimensions plus the crosstab:
 
@@ -257,6 +375,39 @@ simulated test proves lead resolution and payload shape — not connectivity.
 `trigger` ignores campaign pause (a paused campaign is exactly when you want to
 rehearse) but never ignores exclusions or the allow-list.
 
+### Sync
+
+The systemd timer (`chola-redial-sync.timer`) pulls campaigns and leads hourly at
+`:15`. That is the floor, not the ceiling — a campaign created at 20:20 is
+invisible until 21:15 — so the console can ask for the pull itself.
+
+| Method | Path | Notes |
+|---|---|---|
+| `POST` | `/api/sync` | start a pull; returns immediately. Asking twice returns the run already in flight rather than starting a second one. Reads only — **nothing here dials**, so it is safe under any `DRY_RUN`. |
+| `GET` | `/api/sync` | `{running, ok, error, campaigns, leads}`. `ok: null` means still running. |
+
+State is in process memory, not a table: one process owns the console, the answer
+only matters for the minutes the pull takes, and a restart that loses it is
+correct — the restart killed the thread too.
+
+### The dry-run switch
+
+| Method | Path | Notes |
+|---|---|---|
+| `POST` | `/api/config/dry-run` | `{"enabled": true}` → back to dry run, free. `{"enabled": false, "confirm": "GO LIVE"}` → **live dialling**; **400** without that exact word. Returns `{dry_run}`. |
+
+Deliberately **not** written to `.env`. A restart returns to whatever the file
+says, so the blast radius of leaving live dialling on is one process life rather
+than forever. Every dialling helper re-reads `DRY_RUN` as its first statement, so
+the switch reaches all of them without a restart. Each flip is printed to the
+journal — this is the one control that decides whether real customers get called,
+and the journal is where that question gets answered afterwards.
+
 ### Misc
 `GET /api/health` → `{ "ok": true, "dry_run": true, "db": "redial.db",
 "leads_source": "warehouse", "agents": [125, 127], "test_numbers": ["9379747274"] }`
+
+`leads_source` is read from the campaign table, not from `LEADS_SOURCE`: that is
+a hand-set string nobody edits after a sync, and the banner an operator checks
+before a live dial read "seed" over 22 real campaigns. Seed ids are 1–16 and
+warehouse ids 1400+, so the data answers this without being asked.

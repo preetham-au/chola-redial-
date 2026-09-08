@@ -7,9 +7,9 @@ export interface Campaign {
   name: string;
   enabled: boolean;
   paused: boolean;
-  /** Switched on here and only here: the server dials this campaign's urgent
-   *  buckets twice a day until nothing is left to call. Optional so a backend
-   *  that predates it still typechecks. */
+  /** "Include this campaign in the daily plan." It never dials: the server
+   *  prepares a plan twice a day and it waits for the day to be approved.
+   *  Optional so a backend that predates it still typechecks. */
   autopilot?: boolean;
   /** Why it last stopped, or the result of its last pass. */
   autopilot_note?: string;
@@ -152,11 +152,167 @@ export interface BucketsResponse {
  *  `fired_today` was missed (the warehouse was down) and can be re-fired. */
 export interface AutopilotStatus {
   passes: { kind: string; at: string }[];
-  urgent_buckets: string[];
-  review_buckets: string[];
+  /** Always false. A pass PREPARES a plan; the day screen dials it. */
+  dials: boolean;
   /** Server clock, IST HH:MM. The pass times are IST too; the browser is not. */
   now: string;
   fired_today: string[];
+}
+
+/* --- The day ---------------------------------------------------------------
+   `GET /api/day` is the whole console on one page: what is ready, in what
+   order, and whether it has been dialled. Nothing goes out until the day is
+   approved, so `status` is the only thing an operator has to read. */
+
+export type DayStatus = 'no_campaigns' | 'not_prepared' | 'awaiting_approval' | 'approved';
+
+/** A RED priority band, best first. `dte` is (RED date − today): positive means
+ *  the renewal is still ahead, negative means the policy is past its RED date.
+ *  The catch-all band that comes last has null bounds. */
+export interface DayBand {
+  rank: number;
+  dte_from: number | null;
+  dte_to: number | null;
+  label: string;
+  ready: number;
+}
+
+/** `best_rank` is the best RED band any lead in the bucket sits in — the bucket
+ *  list is sorted by it, which is the order approve will dial in. */
+export interface DayBucket {
+  bucket: string;
+  label: string;
+  ready: number;
+  best_rank: number;
+}
+
+export interface DayCampaign extends Campaign {
+  run_id: number | null;
+  run_status: RunStatus | 'not_prepared';
+  ready: number;
+  by_bucket: Record<string, number>;
+  posted: number;
+  failed: number;
+  dropped: number;
+}
+
+export interface DayView {
+  date: string;
+  kind: string;
+  wave: string;
+  /** Server clock, IST HH:MM. */
+  now: string;
+  dry_run: boolean;
+  window: DialWindow;
+  window_open: boolean;
+  status: DayStatus;
+  totals: { campaigns: number; ready: number; posted: number; failed: number; dropped: number };
+  /** A ceiling, not a promise: how many calls the hours left in the window can
+   *  still hold. Approve re-plans, so the real number is decided then. */
+  capacity_before_close: number;
+  buckets: DayBucket[];
+  red_bands: DayBand[];
+  campaigns: DayCampaign[];
+  /** Armed campaigns that are paused or disabled, so "why is nothing happening
+   *  for X" has an answer on the screen rather than in a log. */
+  stopped: (Campaign & { why: string })[];
+  /** verify state -> count, straight off the dial log. */
+  dial_log: Record<string, number>;
+}
+
+export interface PrepareResult {
+  date: string;
+  kind: string;
+  wave: string;
+  ready: number;
+  prepared: number;
+  campaigns: Array<{
+    campaign_id: number;
+    name?: string;
+    status: string;
+    detail?: string;
+    ready?: number;
+    run_id?: number;
+  }>;
+}
+
+export interface ApproveResult {
+  date: string;
+  kind: string;
+  wave: string;
+  dry_run: boolean;
+  buckets: string[] | 'all';
+  approved: number;
+  posted: number;
+  failed: number;
+  /** Slots that no longer fit before the window shuts. Not lost — they come back
+   *  in tomorrow's plan. */
+  not_dialled: number;
+  campaigns: Array<{
+    campaign_id: number;
+    name: string;
+    status: string;
+    detail?: string;
+    posted?: number;
+    failed?: number;
+  }>;
+}
+
+/* --- Dial log --------------------------------------------------------------
+   Two separate facts. `outcome` is what Formi answered when we posted;
+   `verified` is what the warehouse says actually happened, read back later.
+   A 2xx says the request was accepted — only `verified: 'dialled'` says a call
+   was made. */
+
+export type DialOutcome = 'posted' | 'failed' | 'simulated' | 'skipped';
+export type DialVerified = 'pending' | 'queued' | 'dialled' | 'missing' | 'simulated';
+
+export interface DialLogRow {
+  id: number;
+  created_at: string;
+  campaign_id: number;
+  agent_id: number | null;
+  run_id: number | null;
+  item_id: number | null;
+  source: string;
+  lead_uuid: string | null;
+  policy_no: string | null;
+  lead_name: string | null;
+  phone: string | null;
+  bucket: string | null;
+  disposition: string | null;
+  dte: number | null;
+  scheduled_time: string | null;
+  dry_run: boolean;
+  url: string | null;
+  attempts: number;
+  http_status: number | null;
+  response: string | null;
+  outcome: string;
+  verified: string;
+  checked_at?: string | null;
+  interaction_id?: number | null;
+  call_stage?: string | null;
+  call_disposition?: string | null;
+  duration_sec?: number | null;
+}
+
+export interface DialLogPage {
+  total: number;
+  limit: number;
+  offset: number;
+  rows: DialLogRow[];
+}
+
+export interface DialLogSummary {
+  date: string;
+  campaigns: Array<{
+    campaign_id: number;
+    sent: number;
+    outcome: Record<string, number>;
+    verified: Record<string, number>;
+    talk_time_sec: number;
+  }>;
 }
 
 export interface Health {

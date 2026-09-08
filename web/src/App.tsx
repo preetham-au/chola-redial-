@@ -1,9 +1,11 @@
 import { useEffect, useState } from 'react';
 import {
   AlertTriangle,
+  CalendarCheck,
   CheckCircle2,
   CircleSlash,
   FlaskConical,
+  History,
   LayoutGrid,
   ListChecks,
   PhoneCall,
@@ -25,12 +27,22 @@ import { PlanReview } from './screens/PlanReview';
 import { ConfigScreen } from './screens/ConfigScreen';
 import { ManualRedial } from './screens/ManualRedial';
 import { BulkStage } from './screens/BulkStage';
+import { Today } from './screens/Today';
+import { CallLog } from './screens/CallLog';
 import type { Campaign } from './lib/types';
 
+// Two screens answer the two questions an operator actually has — "what goes
+// out today?" and "did it go out?" — so they come first and everything that
+// was here before is filed under the campaign it belongs to.
 const NAV = [
-  { group: 'Today', items: [
+  { group: 'Every day', items: [
+    { id: 'today', label: 'The day', icon: CalendarCheck },
+    { id: 'calllog', label: 'Call log', icon: History },
+  ]},
+  { group: 'One campaign', items: [
     { id: 'dashboard', label: 'Dashboard', icon: LayoutGrid },
     { id: 'plan', label: 'Plan review', icon: ListChecks },
+    { id: 'config', label: 'Campaign config', icon: Settings2 },
   ]},
   { group: 'Dial deliberately', items: [
     { id: 'manual', label: 'Manual redial', icon: PhoneOutgoing },
@@ -39,10 +51,11 @@ const NAV = [
   { group: 'Lead data', items: [
     { id: 'bulk', label: 'Bulk stage change', icon: Tags },
   ]},
-  { group: 'Settings', items: [
-    { id: 'config', label: 'Campaign config', icon: Settings2 },
-  ]},
 ];
+
+// The day and the call log span every campaign, so the campaign picker and the
+// "pick a campaign first" gate do not apply to them.
+const CAMPAIGN_FREE = new Set(['today', 'calllog', 'testcall']);
 
 export function App() {
   const [route, go] = useRoute();
@@ -108,37 +121,44 @@ export function App() {
           {/* The scope, restated where the approve buttons are. */}
           <AgentChip agent={agent} />
 
-          <div className="topbar-sep" />
+          {/* The day and the call log span every campaign, so a picker there
+              would only mislead — it is the screen's own date control that
+              matters. */}
+          {!CAMPAIGN_FREE.has(head) && (
+            <>
+              <div className="topbar-sep" />
 
-          <label className="eyebrow" htmlFor="campaign">Campaign</label>
-          <CampaignPicker
-            campaigns={campaigns}
-            campaignId={campaignId}
-            onPick={setCampaign}
-          />
+              <label className="eyebrow" htmlFor="campaign">Campaign</label>
+              <CampaignPicker
+                campaigns={campaigns}
+                campaignId={campaignId}
+                onPick={setCampaign}
+              />
 
-          {campaign?.paused && (
-            <span className="badge badge-warn">
-              <CircleSlash size={11} /> Paused
-            </span>
+              {campaign?.paused && (
+                <span className="badge badge-warn">
+                  <CircleSlash size={11} /> Paused
+                </span>
+              )}
+              {campaign && !campaign.enabled && (
+                <span className="badge">
+                  <CircleSlash size={11} /> Disabled
+                </span>
+              )}
+              {campaign && <CampaignPauseButton campaign={campaign} />}
+
+              <div className="topbar-sep" />
+
+              <label className="eyebrow" htmlFor="date">Date</label>
+              <input
+                id="date"
+                className="input"
+                type="date"
+                value={date}
+                onChange={(e) => setDate(e.target.value)}
+              />
+            </>
           )}
-          {campaign && !campaign.enabled && (
-            <span className="badge">
-              <CircleSlash size={11} /> Disabled
-            </span>
-          )}
-          {campaign && <CampaignPauseButton campaign={campaign} />}
-
-          <div className="topbar-sep" />
-
-          <label className="eyebrow" htmlFor="date">Date</label>
-          <input
-            id="date"
-            className="input"
-            type="date"
-            value={date}
-            onChange={(e) => setDate(e.target.value)}
-          />
 
           <div className="topbar-spacer" />
 
@@ -169,7 +189,7 @@ export function App() {
         )}
 
         <div className="scroller">
-          {campaignId === null && head !== 'testcall' ? (
+          {campaignId === null && !CAMPAIGN_FREE.has(head) ? (
             <div className="page">
               <div className="empty">
                 <Play />
@@ -271,6 +291,10 @@ export function CampaignPicker({
 function Screen({ route }: { route: string }) {
   const [head, arg] = route.split('/');
   switch (head) {
+    case 'today':
+      return <Today />;
+    case 'calllog':
+      return <CallLog />;
     case 'plan':
       return <PlanReview runId={arg ? Number(arg) : null} />;
     // Legacy routes fold into their new homes: runs → dashboard drawer,
@@ -290,7 +314,7 @@ function Screen({ route }: { route: string }) {
     case 'dashboard':
       return <Dashboard />;
     default:
-      navigate('dashboard');
+      navigate('today');
       return null;
   }
 }

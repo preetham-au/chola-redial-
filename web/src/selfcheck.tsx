@@ -9,8 +9,18 @@ import { AgentChip, AgentPauseConfirm, AgentSwitcher } from './components/AgentB
 import { CampaignPicker } from './App';
 import { BucketOffWhy } from './screens/Dashboard';
 import { TestCallResultView, TestNumberTable, TriggerConfirm } from './screens/TestCall';
+import { ApproveDay, Headline, wireBuckets } from './screens/Today';
+import { Row as LogRow } from './screens/CallLog';
 import { api } from './lib/api';
-import { mockBuckets, mockCampaigns, mockConfig, mockTestCall, mockTestNumbers } from './lib/mock';
+import {
+  mockBuckets,
+  mockCampaigns,
+  mockConfig,
+  mockDay,
+  mockDialLog,
+  mockTestCall,
+  mockTestNumbers,
+} from './lib/mock';
 import {
   agentsFrom,
   BUCKET_COLOR,
@@ -226,6 +236,95 @@ ok(
     <TriggerConfirm phone="9379747274" live typed="9379747274" onTyped={() => {}} busy={false} onClose={() => {}} onConfirm={() => {}} />,
   ).includes('disabled=""'),
 );
+
+// --- the day screen: the only place an operator agrees to place calls --------
+// Every assertion here is safety-bearing. The failure this guards against is a
+// screen that reads as "calls went out" when nothing was approved, or as
+// "approved" when the operator had unticked half the plan.
+{
+  const base = mockDay('2026-09-09', 'auto');
+  const day = (over: Partial<typeof base>) => ({ ...base, ...over });
+  const head = (d: typeof base) =>
+    renderToStaticMarkup(<Headline day={d} busy="" onPrepare={() => {}} onApprove={() => {}} />);
+
+  ok('every bucket ticked sends the empty list the server reads as "all"',
+     wireBuckets(['M0', 'F5'], ['M0', 'F5']).length === 0);
+  ok('a partial tick goes on the wire verbatim, never as "all"',
+     wireBuckets(['M0'], ['M0', 'F5']).join() === 'M0');
+
+  const waiting = head(base);
+  ok('an unapproved day says so in the headline', has(waiting, 'Nothing is dialled yet'));
+  ok('and never claims calls are on the clock', !has(waiting, 'calls on the clock'));
+
+  ok('a day with no campaigns points at the campaign list, not at a dial button',
+     has(head(day({ status: 'no_campaigns' })), 'Choose campaigns'));
+  ok('an unbuilt plan offers to build it, and says building dials nothing',
+     has(head(day({ status: 'not_prepared' })), 'dials nothing'));
+
+  const shortDay = head(day({ capacity_before_close: 40 }));
+  ok('when the day is too short the headline says how many actually fit',
+     has(shortDay, 'still fit before 20:00'));
+  ok('and says the rest come back tomorrow rather than vanishing',
+     has(shortDay, 'tomorrow'));
+
+  const shut = head(day({ window_open: false }));
+  ok('outside 09:00–20:00 the approve button is dead', has(shut, 'disabled=""'));
+  ok('and says why, instead of failing silently', has(shut, 'has closed for today'));
+
+  const empty = head(day({ totals: { ...base.totals, ready: 0 } }));
+  ok('a plan with nothing ready cannot be approved', has(empty, 'disabled=""'));
+
+  const modal = (over: Partial<typeof base>, buckets: string[], shown: string[]) =>
+    renderToStaticMarkup(
+      <ApproveDay day={day(over)} buckets={buckets} shown={shown} onClose={() => {}} onDone={() => {}} />,
+    );
+
+  const dry = modal({}, [], ['M0', 'F5', 'E0', 'F4']);
+  ok('a dry-run approval promises nothing reaches Formi', has(dry, 'nothing reaches Formi'));
+  ok('and is not dressed as a live dial', !has(dry, 'btn btn-live') && has(dry, 'Simulate up to'));
+  ok('a dry run needs no typed confirmation', !has(dry, 'disabled=""'));
+
+  const liveDay = modal({ dry_run: false }, [], ['M0', 'F5', 'E0', 'F4']);
+  ok('a live approval is warm-styled and warns there is no undo',
+     has(liveDay, 'btn btn-live') && has(liveDay, 'no undo'));
+  ok('and costs the typed word DIAL', has(liveDay, 'placeholder="DIAL"') && has(liveDay, 'disabled=""'));
+
+  const partial = modal({}, ['M0'], ['M0']);
+  ok('a partial tick is named in the confirmation, not summarised as "all"',
+     has(partial, '>M0<') && !has(partial, 'all of them'));
+  ok('the confirmation states the RED order that decides who survives a short day',
+     has(partial, 'best RED band first'));
+
+  const none = modal({}, [], []);
+  ok('unticking every bucket blocks the approve button rather than dialling all of them',
+     has(none, 'disabled=""') && has(none, 'nothing to dial'));
+}
+
+// --- the call log: proof, not paperwork -------------------------------------
+{
+  const rows = mockDialLog('2026-09-09').rows;
+  ok('the offline call-log fixture is entirely dry-run, so it can never read as proof',
+     rows.every((r) => r.dry_run && r.outcome === 'simulated' && r.verified === 'simulated'));
+
+  const sim = renderToStaticMarkup(<LogRow r={rows[0]} />);
+  ok('a simulated row says Dry run and never Dialled', has(sim, 'Dry run') && !has(sim, 'Dialled'));
+
+  const real = renderToStaticMarkup(
+    <LogRow r={{ ...rows[0], dry_run: false, outcome: 'posted', verified: 'dialled', duration_sec: 47 }} />,
+  );
+  ok('only a warehouse-verified row reads as Dialled', has(real, 'Dialled') && has(real, '47s'));
+
+  const lost = renderToStaticMarkup(
+    <LogRow r={{ ...rows[0], dry_run: false, outcome: 'posted', verified: 'missing' }} />,
+  );
+  ok('a call Formi accepted but never dialled is not shown as a success',
+     has(lost, 'Not in the warehouse') && !has(lost, 'Dialled'));
+
+  const failedPost = renderToStaticMarkup(
+    <LogRow r={{ ...rows[0], dry_run: false, outcome: 'failed', http_status: 502, response: 'upstream timeout', verified: 'missing' }} />,
+  );
+  ok('a rejected post shows the server’s own words', has(failedPost, 'upstream timeout') && has(failedPost, 'badge-bad'));
+}
 
 // --- the urgency ramp is written twice, so assert it agrees ------------------
 // BUCKET_COLOR fills the charts and the bucket dots; --b-F1..--b-D0 in app.css

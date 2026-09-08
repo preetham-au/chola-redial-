@@ -6,6 +6,10 @@
 -- operator turns it on here and only this app, or a killed campaign, turns it
 -- off. It ends by itself when every lead is past the grace floor or in a
 -- terminal stage (api/autopilot.py).
+--
+-- It means "include this campaign in the daily plan", not "dial this campaign".
+-- Nothing in this console dials without an operator approving the day — see
+-- api/day.py. One switch per campaign; ticking it on can never place a call.
 CREATE TABLE IF NOT EXISTS campaigns (
   id            INTEGER PRIMARY KEY,
   agent_id      INTEGER NOT NULL,
@@ -14,7 +18,20 @@ CREATE TABLE IF NOT EXISTS campaigns (
   enabled       INTEGER NOT NULL DEFAULT 1,
   paused        INTEGER NOT NULL DEFAULT 0,
   autopilot     INTEGER NOT NULL DEFAULT 0,
-  autopilot_note TEXT   NOT NULL DEFAULT ''   -- why it last stopped, or last pass
+  autopilot_note TEXT   NOT NULL DEFAULT '',  -- why it last stopped, or last pass
+  -- Why this campaign is stopped, in the operator's words rather than a flag:
+  -- 'paused in Formi' and 'stopped here' need different answers from the UI and
+  -- only one of them is the operator's own decision.
+  stopped_reason TEXT   NOT NULL DEFAULT '',
+  -- Set when a stop switched a RUNNING autopilot off. Resuming here restores it;
+  -- resuming a campaign that was never on autopilot only un-pauses it, so a
+  -- resume can never start dialling a cohort nobody armed.
+  autopilot_latched INTEGER NOT NULL DEFAULT 0,
+  -- Last `public.campaigns.status` a sync saw. The platform pause is EDGE
+  -- triggered off this: entering 'paused' stops the campaign here, staying
+  -- paused does nothing. Without it every sync would re-stop a campaign the
+  -- operator had deliberately resumed in this console.
+  platform_status TEXT NOT NULL DEFAULT ''
 );
 
 -- Versioned and append-only: a PUT inserts, it never updates. The current
@@ -151,3 +168,50 @@ CREATE TABLE IF NOT EXISTS test_calls (
   http_status    INTEGER,
   response       TEXT
 );
+
+-- Append-only record of every schedule this console sent, or would have sent.
+-- `plan_items` only ever holds a slot's CURRENT state: re-planning a day deletes
+-- its rows and pausing a run rewinds them to 'planned', so what was actually put
+-- on Formi's clock, and when, was recorded nowhere.
+--
+-- Nothing here is updated except the verify columns, and those are filled in by
+-- READING the interaction back out of the warehouse: a 2xx on the schedule POST
+-- proves Formi accepted the request, not that a call was placed, and certainly
+-- not that it completed. `verified` is the only column that answers that.
+CREATE TABLE IF NOT EXISTS dial_log (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at       TEXT    NOT NULL,     -- naive IST, when we sent it
+  campaign_id      INTEGER NOT NULL,
+  agent_id         INTEGER,
+  run_id           INTEGER,
+  item_id          INTEGER,
+  source           TEXT    NOT NULL,     -- autopilot | approve | resume | manual | test
+  lead_uuid        TEXT,
+  policy_no        TEXT,
+  contact_id       TEXT,
+  lead_name        TEXT,
+  phone            TEXT,
+  bucket           TEXT,
+  disposition      TEXT,                 -- the lead's stage when we decided to dial
+  dte              INTEGER,
+  scheduled_time   TEXT,                 -- the minute we asked Formi to dial at
+  dry_run          INTEGER NOT NULL DEFAULT 1,
+  url              TEXT    NOT NULL,
+  request_body     TEXT    NOT NULL,
+  attempts         INTEGER NOT NULL DEFAULT 1,
+  http_status      INTEGER,
+  response         TEXT,
+  outcome          TEXT    NOT NULL,     -- simulated | placed | rejected | error
+  checked_at       TEXT,
+  interaction_id   INTEGER,
+  call_stage       TEXT,
+  call_disposition TEXT,
+  duration_sec     INTEGER,
+  -- pending  not checked yet          queued   on Formi's clock, not dialled yet
+  -- dialled  a real call happened     missing  accepted, but nothing is queued
+  -- simulated  dry run, never sent    (terminal: dialled, simulated)
+  verified         TEXT NOT NULL DEFAULT 'pending'
+);
+CREATE INDEX IF NOT EXISTS ix_dial_log_campaign  ON dial_log(campaign_id, id DESC);
+CREATE INDEX IF NOT EXISTS ix_dial_log_scheduled ON dial_log(scheduled_time);
+CREATE INDEX IF NOT EXISTS ix_dial_log_verified  ON dial_log(verified, scheduled_time);

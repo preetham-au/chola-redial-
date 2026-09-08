@@ -20,6 +20,7 @@ from engine.red_engine import (
 )
 from engine.seed import load_leads
 
+from . import dial_log
 from .db import (
     DEFAULT_CONFIG, NO_TOKEN, current_config, dry_run, formi_token, insert_config,
     now_iso, now_ist, session,
@@ -144,7 +145,10 @@ def _item_json(row: sqlite3.Row) -> dict[str, Any]:
 def _campaign_json(row: sqlite3.Row) -> dict[str, Any]:
     return {"id": row["id"], "agent_id": row["agent_id"], "warehouse_id": row["warehouse_id"],
             "name": row["name"], "enabled": bool(row["enabled"]), "paused": bool(row["paused"]),
-            "autopilot": bool(row["autopilot"]), "autopilot_note": row["autopilot_note"]}
+            "autopilot": bool(row["autopilot"]), "autopilot_note": row["autopilot_note"],
+            "stopped_reason": row["stopped_reason"],
+            "autopilot_latched": bool(row["autopilot_latched"]),
+            "platform_status": row["platform_status"]}
 
 
 @router.get("/api/campaigns")
@@ -191,32 +195,88 @@ def resume_agent(agent_id: int) -> dict[str, Any]:
 
 
 def _set_agent_paused(agent_id: int, paused: bool) -> dict[str, Any]:
-    """Pause/resume every campaign on the agent — the kill switch for one voice."""
+    """Pause/resume every campaign on the agent — the kill switch for one voice.
+
+    Goes through the same stop as a single campaign, so the kill switch really
+    stops calls instead of only stopping new ones being planned.
+    """
+    cancelled = failed = 0
     with session() as conn:
-        if conn.execute("SELECT 1 FROM campaigns WHERE agent_id=?", (agent_id,)).fetchone() is None:
+        rows = conn.execute("SELECT * FROM campaigns WHERE agent_id=? ORDER BY id",
+                            (agent_id,)).fetchall()
+        if not rows:
             raise HTTPException(404, f"agent {agent_id} has no campaigns")
-        conn.execute("UPDATE campaigns SET paused=? WHERE agent_id=?", (int(paused), agent_id))
+        for row in rows:
+            if paused:
+                out = stop_campaign(conn, row, f"agent {agent_id} stopped in this console")
+                cancelled += out["cancelled"]
+                failed += out["cancel_failed"]
+            else:
+                resume_campaign(conn, row["id"])
         conn.commit()
     agent = next(a for a in list_agents() if a["agent_id"] == agent_id)
-    return {**agent, "campaigns_changed": list_campaigns(agent_id)}
+    return {**agent, "cancelled": cancelled, "cancel_failed": failed,
+            "campaigns_changed": list_campaigns(agent_id)}
 
 
 @router.post("/api/campaigns/{campaign_id}/pause")
-def pause(campaign_id: int) -> dict[str, Any]:
-    return _set_paused(campaign_id, True)
+def pause(campaign_id: int, reason: str = Query("stopped in this console")) -> dict[str, Any]:
+    with session() as conn:
+        campaign = _campaign(conn, campaign_id)
+        stopped = stop_campaign(conn, campaign, reason)
+        conn.commit()
+        return {**_campaign_json(_campaign(conn, campaign_id)), **stopped}
 
 
 @router.post("/api/campaigns/{campaign_id}/resume")
 def resume(campaign_id: int) -> dict[str, Any]:
-    return _set_paused(campaign_id, False)
-
-
-def _set_paused(campaign_id: int, paused: bool) -> dict[str, Any]:
     with session() as conn:
         _campaign(conn, campaign_id)
-        conn.execute("UPDATE campaigns SET paused=? WHERE id=?", (int(paused), campaign_id))
+        resume_campaign(conn, campaign_id)
         conn.commit()
         return _campaign_json(_campaign(conn, campaign_id))
+
+
+def stop_campaign(conn: sqlite3.Connection, campaign: sqlite3.Row,
+                  reason: str) -> dict[str, Any]:
+    """Stop a campaign here: pause it, disarm autopilot, take today's calls back.
+
+    Pausing is not a flag. Calls already accepted by Formi sit on ITS clock, so
+    stopping a campaign has to cancel them there too — otherwise "paused" only
+    means "plans no more calls" while the ones already queued keep dialling.
+    That is the whole of what the client asked for when a campaign is paused.
+
+    The autopilot state is latched rather than lost, so a resume in this console
+    puts the campaign back exactly as it was running. Nothing else restores it —
+    see `resume_campaign`.
+    """
+    cancelled = failed = 0
+    today = now_ist().date().isoformat()
+    for run in conn.execute(
+            "SELECT * FROM runs WHERE campaign_id=? AND run_date>=? AND status='committed' "
+            "ORDER BY id", (campaign["id"], today)).fetchall():
+        result = _pause_run(conn, run)
+        cancelled += result["cancelled"]
+        failed += result["cancel_failed"]
+    conn.execute(
+        "UPDATE campaigns SET paused=1, stopped_reason=?, "
+        "autopilot_latched=CASE WHEN autopilot=1 THEN 1 ELSE autopilot_latched END, "
+        "autopilot=0, autopilot_note=? WHERE id=?",
+        (reason, f"stopped: {reason}", campaign["id"]))
+    return {"cancelled": cancelled, "cancel_failed": failed}
+
+
+def resume_campaign(conn: sqlite3.Connection, campaign_id: int) -> None:
+    """Un-pause and put back whatever the stop took away. The ONLY way back.
+
+    Deliberately not `SET autopilot=1`: that would arm a campaign the operator
+    never armed, and under live dialling an unwanted arm is an unwanted call.
+    Only a latch set by `stop_campaign` is honoured.
+    """
+    conn.execute(
+        "UPDATE campaigns SET paused=0, stopped_reason='', "
+        "autopilot=CASE WHEN autopilot_latched=1 THEN 1 ELSE autopilot END, "
+        "autopilot_latched=0 WHERE id=?", (campaign_id,))
 
 
 @router.get("/api/campaigns/{campaign_id}/config")
@@ -268,8 +328,8 @@ def _evaluate(conn: sqlite3.Connection, campaign: sqlite3.Row, day: date,
     cfg = current_config(conn, campaign["id"])
     if window and any(window):
         saved = cfg.get("dial_window") or {}
-        cfg = {**cfg, "dial_window": {"start": window[0] or saved.get("start", "09:30"),
-                                      "end": window[1] or saved.get("end", "19:00")}}
+        cfg = {**cfg, "dial_window": {"start": window[0] or saved.get("start", "09:00"),
+                                      "end": window[1] or saved.get("end", "20:00")}}
     red, dcfg = _configs(cfg)
     # A plan for a FUTURE date is evaluated at the start of its dial window, so it
     # is reproducible whatever time of day the operator asks for it. A plan for
@@ -550,7 +610,7 @@ def patch_item(run_id: int, item_id: int, body: ItemPatch) -> dict[str, Any]:
 
 
 def _commit(conn: sqlite3.Connection, run: sqlite3.Row, campaign: sqlite3.Row,
-            verb: str) -> dict[str, Any]:
+            verb: str, source: str = "approve") -> dict[str, Any]:
     """Post this run's still-`planned` slots to Formi. The only path that dials.
 
     Shared by approve and resume: a resumed run is the same act as approving it,
@@ -588,15 +648,25 @@ def _commit(conn: sqlite3.Connection, run: sqlite3.Row, campaign: sqlite3.Row,
             [(json.dumps({"would_post": {
                 "url": _schedule_path(campaign["agent_id"], r["lead_uuid"]),
                 "body": {"scheduled_time": r["scheduled_time"]}}}), r["id"]) for r in items])
+        dial_log.write(conn, [dial_log.row(
+            campaign, r, source=source,
+            url=_schedule_path(campaign["agent_id"], r["lead_uuid"]),
+            body={"scheduled_time": r["scheduled_time"]}, dry=True,
+            outcome="simulated") for r in items])
         posted, failed = len(items), 0
     else:
-        posted, failed = _dial_live(conn, campaign, items)
+        posted, failed = _dial_live(conn, campaign, items, source)
     # Counts are cumulative across pause/resume cycles, so a run that went out in
     # two halves still reports how many calls it actually placed.
     conn.execute("UPDATE runs SET status='committed', posted=posted+?, failed=failed+?, "
                  "dropped=dropped+?, dry_run=? WHERE id=?",
                  (posted, failed, len(stale), int(dry_run()), run_id))
     conn.commit()
+    # Confirm on a background thread that what we just posted is really on the
+    # clock. Off the dial path on purpose: the operator gets the run back now,
+    # and the answer lands in the log a moment later.
+    if posted and not dry_run():
+        dial_log.verify_async(_iso_day(run["run_date"]))
     out = _run_json(conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
     out["dry_run"] = dry_run()
     out["simulated"] = posted if dry_run() else 0
@@ -631,7 +701,7 @@ def resume_run(run_id: int) -> dict[str, Any]:
         campaign = _campaign(conn, run["campaign_id"])
         if campaign["paused"]:
             raise HTTPException(409, f"campaign {campaign['id']} is paused")
-        return _commit(conn, run, campaign, "resuming")
+        return _commit(conn, run, campaign, "resuming", source="resume")
 
 
 @router.post("/api/runs/{run_id}/pause")
@@ -650,29 +720,49 @@ def pause_run(run_id: int) -> dict[str, Any]:
             raise HTTPException(404, f"run {run_id} not found")
         if run["status"] != "committed":
             raise HTTPException(409, f"run {run_id} is {run['status']}, not committed")
-
-        cutoff = now_ist().strftime("%Y-%m-%dT%H:%M:00")
-        items = conn.execute(
-            "SELECT * FROM plan_items WHERE run_id=? AND status IN ('posted','simulated') "
-            "AND scheduled_time > ? ORDER BY scheduled_time, id", (run_id, cutoff)).fetchall()
-
-        cancelled = failed = 0
-        if items and not dry_run():
-            cancelled, failed = _cancel_live(conn, run, items)
-        elif items:
-            cancelled = len(items)                     # simulated: nothing to undo
-        conn.executemany("UPDATE plan_items SET status='planned', http_status=NULL WHERE id=?",
-                         [(r["id"],) for r in items])
-        conn.execute("UPDATE runs SET status='paused', posted=MAX(posted-?, 0) WHERE id=?",
-                     (cancelled, run_id))
+        out = _pause_run(conn, run)
         conn.commit()
-        out = _run_json(conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
-        out["cancelled"] = cancelled
-        out["cancel_failed"] = failed
-        out["left_running"] = conn.execute(
-            "SELECT COUNT(*) c FROM plan_items WHERE run_id=? AND status IN ('posted','simulated')",
-            (run_id,)).fetchone()["c"]
         return out
+
+
+def _pause_run(conn: sqlite3.Connection, run: sqlite3.Row) -> dict[str, Any]:
+    """The body of `pause_run`, on a caller's connection and without committing.
+
+    Split out so stopping a whole campaign can cancel each of its committed runs
+    inside one transaction instead of re-entering the endpoint (which would open
+    a second connection to the same SQLite file mid-write).
+    """
+    run_id = run["id"]
+    cutoff = now_ist().strftime("%Y-%m-%dT%H:%M:00")
+    items = conn.execute(
+        "SELECT * FROM plan_items WHERE run_id=? AND status IN ('posted','simulated') "
+        "AND scheduled_time > ? ORDER BY scheduled_time, id", (run_id, cutoff)).fetchall()
+
+    cancelled = failed = 0
+    if items and not dry_run():
+        cancelled, failed = _cancel_live(conn, run, items)
+    elif items:
+        cancelled = len(items)                     # simulated: nothing to undo
+    conn.executemany("UPDATE plan_items SET status='planned', http_status=NULL WHERE id=?",
+                     [(r["id"],) for r in items])
+    # The log said these calls were placed, and they were — then we took them
+    # back. Leaving them open would have the verifier report them `missing`,
+    # which reads like a fault instead of the cancellation it is.
+    if items:
+        marks = ",".join("?" * len(items))
+        conn.execute(
+            f"UPDATE dial_log SET verified='cancelled', checked_at=? WHERE item_id IN ({marks}) "
+            f"AND verified IN ({','.join('?' * len(dial_log.OPEN))})",
+            [now_iso(), *[r["id"] for r in items], *dial_log.OPEN])
+    conn.execute("UPDATE runs SET status='paused', posted=MAX(posted-?, 0) WHERE id=?",
+                 (cancelled, run_id))
+    out = _run_json(conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
+    out["cancelled"] = cancelled
+    out["cancel_failed"] = failed
+    out["left_running"] = conn.execute(
+        "SELECT COUNT(*) c FROM plan_items WHERE run_id=? AND status IN ('posted','simulated')",
+        (run_id,)).fetchone()["c"]
+    return out
 
 
 def _cancel_live(conn: sqlite3.Connection, run: sqlite3.Row, items) -> tuple[int, int]:
@@ -737,35 +827,67 @@ def _schedule_path(agent_id: Any, lead_uuid: Any) -> str:
     return f"/v2/campaign/leads/{agent_id}/{lead_uuid}/schedule"
 
 
-def _formi_post(agent_id: Any, lead_uuid: Any, scheduled_time: Any):
+# A connection reset or a read timeout is not a refusal — the call was simply
+# never asked for. Without a retry one blip silently drops that lead for the day,
+# which is why scripts/redial/schedule_redials.py has always had one; the console
+# was the only caller that did not.
+POST_ATTEMPTS = 3
+POST_BACKOFF_SEC = 1.5
+
+
+def _formi_post(agent_id: Any, lead_uuid: Any, scheduled_time: Any) -> tuple[Any, int]:
     """The single live POST in the app. Unreachable while DRY_RUN is set.
 
     The guard is the first statement and `requests` is imported after it, so a
     dry run cannot reach the network even if this were called by mistake.
+
+    Returns (response, attempts). `response` is None when every attempt died in
+    transport — a 4xx/5xx is an answer and is returned as one, only a raised
+    RequestException is retried.
     """
     if dry_run():
         raise RuntimeError("DRY_RUN is set — refusing to dial")
-    import requests                                  # noqa: PLC0415 — see docstring
+    import time                                     # noqa: PLC0415 — see docstring
+    import requests                                 # noqa: PLC0415
     token = formi_token()
     if not token:
         raise HTTPException(500, f"{NO_TOKEN}; cannot dial live")
-    return requests.post(
-        f"https://api.formi.co.in{_schedule_path(agent_id, lead_uuid)}",
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        json={"scheduled_time": scheduled_time}, timeout=45)
+    for attempt in range(1, POST_ATTEMPTS + 1):
+        try:
+            return requests.post(
+                f"https://api.formi.co.in{_schedule_path(agent_id, lead_uuid)}",
+                headers={"Authorization": f"Bearer {token}",
+                         "Content-Type": "application/json"},
+                json={"scheduled_time": scheduled_time}, timeout=45), attempt
+        except requests.RequestException:
+            if attempt < POST_ATTEMPTS:
+                time.sleep(POST_BACKOFF_SEC)
+    return None, POST_ATTEMPTS
 
 
-def _dial_live(conn: sqlite3.Connection, campaign: sqlite3.Row, items) -> tuple[int, int]:
+def _dial_live(conn: sqlite3.Connection, campaign: sqlite3.Row, items,
+               source: str) -> tuple[int, int]:
     """POST each slot to Formi. Unreachable while DRY_RUN is set."""
     posted = failed = 0
+    logged = []
     for item in items:
-        response = _formi_post(campaign["agent_id"], item["lead_uuid"], item["scheduled_time"])
-        ok = 200 <= response.status_code < 300
+        response, attempts = _formi_post(campaign["agent_id"], item["lead_uuid"],
+                                         item["scheduled_time"])
+        ok = response is not None and 200 <= response.status_code < 300
         posted += int(ok)
         failed += int(not ok)
+        status = response.status_code if response is not None else None
+        body = response.text[:300] if response is not None else \
+            f"no response after {attempts} attempts"
         conn.execute("UPDATE plan_items SET status=?, http_status=?, response=? WHERE id=?",
-                     ("posted" if ok else "failed", response.status_code,
-                      response.text[:300], item["id"]))
+                     ("posted" if ok else "failed", status, body, item["id"]))
+        logged.append(dial_log.row(
+            campaign, item, source=source, url=_schedule_path(campaign["agent_id"],
+                                                              item["lead_uuid"]),
+            body={"scheduled_time": item["scheduled_time"]}, dry=False,
+            outcome="placed" if ok else ("error" if response is None else "rejected"),
+            http_status=status, response=body, attempts=attempts))
+    dial_log.write(conn, logged)
     return posted, failed
 
 

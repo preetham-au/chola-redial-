@@ -177,7 +177,7 @@ def test_no_slot_lands_outside_the_dial_window():
 # Dial window
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("start,end", [("08:00", "19:00"), ("09:00", "20:00"),
+@pytest.mark.parametrize("start,end", [("08:00", "19:00"), ("09:00", "20:30"),
                                        ("19:00", "09:00"), ("12:00", "12:00")])
 def test_dial_window_rejects_out_of_range(start, end):
     with pytest.raises(ValueError):
@@ -185,7 +185,8 @@ def test_dial_window_rejects_out_of_range(start, end):
 
 
 def test_dial_window_accepts_the_edges():
-    assert validate_dial_window("09:00", "19:00") == (540, 1140)
+    """09:00-20:00 IST, the hours the client dials in."""
+    assert validate_dial_window("09:00", "20:00") == (540, 1200)
 
 
 # ---------------------------------------------------------------------------

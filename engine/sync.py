@@ -229,30 +229,113 @@ LIMIT {ms.ROW_CAP}
 # Local store
 # ---------------------------------------------------------------------------
 
-def upsert_campaign(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
+def upsert_campaign(conn: sqlite3.Connection, row: dict[str, Any]) -> bool:
     """The warehouse campaign id IS the local id — one less mapping to get wrong.
 
-    `paused` is taken from the warehouse the FIRST time a campaign is seen and
-    never again: it is the console's own stop switch, and copying the warehouse
-    value on every sync meant an operator who paused a campaign here found it
-    running again after the next sync — the console could not hold a decision.
+    Returns True when this sync just stopped the campaign, so the caller can take
+    its queued calls off Formi's clock.
 
-    `enabled` IS still taken, because a campaign killed in Formi must leave the
-    roster, and killing it also switches the autopilot off. That is the "or i
-    delete it in the redial platform" stop, enforced where it cannot be missed.
+    Pausing in Formi is EDGE triggered, not copied. `campaigns.platform_status`
+    holds the status the last sync saw, and only a transition INTO `paused` stops
+    the campaign here:
+
+        active -> paused   stop it here, and disarm the autopilot
+        paused -> paused   do nothing; the operator may have resumed it here
+        paused -> active   do nothing; a resume in Formi must NOT restart calls
+                           in this console, only a resume in this console does
+
+    Copying the value on every sync was the old behaviour and it could not hold
+    a decision in either direction: an operator who paused a campaign here found
+    it running again after the next sync, and — the bug the client reported — a
+    campaign paused in Formi after it was first seen was never noticed at all,
+    because `paused` was written on INSERT and never on UPDATE.
+
+    `enabled` IS still copied every time: a campaign killed in Formi must leave
+    the roster, and killing it also switches the autopilot off.
     """
     enabled, paused = campaign_status_flags(row.get("campaign_status"))
+    status = str(row.get("campaign_status") or "").strip().lower()
     campaign_id = int(row["campaign_id"])
+    was = conn.execute("SELECT platform_status FROM campaigns WHERE id=?",
+                       (campaign_id,)).fetchone()
     conn.execute(
-        "INSERT INTO campaigns (id, agent_id, warehouse_id, name, enabled, paused) "
-        "VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
+        "INSERT INTO campaigns (id, agent_id, warehouse_id, name, enabled, paused, "
+        "                       platform_status) "
+        "VALUES (?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
         "agent_id=excluded.agent_id, warehouse_id=excluded.warehouse_id, "
         "name=excluded.name, enabled=excluded.enabled, "
+        "platform_status=excluded.platform_status, "
         "autopilot=CASE WHEN excluded.enabled=0 THEN 0 ELSE campaigns.autopilot END, "
         "autopilot_note=CASE WHEN excluded.enabled=0 AND campaigns.autopilot=1 "
         "  THEN 'stopped: campaign killed in Formi' ELSE campaigns.autopilot_note END",
         (campaign_id, int(row["agent_id"]), campaign_id,
-         str(row.get("campaign_name") or f"campaign {campaign_id}"), enabled, paused))
+         str(row.get("campaign_name") or f"campaign {campaign_id}"), enabled, paused,
+         status))
+    # First sight of an already-paused campaign counts as the edge: it arrives
+    # stopped, which is what the INSERT above wrote.
+    return bool(paused) and (was is None or str(was["platform_status"] or "") != "paused")
+
+
+def refresh_campaign_status(conn: sqlite3.Connection, agents: Sequence[int],
+                            config: ms.MetabaseConfig, schema: Any,
+                            today: date | None = None) -> list[int]:
+    """Re-read Formi's campaign status for `agents` and honour a fresh pause.
+
+    `refresh_campaign_leads` deliberately touches only leads, so between two full
+    syncs a campaign paused in Formi kept its local `paused=0` — and the afternoon
+    wave planned it and dialled it. This is the same pair `sync` uses, on its own,
+    so it can be run before a wave is built: `upsert_campaign` reports the pause
+    EDGE and `apply_platform_pause` cancels that campaign's queued calls.
+
+    Only campaigns the console already holds are touched. Upserting the rest would
+    re-admit campaigns the sync capped out or dropped for having no parseable RED.
+    Returns the ids this call just stopped.
+    """
+    known = {int(r["id"]) for r in conn.execute("SELECT id FROM campaigns")}
+    if not known:
+        return []
+    stopped: list[int] = []
+    for agent in agents:
+        for row in ms.fetch_agent_campaigns(agent, config, schema, today):
+            if int(row["campaign_id"]) in known and upsert_campaign(conn, row):
+                stopped.append(int(row["campaign_id"]))
+    conn.commit()
+    for campaign_id in stopped:
+        apply_platform_pause(conn, campaign_id)
+    return stopped
+
+
+PLATFORM_PAUSE = "paused in the Formi platform"
+
+
+def apply_platform_pause(conn: sqlite3.Connection, campaign_id: int) -> dict[str, Any]:
+    """Stop a campaign here because Formi just paused it, calls included.
+
+    Reuses the console's own stop, so a platform pause and an operator pause do
+    exactly the same thing — cancel today's queued interactions, disarm the
+    autopilot, latch it for the resume. The only difference is the reason
+    recorded, which is what the console shows and why the operator, not a later
+    sync, is the one who starts it again.
+    """
+    from api.routes_core import stop_campaign         # noqa: PLC0415 — import cycle
+
+    campaign = conn.execute("SELECT * FROM campaigns WHERE id=?", (campaign_id,)).fetchone()
+    if campaign is None:
+        return {"cancelled": 0, "cancel_failed": 0}
+    try:
+        out = stop_campaign(conn, campaign, PLATFORM_PAUSE)
+        conn.commit()
+    except Exception as exc:            # a sync must not die on an unreachable Formi
+        conn.rollback()
+        log(f"  ! campaign {campaign_id} paused in Formi but its queued calls could "
+            f"not be cancelled: {str(exc)[:120]}")
+        conn.execute("UPDATE campaigns SET paused=1, autopilot=0, stopped_reason=? WHERE id=?",
+                     (PLATFORM_PAUSE + " (queued calls NOT cancelled)", campaign_id))
+        conn.commit()
+        return {"cancelled": 0, "cancel_failed": -1}
+    log(f"  campaign {campaign_id} {PLATFORM_PAUSE}: stopped here, "
+        f"{out['cancelled']} queued call(s) cancelled")
+    return out
 
 
 def _red(lead: dict[str, Any]) -> Any:
@@ -424,9 +507,10 @@ def sync(agents: Sequence[int] = tuple(AGENTS),
     total_leads = truncated = 0
     per_campaign: list[tuple[int, str, int]] = []
     try:
-        for row in chosen:
-            upsert_campaign(conn, row)
+        stopped = [row for row in chosen if upsert_campaign(conn, row)]
         conn.commit()
+        for row in stopped:
+            apply_platform_pause(conn, int(row["campaign_id"]))
         if not keep_local:
             dropped = purge_campaigns(conn, chosen_ids)
             log(f"dropped {dropped} campaign(s) that were not in this sync "

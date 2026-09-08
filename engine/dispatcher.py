@@ -36,15 +36,15 @@ from .red_engine import (
 
 __all__ = [
     "DispatchConfig", "Slot", "DispatchResult", "WINDOW_FLOOR", "WINDOW_CEIL",
-    "parse_hhmm", "validate_dial_window", "dispatch_config_from_body",
-    "red_config_from_body", "dispatch", "manual_pairs",
+    "DEFAULT_RED_PRIORITY", "parse_hhmm", "validate_dial_window", "red_rank",
+    "dispatch_config_from_body", "red_config_from_body", "dispatch", "manual_pairs",
 ]
 
 # Regulatory / operational clamp. Nothing may be dialled outside these hours,
 # whatever a saved config says, so it is enforced here as well as at the API
 # boundary — the API is not the only caller.
 WINDOW_FLOOR = 9 * 60      # 09:00
-WINDOW_CEIL = 19 * 60      # 19:00
+WINDOW_CEIL = 20 * 60      # 20:00
 
 
 def parse_hhmm(text: Any, label: str = "time") -> int:
@@ -64,7 +64,7 @@ def hhmm(minute: int) -> str:
 
 
 def validate_dial_window(start: Any, end: Any) -> tuple[int, int]:
-    """Return (start_min, end_min) or raise ValueError. 09:00-19:00, start < end."""
+    """Return (start_min, end_min) or raise ValueError. 09:00-20:00, start < end."""
     start_min = parse_hhmm(start, "dial_window.start")
     end_min = parse_hhmm(end, "dial_window.end")
     if start_min >= end_min:
@@ -78,6 +78,17 @@ def validate_dial_window(start: Any, end: Any) -> tuple[int, int]:
     return start_min, end_min
 
 
+# Days-to-expiry bands, best first, applied AHEAD of `bucket_priority`. The
+# client's order: renewal due in the next three days, then RED day itself and
+# the week after it. Whatever is shed by `max_per_run` or will not fit in the
+# hours left comes off the bottom of this, so a late approval keeps the calls
+# that cannot be made up tomorrow and drops the ones that can.
+#
+# A band, not a bucket, because the bands cut ACROSS buckets: dte 3..1 is the
+# tail of F5 (7..1) and has to outrank the rest of it.
+DEFAULT_RED_PRIORITY = ((3, 1), (0, -7))
+
+
 @dataclass(frozen=True)
 class DispatchConfig:
     """The scheduling half of a saved config (the engine owns the other half)."""
@@ -88,10 +99,25 @@ class DispatchConfig:
     same_day_gap_hours: float = 3.0
     max_per_minute: int = 12       # 0 = unlimited
     max_per_run: int = 5000        # 0 = unlimited
+    red_priority: tuple[tuple[int, int], ...] = DEFAULT_RED_PRIORITY
 
     @property
     def span(self) -> int:
         return self.end_min - self.start_min
+
+
+def red_rank(dte: Any, bands: Sequence[tuple[int, int]] = DEFAULT_RED_PRIORITY) -> int:
+    """Index of the first band containing `dte`; len(bands) for everything else.
+
+    Bands are written high-to-low the way a person says them ("1 to 3", "0 to -7"),
+    so either order of the pair is accepted.
+    """
+    if dte is None:
+        return len(bands)
+    for index, (first, second) in enumerate(bands):
+        if min(first, second) <= int(dte) <= max(first, second):
+            return index
+    return len(bands)
 
 
 @dataclass
@@ -126,8 +152,8 @@ class DispatchResult:
 
 def dispatch_config_from_body(body: dict[str, Any]) -> DispatchConfig:
     window = body.get("dial_window") or {}
-    start_min, end_min = validate_dial_window(window.get("start", "09:30"),
-                                              window.get("end", "19:00"))
+    start_min, end_min = validate_dial_window(window.get("start", "09:00"),
+                                              window.get("end", "20:00"))
 
     def num(key: str, default: float, minimum: float) -> float:
         raw = body.get(key, default)
@@ -139,12 +165,19 @@ def dispatch_config_from_body(body: dict[str, Any]) -> DispatchConfig:
             raise ValueError(f"{key} must be at least {minimum}")
         return value
 
+    bands = body.get("red_priority") or DEFAULT_RED_PRIORITY
+    try:
+        red_priority = tuple((int(a), int(b)) for a, b in bands)
+    except (TypeError, ValueError):
+        raise ValueError("red_priority must be a list of [from_dte, to_dte] pairs") from None
+
     return DispatchConfig(
         start_min=start_min, end_min=end_min,
         shift_from_last_hours=num("shift_from_last_hours", 2.0, 0.0),
         same_day_gap_hours=num("same_day_gap_hours", 3.0, 0.0),
         max_per_minute=int(num("max_per_minute", 12, 0)),
         max_per_run=int(num("max_per_run", 5000, 0)),
+        red_priority=red_priority,
     )
 
 
@@ -214,7 +247,8 @@ def dispatch(
     in the past, and every one of those slots is undialable the moment it lands.
     """
     ordered = [(lead, dec) for lead, dec in pairs if dec.schedule]
-    ordered.sort(key=lambda p: (config.priority_of(p[1].bucket), _lead_key(p[0])))
+    ordered.sort(key=lambda p: (red_rank(p[1].dte, dcfg.red_priority),
+                                config.priority_of(p[1].bucket), _lead_key(p[0])))
 
     dropped = 0
     if dcfg.max_per_run and len(ordered) > dcfg.max_per_run:

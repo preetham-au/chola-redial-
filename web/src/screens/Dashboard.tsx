@@ -145,12 +145,12 @@ export function Dashboard() {
   );
 }
 
-/** The one switch that makes this campaign run itself.
+/** The one switch: put this campaign in the daily plan, or take it out.
  *
- *  On: the server re-syncs the leads and dials RED−7…RED+3 twice a day, and
- *  leaves the calmer buckets as a plan to approve. It stops on its own when
- *  every policy is past the grace window, and the moment the campaign is paused
- *  or removed in Formi. Everything below this card still works by hand. */
+ *  It never dials. On, the server re-syncs the leads and PREPARES a plan twice a
+ *  day; the plan waits on the day screen until an operator approves it. The
+ *  campaign leaves the plan on its own when every policy is past the grace
+ *  window, and the moment it is paused or removed in Formi. */
 function Autopilot() {
   const campaign = useCampaign();
   const { campaigns, setCampaigns, toast } = useStore();
@@ -166,8 +166,8 @@ function Autopilot() {
       toast(
         on ? 'info' : 'ok',
         on
-          ? `Autopilot off for ${next.name}. Nothing runs unless you plan it.`
-          : `Autopilot on for ${next.name}. Urgent buckets dial themselves until the policies run out.`,
+          ? `${next.name} is out of the daily plan. Nothing is planned for it.`
+          : `${next.name} is in the daily plan. Its plan is ready each morning and waits for you to approve the day.`,
       );
     } catch (e) {
       toast('bad', (e as Error).message);
@@ -178,14 +178,14 @@ function Autopilot() {
 
   return (
     <Card
-      title="Autopilot"
-      eyebrow={on ? 'running · urgent buckets dial themselves' : 'off · everything is manual'}
+      title="In the daily plan"
+      eyebrow={on ? 'planned every morning · never dialled without your approval' : 'not planned'}
     >
       <div className="row" style={{ gap: 14, alignItems: 'flex-start' }}>
         <p className="hero-sub" style={{ margin: 0, flex: 1 }}>
           {on
-            ? 'Morning and afternoon, this campaign re-syncs and dials RED−7 to RED+3 by itself. The calmer buckets are planned and wait for you. It stops when every policy is past the grace window, or when you pause it.'
-            : 'Turn this on once and this campaign keeps calling on its own until every policy expires. You still approve the calmer buckets.'}
+            ? 'Morning and afternoon, this campaign re-syncs and its plan is built for you. It goes out only when you approve the day. It leaves the plan when every policy is past the grace window, or when it is paused here or in Formi.'
+            : 'Put this campaign in the daily plan and its calls are worked out for you each morning. Switching it on never places a call — you approve the day.'}
           {campaign.autopilot_note ? (
             <>
               {' '}
@@ -198,7 +198,7 @@ function Autopilot() {
           onClick={toggle}
           disabled={busy || !campaign.enabled}
         >
-          {busy ? <Loader2 /> : <PlayCircle />} {on ? 'Stop autopilot' : 'Start autopilot'}
+          {busy ? <Loader2 /> : <PlayCircle />} {on ? 'Take out of the plan' : 'Add to the daily plan'}
         </button>
       </div>
       {on ? <Passes /> : null}
@@ -209,8 +209,8 @@ function Autopilot() {
 /** The two daily passes, and the one that did not happen.
  *
  *  A pass fires once per day and is never retried -- if the warehouse was down
- *  at 10:00 the morning calls simply did not go out, and nothing else in the
- *  console says so. Until now the documented recovery was a curl command. */
+ *  at 10:00 there is no plan to approve, and nothing else in the console says
+ *  so. Re-firing builds the plan; it still dials nothing. */
 function Passes() {
   const { toast } = useStore();
   const status = useAsync(() => api.autopilotStatus(), []);
@@ -225,7 +225,7 @@ function Passes() {
     setFiring(kind);
     try {
       await api.runPass(kind);
-      toast('ok', `Pass ${kind} re-run. Its urgent buckets have been dialled.`);
+      toast('ok', `Pass ${kind} re-run. The plan is built — approve the day to dial it.`);
       status.reload();
     } catch (e) {
       toast('bad', (e as Error).message);

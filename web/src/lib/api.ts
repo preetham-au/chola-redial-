@@ -4,15 +4,20 @@
 
 import type {
   Agent,
+  ApproveResult,
   AutopilotStatus,
   BucketsResponse,
   Campaign,
   Config,
   ConfigVersion,
+  DayView,
+  DialLogPage,
+  DialLogSummary,
   Health,
   ManualPreview,
   PagedItems,
   PlanItem,
+  PrepareResult,
   Run,
   StageJob,
   StagePreview,
@@ -21,7 +26,7 @@ import type {
   TestCallResult,
   TestNumber,
 } from './types';
-import { agentsFrom } from './domain';
+import { agentsFrom, today } from './domain';
 import {
   mockAgentPause,
   mockAgents,
@@ -30,6 +35,9 @@ import {
   mockCampaigns,
   mockConfig,
   mockConfigHistory,
+  mockDay,
+  mockDialLog,
+  mockDialLogSummary,
   mockExpiredPreview,
   mockHealth,
   mockItems,
@@ -192,8 +200,48 @@ export const api = {
       paused: false,
     })),
 
-  /** The one switch. On = the server plans and dials this campaign's urgent
-   *  buckets morning and afternoon until every policy is past the grace window. */
+  /* --- The day -----------------------------------------------------------
+     One screen, one decision. `day` is cheap enough to poll: the server reads
+     rows it already wrote and never re-runs the engine. */
+
+  day: (date: string, kind = 'auto') =>
+    req<DayView>(`/api/day${q({ date, kind })}`, undefined, () => mockDay(date, kind)),
+
+  /** Build (or rebuild) the plan. Writes `planned` runs and dials nothing. */
+  prepareDay: (date: string, kind = 'auto', resync = false) =>
+    req<PrepareResult>('/api/day/prepare', json({ date, kind, resync }), () => {
+      throw new ApiError('The server is unreachable — no plan was built.', 503);
+    }),
+
+  /** The only call in this client that reaches Formi. `buckets` empty = all of
+   *  them; the rest are not dialled today and return in tomorrow's plan. */
+  approveDay: (date: string, kind = 'auto', buckets: string[] = [], campaign_ids: number[] = []) =>
+    req<ApproveResult>('/api/day/approve', json({ date, kind, buckets, campaign_ids }), () => {
+      // Never invent an approval. This is the one answer that would tell an
+      // operator customers were called when nothing was.
+      throw new ApiError('The server is unreachable — nothing was approved or dialled.', 503);
+    }),
+
+  /* --- Dial log ----------------------------------------------------------- */
+
+  dialLog: (f: { campaign_id?: number; date?: string; verified?: string; outcome?: string;
+                 limit?: number; offset?: number }) =>
+    req<DialLogPage>(`/api/dial-log${q(f)}`, undefined, () => mockDialLog(f.date ?? today())),
+
+  dialLogSummary: (date: string, campaign_id?: number) =>
+    req<DialLogSummary>(`/api/dial-log/summary${q({ date, campaign_id })}`, undefined,
+      () => mockDialLogSummary(date)),
+
+  /** Ask the warehouse what really happened. Read-only — it cannot place a call,
+   *  whatever DRY_RUN says. */
+  verifyDialLog: (date: string, wait = false) =>
+    req<unknown>(`/api/dial-log/verify${q({ date, wait: wait ? 'true' : undefined })}`,
+      { method: 'POST' }, () => {
+        throw new ApiError('The server is unreachable — nothing was verified.', 503);
+      }),
+
+  /** The one switch. On = this campaign is in the daily plan. It never dials:
+   *  the plan waits for the day to be approved. */
   setAutopilot: (id: number, on: boolean) =>
     req<Campaign>(`/api/campaigns/${id}/autopilot`, json({ on }), () => {
       const c = mockCampaigns.find((x) => x.id === id) ?? mockCampaigns[0];

@@ -372,21 +372,24 @@ export const ITEM_STATUS_TONE: Record<string, string> = {
   skipped: 'badge-warn',
 };
 
+// The client's dialling hours. Must match WINDOW_FLOOR / WINDOW_CEIL in
+// engine/dispatcher.py — a UI that accepts a window the server rejects turns a
+// config save into an unexplained 422.
 export const DIAL_WINDOW_FLOOR = '09:00';
-export const DIAL_WINDOW_CEIL = '19:00';
+export const DIAL_WINDOW_CEIL = '20:00';
 
 export function minutesOf(hhmm: string): number {
   const [h, m] = hhmm.split(':').map(Number);
   return (h || 0) * 60 + (m || 0);
 }
 
-/** Mirrors the server's 422: inside 09:00–19:00 and start < end. */
+/** Mirrors the server's 422: inside 09:00–20:00 IST and start < end. */
 export function dialWindowError(start: string, end: string): string | null {
   if (!/^\d{2}:\d{2}$/.test(start) || !/^\d{2}:\d{2}$/.test(end)) return 'Use HH:MM.';
   const s = minutesOf(start);
   const e = minutesOf(end);
-  if (s < minutesOf(DIAL_WINDOW_FLOOR)) return 'Cannot start before 09:00.';
-  if (e > minutesOf(DIAL_WINDOW_CEIL)) return 'Cannot end after 19:00.';
+  if (s < minutesOf(DIAL_WINDOW_FLOOR)) return `Cannot start before ${DIAL_WINDOW_FLOOR}.`;
+  if (e > minutesOf(DIAL_WINDOW_CEIL)) return `Cannot end after ${DIAL_WINDOW_CEIL}.`;
   if (s >= e) return 'Start must be before end.';
   return null;
 }

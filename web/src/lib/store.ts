@@ -115,7 +115,9 @@ export const useAgent = () =>
 /** Hash routing. Seven screens do not need a router dependency. */
 export function useRoute(): [string, (r: string) => void] {
   // tolerate a pasted "#/plan" as well as "#plan"
-  const read = () => window.location.hash.replace(/^#\/?/, '') || 'dashboard';
+  // The day is the landing screen: it is the only one that answers "what goes
+  // out today, and has it?" without first picking a campaign.
+  const read = () => window.location.hash.replace(/^#\/?/, '') || 'today';
   const [route, setRoute] = useState(read);
   useEffect(() => {
     const on = () => setRoute(read());

@@ -8,6 +8,11 @@ import type {
   Campaign,
   Config,
   ConfigVersion,
+  DayCampaign,
+  DayView,
+  DialLogPage,
+  DialLogRow,
+  DialLogSummary,
   Health,
   ManualSample,
   PlanItem,
@@ -73,11 +78,108 @@ export const mockTestNumbers: TestNumber[] = [
 
 export const mockAutopilot: AutopilotStatus = {
   passes: [{ kind: 'auto', at: '10:00' }, { kind: 'auto_pm', at: '15:00' }],
-  urgent_buckets: ['M0', 'E0', 'F6', 'F5'],
-  review_buckets: ['F4', 'F3', 'F2', 'F1', 'D0'],
+  dials: false,
   now: '09:00',
   fired_today: [],
 };
+
+/** The day, offline. Deliberately `awaiting_approval` with real-looking counts:
+ *  the screen an operator opens most is the one whose empty state teaches least. */
+export const mockDay = (date: string, kind: string): DayView => {
+  const armed = mockCampaigns.filter((c) => c.enabled && !c.paused).slice(0, 4);
+  const per = [312, 184, 96, 41];
+  const campaigns: DayCampaign[] = armed.map((c, i) => ({
+    ...c,
+    autopilot: true,
+    run_id: 900 + i,
+    run_status: 'planned',
+    ready: per[i],
+    by_bucket: { M0: Math.round(per[i] * 0.31), E0: Math.round(per[i] * 0.24),
+                 F5: Math.round(per[i] * 0.28), F4: Math.round(per[i] * 0.17) },
+    posted: 0,
+    failed: 0,
+    dropped: 0,
+  }));
+  const ready = campaigns.reduce((s, c) => s + c.ready, 0);
+  return {
+    date,
+    kind,
+    wave: kind === 'auto_pm' ? 'afternoon' : 'morning',
+    now: '09:00',
+    dry_run: true,
+    window: { start: '09:00', end: '20:00' },
+    window_open: true,
+    status: 'awaiting_approval',
+    totals: { campaigns: campaigns.length, ready, posted: 0, failed: 0, dropped: 0 },
+    capacity_before_close: ready,
+    buckets: [
+      { bucket: 'M0', label: 'Mandatory day', ready: Math.round(ready * 0.31), best_rank: 0 },
+      { bucket: 'F5', label: 'Critical window', ready: Math.round(ready * 0.28), best_rank: 0 },
+      { bucket: 'E0', label: 'RED day', ready: Math.round(ready * 0.24), best_rank: 1 },
+      { bucket: 'F4', label: 'High frequency', ready: Math.round(ready * 0.17), best_rank: 2 },
+    ],
+    red_bands: [
+      { rank: 0, dte_from: 3, dte_to: 1, label: 'renewal due in 1-3 days',
+        ready: Math.round(ready * 0.59) },
+      { rank: 1, dte_from: 0, dte_to: -7, label: 'RED day to 7 days past it',
+        ready: Math.round(ready * 0.24) },
+      { rank: 2, dte_from: null, dte_to: null, label: 'outside the priority bands',
+        ready: Math.round(ready * 0.17) },
+    ],
+    campaigns,
+    stopped: mockCampaigns
+      .filter((c) => c.paused || !c.enabled)
+      .slice(0, 2)
+      .map((c) => ({ ...c, why: c.enabled ? 'paused in Formi' : 'disabled' })),
+    dial_log: {},
+  };
+};
+
+/** One log page, offline. Every row is a dry run — an offline fixture must never
+ *  be mistakable for proof that a real call went out. */
+export const mockDialLog = (date: string): DialLogPage => {
+  const r = rng(77);
+  const rows: DialLogRow[] = Array.from({ length: 24 }, (_, i) => {
+    const hour = 9 + Math.floor(i / 3);
+    return {
+      id: 5000 - i,
+      created_at: `${date}T${String(hour).padStart(2, '0')}:0${i % 6}:11`,
+      campaign_id: mockCampaigns[i % 4].id,
+      agent_id: mockCampaigns[i % 4].agent_id,
+      run_id: 900 + (i % 4),
+      item_id: 70000 + i,
+      source: 'approve',
+      lead_uuid: `0000${i}`.slice(-5),
+      policy_no: `PV${3300000 + Math.floor(r() * 90000)}`,
+      lead_name: ['Ramesh K', 'Sunita M', 'Arun P', 'Fatima S'][i % 4],
+      phone: `98${String(Math.floor(r() * 1e8)).padStart(8, '0')}`,
+      bucket: ['M0', 'F5', 'E0', 'F4'][i % 4],
+      disposition: 'did_not_pick',
+      dte: [1, 2, 0, -3][i % 4],
+      scheduled_time: `${date}T${String(hour).padStart(2, '0')}:${String((i * 7) % 60).padStart(2, '0')}:00`,
+      dry_run: true,
+      url: 'https://api.formi.co.in/v2/campaign/leads/125/…/schedule',
+      attempts: 1,
+      http_status: null,
+      response: null,
+      outcome: 'simulated',
+      verified: 'simulated',
+      duration_sec: 0,
+    };
+  });
+  return { total: rows.length, limit: 100, offset: 0, rows };
+};
+
+export const mockDialLogSummary = (date: string): DialLogSummary => ({
+  date,
+  campaigns: mockCampaigns.slice(0, 4).map((c, i) => ({
+    campaign_id: c.id,
+    sent: 6,
+    outcome: { simulated: 6 },
+    verified: { simulated: 6 },
+    talk_time_sec: i * 40,
+  })),
+});
 
 export const mockHealth: Health = {
   ok: true,

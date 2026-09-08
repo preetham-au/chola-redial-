@@ -14,7 +14,7 @@ from api.db import DEFAULT_CONFIG, NO_TOKEN, db_path, formi_token, with_defaults
 # assertions have to ask about today.
 TODAY = datetime.date.today().isoformat()
 # A slot the dial-window and past-time checks always accept, whatever o'clock
-# the suite runs at. Tomorrow morning is inside 09:30-19:00 and never behind us.
+# the suite runs at. Tomorrow morning is inside 09:00-20:00 and never behind us.
 TOMORROW_AM = f"{(datetime.date.today() + datetime.timedelta(days=1)).isoformat()}T10:05:00"
 
 
@@ -27,7 +27,7 @@ def _db():
 def _plan_today(client, campaign_id: int, **body):
     """Plan `campaign_id` for today, or skip once the dial window has shut.
 
-    After 19:00 IST there is no legal slot left on today's clock, so the server
+    After 20:00 IST there is no legal slot left on today's clock, so the server
     answers 422 by design. A suite that runs in the evening should say "not
     applicable now", not fail -- but it must still fail on any OTHER 422.
     """
@@ -125,7 +125,7 @@ def test_put_config_inserts_a_new_version_and_never_mutates(client):
 
 
 @pytest.mark.parametrize("window", [{"start": "08:00", "end": "19:00"},
-                                    {"start": "09:00", "end": "20:00"},
+                                    {"start": "09:00", "end": "20:30"},
                                     {"start": "18:00", "end": "10:00"}])
 def test_put_config_422_on_a_bad_dial_window(client, window):
     response = client.put("/api/campaigns/2/config", json={"dial_window": window})
@@ -209,7 +209,7 @@ def test_plan_produces_a_prioritised_non_empty_run(client):
     # Everything is inside the dial window, and priority tracks the bucket order.
     for item in items:
         hour = int(item["scheduled_time"][11:13])
-        assert 9 <= hour <= 19
+        assert 9 <= hour <= 20
     # Read from the campaign's own config rather than a copy of it, so adding a
     # bucket to the default table does not silently make this a no-op.
     priority = client.get("/api/campaigns/1/config").json()["bucket_priority"]
@@ -694,7 +694,7 @@ def test_a_hand_picked_test_call_time_obeys_the_dial_window(client, no_network):
 
     # Omitted still means "next minute inside the window", not an error.
     auto = client.post("/api/test-call/preview", json={"phone": phone}).json()
-    assert "09:30" <= auto["would_post"]["body"]["scheduled_time"][11:16] <= "19:00"
+    assert "09:00" <= auto["would_post"]["body"]["scheduled_time"][11:16] <= "20:00"
 
     # A rejected time is never recorded as an attempt.
     with _db() as conn:
