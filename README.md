@@ -42,7 +42,7 @@ On Windows `run.bat` does all three (it seeds only if `redial.db` is missing).
 The React dev server on `http://localhost:5173` is allowed by CORS.
 
 ```bash
-pytest                                      # 162 passing, no network, no credentials
+pytest                                      # 163 passing, no network, no credentials
 ```
 
 ## How a day works

@@ -6,7 +6,7 @@ a sub in neither era -- the coarse group after the 31 Aug 2026 cutover, the sub
 under a `sub_` prefix before it -- so the label arm of `_connected_predicate`
 never fired and a voicemail greeting could pass as a conversation.
 """
-from datetime import date
+from datetime import date, datetime, timezone
 
 import pytest
 
@@ -52,3 +52,37 @@ def test_the_two_tuples_are_disjoint():
     """A label cannot mean both `a human spoke` and `a machine answered`."""
     both = set(CONTACTED_DISPOSITIONS) & set(MACHINE_DISPOSITIONS)
     assert not both, both
+
+
+def test_an_omitted_today_means_today_in_ist_not_on_the_host(monkeypatch):
+    """`today=None` must resolve to the IST calendar day on a UTC box.
+
+    The VM runs UTC. Every RED window in this module is `red - today`, so while
+    the default was `date.today()` the five hourly syncs between 18:30 and 24:00
+    UTC computed dte one day out and cut the window at the wrong lead. Pinned to
+    a real instant rather than asserting against a live clock, so the test says
+    the same thing at 09:00 as it does at 01:00.
+    """
+    import engine.metabase_source as ms
+
+    # 2026-09-08 19:35 UTC is 01:05 IST on the 9th -- the hour the VM's suite
+    # actually failed at. Both clocks are pinned, so a `date.today()` that has
+    # crept back in reads the 8th here however the host is configured; without
+    # pinning BOTH, this test passes on an IST laptop against the very bug it
+    # is meant to catch.
+    class _Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 8, 19, 35, tzinfo=tz or timezone.utc)
+
+    class _HostDate(date):
+        @classmethod
+        def today(cls):
+            return date(2026, 9, 8)
+
+    monkeypatch.setattr(ms, "datetime", _Clock)
+    monkeypatch.setattr(ms, "date", _HostDate)
+    assert ms.ist_today() == date(2026, 9, 9)
+    sql = build_agent_campaigns_sql(CONFIG, SCHEMA, 125)
+    assert "DATE '2026-09-09'" in sql
+    assert "DATE '2026-09-08'" not in sql

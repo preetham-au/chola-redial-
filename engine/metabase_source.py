@@ -31,7 +31,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
@@ -42,9 +42,23 @@ import requests
 # writing twice and drifting apart.
 from .red_engine import DAY_WORDS
 
+
+def ist_today() -> date:
+    """Today in IST — what "today" means to this business, on any host.
+
+    NOT `date.today()`, which is server-local. The VM runs UTC, so between 18:30
+    and midnight UTC `date.today()` is still YESTERDAY in IST: every RED window
+    in this module is `red - today`, so five of the twenty-four hourly syncs
+    computed dte one day out and cut the window at the wrong lead. India has no
+    DST, so a fixed +05:30 is exact and needs no tzdata on the host.
+    """
+    return (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).date()
+
+
 __all__ = [
     "MetabaseError",
     "MetabaseConfig",
+    "ist_today",
     "load_config",
     "run_sql",
     "describe_schema",
@@ -744,7 +758,7 @@ def build_agent_campaigns_sql(
     dial_stages = ", ".join(f"'{s}'" for s in REAL_DIAL_STAGES)
     connected = ", ".join(f"'{s}'" for s in CONNECTED_STAGES)
     connected_pred = _connected_predicate("a")
-    today_sql = f"DATE '{(today or date.today()).isoformat()}'"
+    today_sql = f"DATE '{(today or ist_today()).isoformat()}'"
     red_expr = red_parse_expression("v.red") if "red" in leads else "NULL::date"
     interaction_outlet = f"AND i.outlet_id = {config.outlet_id}" if "outlet_id" in interactions else ""
 
@@ -854,7 +868,7 @@ def build_campaign_stats_sql(
     dial_stages = ", ".join(f"'{s}'" for s in REAL_DIAL_STAGES)
     connected = ", ".join(f"'{s}'" for s in CONNECTED_STAGES)
     connected_pred = _connected_predicate("a")
-    today_sql = f"DATE '{(today or date.today()).isoformat()}'"
+    today_sql = f"DATE '{(today or ist_today()).isoformat()}'"
     red_expr = red_parse_expression("v.red") if "red" in leads else "NULL::date"
 
     status_column = _status_column(campaigns)
@@ -1006,7 +1020,7 @@ def build_leads_sql(
     ids = ",".join(str(v) for v in _int_list(campaign_ids, "campaign_ids"))
     outlet_filter = f"AND i.outlet_id = {config.outlet_id}" if "outlet_id" in interactions else ""
     dial_stages = ", ".join(f"'{s}'" for s in REAL_DIAL_STAGES)
-    today_value = (today or date.today()).isoformat()
+    today_value = (today or ist_today()).isoformat()
     today_sql = f"DATE '{today_value}'"
 
     # Project the optional columns this environment actually has, applying the
@@ -1060,7 +1074,7 @@ campaign_order AS MATERIALIZED (
   FROM order_votes
 )"""
     red_expr = red_parse_expression("v.red", month_first_expr="co.month_first",
-                                    today=today or date.today())
+                                    today=today or ist_today())
 
     # A specific RED date (or RED date range) is a more direct way to express
     # "dial only the 31 Aug expiries" than converting to a dte window by hand,

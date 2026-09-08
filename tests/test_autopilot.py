@@ -11,9 +11,12 @@ import sqlite3
 
 import pytest
 
-from api.db import db_path
+from api.db import db_path, now_ist
 
-TODAY = datetime.date.today()
+# IST, not `date.today()`: a pass files its run under the IST calendar day, so on
+# a UTC host after 18:30 UTC a suite asking `date.today()` prepares one day and
+# asserts against another.
+TODAY = now_ist().date()
 
 
 def _db():

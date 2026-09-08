@@ -166,7 +166,7 @@ def fetch_fresh_leads(campaign_id: int, config: ms.MetabaseConfig,
     # today's clock, plus anything Formi already has scheduled for today.
     window = ""
     if dte_min is not None and dte_max is not None:
-        today_sql = f"DATE '{(today or date.today()).isoformat()}'"
+        today_sql = f"DATE '{(today or ms.ist_today()).isoformat()}'"
         window = (f"  AND ((red.d - {today_sql}) BETWEEN {int(dte_min)} AND {int(dte_max)}\n"
                   f"       OR COALESCE(q.queued_today, 0) > 0)\n")
     rows = retry(f"fresh leads {campaign_id}", ms.run_sql, f"""

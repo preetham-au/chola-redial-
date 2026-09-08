@@ -8,14 +8,19 @@ import sqlite3
 import pytest
 import requests
 
-from api.db import DEFAULT_CONFIG, NO_TOKEN, db_path, formi_token, with_defaults
+from api.db import DEFAULT_CONFIG, NO_TOKEN, db_path, formi_token, now_ist, with_defaults
 
 # The seed anchors every RED to the day it was written, so bucket-sensitive
 # assertions have to ask about today.
-TODAY = datetime.date.today().isoformat()
+#
+# IST, not `date.today()`: the service files everything under the IST calendar
+# day, so on a UTC host after 18:30 UTC a suite asking `date.today()` plans for
+# one day and asserts against another. That is not a hypothetical — it is six
+# failures on the VM, at 01:00 IST, in code that passes here at 19:00.
+TODAY = now_ist().date().isoformat()
 # A slot the dial-window and past-time checks always accept, whatever o'clock
 # the suite runs at. Tomorrow morning is inside 09:00-20:00 and never behind us.
-TOMORROW_AM = f"{(datetime.date.today() + datetime.timedelta(days=1)).isoformat()}T10:05:00"
+TOMORROW_AM = f"{(now_ist().date() + datetime.timedelta(days=1)).isoformat()}T10:05:00"
 
 
 def _db():
