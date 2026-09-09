@@ -9,7 +9,7 @@ import { AgentChip, AgentPauseConfirm, AgentSwitcher } from './components/AgentB
 import { CampaignPicker } from './App';
 import { BucketOffWhy } from './screens/Dashboard';
 import { TestCallResultView, TestNumberTable, TriggerConfirm } from './screens/TestCall';
-import { ApproveDay, Headline, wireBuckets } from './screens/Today';
+import { ApproveDay, Headline, autopilotDiff, wireBuckets } from './screens/Today';
 import { Row as LogRow } from './screens/CallLog';
 import { api } from './lib/api';
 import {
@@ -31,7 +31,7 @@ import {
   narrowedBuckets,
   passState,
 } from './lib/domain';
-import type { Config, TestCallResult } from './lib/types';
+import type { Campaign, Config, TestCallResult } from './lib/types';
 
 const ROWS = configurableBuckets(mockConfig.frequency_table);
 let cfg: Config = structuredClone(mockConfig);
@@ -246,7 +246,9 @@ ok(
   const base = mockDay('2026-09-09', 'auto');
   const day = (over: Partial<typeof base>) => ({ ...base, ...over });
   const head = (d: typeof base) =>
-    renderToStaticMarkup(<Headline day={d} busy="" onPrepare={() => {}} onApprove={() => {}} />);
+    renderToStaticMarkup(
+      <Headline day={d} busy="" onPrepare={() => {}} onApprove={() => {}} onPick={() => {}} />,
+    );
 
   ok('every bucket ticked sends the empty list the server reads as "all"',
      wireBuckets(['M0', 'F5'], ['M0', 'F5']).length === 0);
@@ -259,6 +261,30 @@ ok(
 
   ok('a day with no campaigns points at the campaign list, not at a dial button',
      has(head(day({ status: 'no_campaigns' })), 'Choose campaigns'));
+  ok('and says picking campaigns places no call',
+     has(head(day({ status: 'no_campaigns' })), 'places no call'));
+
+  // The picker's one wire-bearing decision. Everything it sends changes who is
+  // dialled once the day is approved, so it sends the difference and nothing else.
+  {
+    const c = (id: number, over: Partial<Campaign> = {}): Campaign =>
+      ({ id, agent_id: 1, warehouse_id: id, name: `c${id}`, enabled: true, paused: false, ...over });
+    const all = [c(1), c(2, { autopilot: true }), c(3, { autopilot: true }), c(4, { enabled: false })];
+
+    const d = autopilotDiff(all, new Set([1, 2, 4]));
+    ok('picking a campaign that is already in the plan sends nothing for it',
+       !d.arm.includes(2) && !d.disarm.includes(2));
+    ok('a newly ticked campaign is armed', d.arm.join() === '1');
+    ok('an unticked campaign that was in the plan is taken out', d.disarm.join() === '3');
+    ok('a disabled campaign is never armed, however it was ticked',
+       !d.arm.includes(4) && !d.disarm.includes(4));
+    ok('ticking nothing takes every armed campaign out and arms none',
+       autopilotDiff(all, new Set()).arm.length === 0 &&
+       autopilotDiff(all, new Set()).disarm.join() === '2,3');
+    ok('re-saving without a change puts nothing on the wire',
+       autopilotDiff(all, new Set([2, 3])).arm.length === 0 &&
+       autopilotDiff(all, new Set([2, 3])).disarm.length === 0);
+  }
   ok('an unbuilt plan offers to build it, and says building dials nothing',
      has(head(day({ status: 'not_prepared' })), 'dials nothing'));
 

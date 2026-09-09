@@ -17,6 +17,7 @@ import {
   ClipboardList,
   FlaskConical,
   Info,
+  ListChecks,
   Loader2,
   PhoneCall,
   Radio,
@@ -26,7 +27,7 @@ import { api } from '../lib/api';
 import { bandRange, bucketColor, friendlyBucket, n } from '../lib/domain';
 import { navigate, useAsync, useStore } from '../lib/store';
 import { Card, Empty, Fact, Modal, TypeToConfirm } from '../components/ui';
-import type { DayBucket, DayView } from '../lib/types';
+import type { Campaign, DayBucket, DayView } from '../lib/types';
 
 const WAVES = [
   { kind: 'auto', label: 'Morning' },
@@ -39,6 +40,26 @@ const WAVES = [
 export const wireBuckets = (chosen: string[], all: string[]) =>
   chosen.length === all.length ? [] : chosen;
 
+/** A campaign the server will accept into the daily plan. A disabled one is
+ *  refused with a 409, so it is shown and not offered rather than failing on
+ *  save. */
+export const pickable = (c: Campaign) => c.enabled !== false;
+
+/** Which campaigns to arm and which to disarm — the only thing this screen puts
+ *  on the wire that changes who gets called.
+ *
+ *  Only the DIFFERENCE is sent. Re-arming an already-armed campaign would
+ *  overwrite the note saying why it last stopped, and disarming one that is
+ *  already out would invent a "stopped by operator" it never had. A campaign
+ *  the server would refuse never reaches either list. */
+export function autopilotDiff(all: Campaign[], chosen: Set<number>) {
+  const ok = all.filter(pickable);
+  return {
+    arm: ok.filter((c) => chosen.has(c.id) && !c.autopilot).map((c) => c.id),
+    disarm: ok.filter((c) => !chosen.has(c.id) && c.autopilot).map((c) => c.id),
+  };
+}
+
 export function Today() {
   const date = useStore((s) => s.date);
   const setDate = useStore((s) => s.setDate);
@@ -47,6 +68,7 @@ export function Today() {
   const day = useAsync(() => api.day(date, kind), [date, kind]);
   const [picked, setPicked] = useState<string[] | null>(null);
   const [approving, setApproving] = useState(false);
+  const [picking, setPicking] = useState(false);
   const [busy, setBusy] = useState('');
 
   const d = day.data;
@@ -102,6 +124,9 @@ export function Today() {
               </button>
             ))}
           </div>
+          <button className="btn btn-ghost" onClick={() => setPicking(true)}>
+            <ListChecks /> Campaigns
+          </button>
           <button className="btn btn-ghost" onClick={() => day.reload()} aria-label="Refresh">
             <RefreshCw /> Refresh
           </button>
@@ -120,6 +145,7 @@ export function Today() {
         busy={busy}
         onPrepare={prepare}
         onApprove={() => setApproving(true)}
+        onPick={() => setPicking(true)}
       />
 
       {d && d.status !== 'no_campaigns' && (
@@ -131,6 +157,15 @@ export function Today() {
       )}
 
       {d && d.stopped.length > 0 && <Stopped day={d} />}
+
+      {picking && (
+        <PickCampaigns
+          date={date}
+          kind={kind}
+          onClose={() => setPicking(false)}
+          onDone={() => day.reload()}
+        />
+      )}
 
       {approving && d && (
         <ApproveDay
@@ -152,11 +187,13 @@ export function Headline({
   busy,
   onPrepare,
   onApprove,
+  onPick,
 }: {
   day: DayView | null;
   busy: string;
   onPrepare: () => void;
   onApprove: () => void;
+  onPick: () => void;
 }) {
   if (!day) {
     return (
@@ -179,12 +216,12 @@ export function Headline({
           <span className="eyebrow">{day.date} · {day.wave}</span>
           <h2 className="hero-h">No campaign is in the daily plan.</h2>
           <p className="hero-sub">
-            Put a campaign in from its dashboard. Doing so never places a call — it decides whose
-            leads appear here tomorrow morning.
+            Pick the campaigns to run today. Their leads are then scheduled by RED — the days to
+            expiry decide who is called and in what order. Picking places no call.
           </p>
         </div>
-        <button className="btn btn-primary btn-hero" onClick={() => navigate('dashboard')}>
-          Choose campaigns
+        <button className="btn btn-primary btn-hero" onClick={onPick}>
+          <ListChecks /> Choose campaigns
         </button>
       </section>
     );
@@ -422,6 +459,200 @@ function Campaigns({ day }: { day: DayView }) {
         </table>
       </div>
     </Card>
+  );
+}
+
+/** Pick today's campaigns in one place, then let RED schedule them.
+ *
+ *  This is the whole selection step. Before it, an operator had to open each
+ *  campaign's own dashboard and flip one switch — 67 dashboards to choose the
+ *  handful that run today, which is why nothing was ever in the daily plan.
+ *
+ *  Ticking still dials nothing. Saving arms the campaigns and builds the plan;
+ *  the plan waits for the day to be approved, exactly as before. RED decides
+ *  the rest: days-to-expiry puts each lead in a band and the bands are called
+ *  in the client's order.
+ */
+function PickCampaigns({
+  date,
+  kind,
+  onClose,
+  onDone,
+}: {
+  date: string;
+  kind: string;
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const toast = useStore((s) => s.toast);
+  const list = useAsync(() => api.campaigns(), []);
+  const [ticked, setTicked] = useState<Set<number> | null>(null);
+  const [filter, setFilter] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  // What is armed right now, straight from the server. Kept apart from `ticked`
+  // so saving can send only what the operator actually changed — re-arming an
+  // already-armed campaign would overwrite the note saying why it last stopped.
+  const armed = useMemo(
+    () => new Set((list.data ?? []).filter((c) => c.autopilot).map((c) => c.id)),
+    [list.data],
+  );
+  useEffect(() => {
+    if (list.data) setTicked((t) => t ?? new Set(armed));
+  }, [list.data, armed]);
+
+  const chosen = ticked ?? armed;
+  const shown = useMemo(() => {
+    const needle = filter.trim().toLowerCase();
+    return (list.data ?? [])
+      .filter((c) => !needle || c.name.toLowerCase().includes(needle) || String(c.id) === needle)
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }, [list.data, filter]);
+
+  const toggle = (id: number) =>
+    setTicked((t) => {
+      const next = new Set(t ?? armed);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+
+  const setMany = (on: boolean) =>
+    setTicked((t) => {
+      const next = new Set(t ?? armed);
+      for (const c of shown.filter(pickable)) {
+        if (on) next.add(c.id);
+        else next.delete(c.id);
+      }
+      return next;
+    });
+
+  const { arm, disarm } = useMemo(
+    () => autopilotDiff(list.data ?? [], chosen),
+    [list.data, chosen],
+  );
+
+  const save = async () => {
+    setSaving(true);
+    const failed: string[] = [];
+    try {
+      // One campaign refusing must not strand the others half-applied, so each
+      // is reported and the rest carry on.
+      for (const [id, on] of [
+        ...arm.map((id) => [id, true] as const),
+        ...disarm.map((id) => [id, false] as const),
+      ]) {
+        try {
+          await api.setAutopilot(id, on);
+        } catch (e) {
+          failed.push(`${id}: ${(e as Error).message}`);
+        }
+      }
+      if (failed.length) toast('bad', `${failed.length} campaign(s) refused — ${failed[0]}`);
+
+      if (chosen.size === 0) {
+        toast('ok', 'No campaign is in the daily plan. Nothing will be dialled.');
+      } else {
+        const res = await api.prepareDay(date, kind);
+        toast(
+          'ok',
+          `${n(res.ready)} leads ready across ${res.prepared} campaigns, scheduled by RED. ` +
+            'Nothing has been dialled.',
+        );
+      }
+      onDone();
+      onClose();
+    } catch (e) {
+      toast('bad', (e as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Modal
+      title="Which campaigns run today"
+      onClose={onClose}
+      footer={
+        <>
+          <span className="cell-dim" style={{ marginRight: 'auto' }}>
+            {chosen.size} selected
+            {arm.length > 0 && ` · ${arm.length} to add`}
+            {disarm.length > 0 && ` · ${disarm.length} to remove`}
+          </span>
+          <button className="btn btn-ghost" onClick={onClose} disabled={saving}>
+            Cancel
+          </button>
+          <button
+            className="btn btn-primary"
+            onClick={save}
+            disabled={saving || (arm.length === 0 && disarm.length === 0)}
+          >
+            {saving ? <Loader2 className="spin" /> : <ClipboardList />} Save and build the plan
+          </button>
+        </>
+      }
+    >
+      <p style={{ marginTop: 0 }}>
+        <Info className="inline-icon" /> Saving arms these campaigns and builds {date}’s plan from
+        their leads’ RED. It places no call — the day still has to be approved.
+      </p>
+
+      <div className="row" style={{ gap: 8, margin: '10px 0' }}>
+        <input
+          className="input"
+          placeholder="Filter by name or id"
+          aria-label="Filter campaigns"
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
+          style={{ flex: 1 }}
+        />
+        <button className="btn btn-sm btn-ghost" onClick={() => setMany(true)}>
+          Select all
+        </button>
+        <button className="btn btn-sm btn-ghost" onClick={() => setMany(false)}>
+          Clear
+        </button>
+      </div>
+
+      {list.error && (
+        <div className="warnbox">
+          <AlertTriangle />
+          <span>{list.error}</span>
+        </div>
+      )}
+      {list.loading && <p className="cell-dim">Reading the campaign list…</p>}
+      {!list.loading && shown.length === 0 && (
+        <Empty title="No campaign matches" note="Clear the filter to see them all." />
+      )}
+
+      <div className="grid" style={{ gap: 2, maxHeight: 340, overflowY: 'auto' }}>
+        {shown.map((c) => {
+          const ok = pickable(c);
+          return (
+            <label
+              key={c.id}
+              className="row"
+              style={{ gap: 8, padding: '4px 2px', opacity: ok ? 1 : 0.5 }}
+              title={ok ? undefined : 'Disabled in Formi — it cannot be put in the plan.'}
+            >
+              <input
+                type="checkbox"
+                checked={ok && chosen.has(c.id)}
+                disabled={!ok}
+                onChange={() => toggle(c.id)}
+              />
+              <span style={{ flex: 1 }}>
+                {c.name} <span className="cell-dim">· {c.id} · agent {c.agent_id}</span>
+              </span>
+              {!ok && <span className="badge">disabled</span>}
+              {/* Armed and paused is the one combination that looks selected and
+                  produces nothing: the day query skips paused campaigns. */}
+              {ok && c.paused && <span className="badge">paused — skipped today</span>}
+            </label>
+          );
+        })}
+      </div>
+    </Modal>
   );
 }
 
