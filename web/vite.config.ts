@@ -10,7 +10,9 @@ export default defineConfig(({ command }) => ({
   base: command === 'build' ? '/redial/' : '/',
   plugins: [react()],
   server: {
-    port: 5173,
+    // 5173 is the default everyone types; PORT lets a second copy run alongside
+    // it (a preview harness, a colleague's server) without editing this file.
+    port: Number(process.env.PORT) || 5173,
     // Vite rejects requests whose Host header it does not recognise. ngrok
     // rewrites Host to a *.ngrok-free.app name, so the tunnel 403s without this.
     allowedHosts: ['.ngrok-free.dev', '.ngrok-free.app', '.ngrok.io', '.ngrok.app'],
