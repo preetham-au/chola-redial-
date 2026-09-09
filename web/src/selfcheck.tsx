@@ -9,7 +9,7 @@ import { AgentChip, AgentPauseConfirm, AgentSwitcher } from './components/AgentB
 import { CampaignPicker } from './App';
 import { BucketOffWhy } from './screens/Dashboard';
 import { TestCallResultView, TestNumberTable, TriggerConfirm } from './screens/TestCall';
-import { ApproveDay, Headline, autopilotDiff, wireBuckets } from './screens/Today';
+import { ApproveDay, Headline, autopilotDiff, closesAt, wireBuckets } from './screens/Today';
 import { Row as LogRow } from './screens/CallLog';
 import { api } from './lib/api';
 import {
@@ -293,6 +293,20 @@ ok(
      has(shortDay, 'still fit before 20:00'));
   ok('and says the rest come back tomorrow rather than vanishing',
      has(shortDay, 'tomorrow'));
+
+  // Each campaign carries its own dial window, editable on its own. `day.window`
+  // is the ENVELOPE across the armed ones, so naming its end as "the" close time
+  // is only honest while they all agree.
+  {
+    const mixed = day({ capacity_before_close: 40, window_varies: true });
+    ok('a shared window is still named outright', has(shortDay, 'before 20:00'));
+    ok('windows that differ are never given one close time',
+       !has(head(mixed), 'before 20:00') && has(head(mixed), 'their campaigns close'));
+    ok('a shared window still yields the one close time everybody keeps',
+       closesAt(base) === '20:00');
+    ok('approving names each campaign’s own window when they differ',
+       has(head(day({ window_varies: true })), 'own campaign'));
+  }
 
   const shut = head(day({ window_open: false }));
   ok('outside 09:00–20:00 the approve button is dead', has(shut, 'disabled=""'));

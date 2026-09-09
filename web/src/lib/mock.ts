@@ -108,6 +108,7 @@ export const mockDay = (date: string, kind: string): DayView => {
     now: '09:00',
     dry_run: true,
     window: { start: '09:00', end: '20:00' },
+    window_varies: false,
     window_open: true,
     status: 'awaiting_approval',
     totals: { campaigns: campaigns.length, ready, posted: 0, failed: 0, dropped: 0 },

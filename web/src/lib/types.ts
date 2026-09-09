@@ -203,12 +203,20 @@ export interface DayView {
   /** Server clock, IST HH:MM. */
   now: string;
   dry_run: boolean;
+  /** The ENVELOPE across the armed campaigns — no call goes out before its start
+   *  or after its end. Each campaign carries its own window, so this is not
+   *  necessarily any one campaign's hours. */
   window: DialWindow;
+  /** The armed campaigns do not share a window, so naming one close time would
+   *  be wrong for most of them. */
+  window_varies: boolean;
+  /** At least one armed campaign can still dial today. */
   window_open: boolean;
   status: DayStatus;
   totals: { campaigns: number; ready: number; posted: number; failed: number; dropped: number };
-  /** A ceiling, not a promise: how many calls the hours left in the window can
-   *  still hold. Approve re-plans, so the real number is decided then. */
+  /** A ceiling, not a promise: how many calls the hours left can still hold,
+   *  capped per campaign against its own window and then summed. Approve
+   *  re-plans, so the real number is decided then. */
   capacity_before_close: number;
   buckets: DayBucket[];
   red_bands: DayBand[];

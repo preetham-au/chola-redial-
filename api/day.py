@@ -116,13 +116,95 @@ def _band_label(first: int, second: int) -> str:
     return f"{hi} days before RED to {-lo} days after"
 
 
-def _band_rows(bands, counts: dict[int, int]) -> list[dict[str, Any]]:
-    rows = [{"rank": i, "dte_from": max(a, b), "dte_to": min(a, b),
-             "label": _band_label(a, b), "ready": counts.get(i, 0)}
-            for i, (a, b) in enumerate(bands)]
-    rows.append({"rank": len(bands), "dte_from": None, "dte_to": None,
-                 "label": "outside the priority bands", "ready": counts.get(len(bands), 0)})
+def _band_rows(per_campaign: dict[int, tuple], counts: dict[int, int]) -> list[dict[str, Any]]:
+    """One row per priority position, over EVERY armed campaign's bands.
+
+    `red_priority` is per-campaign, so a rank means "that campaign's Nth band"
+    and nothing more. Reading one campaign's table and calling it the day's was
+    wrong twice: it named days the other campaigns may not treat as priority at
+    all, and it ranked their leads by a table they do not use.
+
+    Where the campaigns agree — the case today, and the one the client asked for
+    — each row reads exactly as it always did. Where they disagree the range is
+    left empty and the row says so, because no single pair of days covers that
+    position across the day.
+    """
+    defs: dict[int, set[Optional[tuple[int, int]]]] = {}
+    # With nothing armed there is no config to read, and the response still owes
+    # its caller the shape it always had.
+    for bands in (per_campaign or {0: DEFAULT_RED_PRIORITY}).values():
+        for rank, (first, second) in enumerate(bands):
+            defs.setdefault(rank, set()).add((min(first, second), max(first, second)))
+        defs.setdefault(len(bands), set()).add(None)
+
+    rows = []
+    for rank in sorted(defs):
+        seen = defs[rank]
+        if seen == {None}:
+            row = {"dte_from": None, "dte_to": None, "label": "outside the priority bands"}
+        elif len(seen) == 1 and (band := next(iter(seen))) is not None:
+            lo, hi = band
+            row = {"dte_from": hi, "dte_to": lo, "label": _band_label(lo, hi)}
+        else:
+            row = {"dte_from": None, "dte_to": None,
+                   "label": f"priority {rank + 1} — differs between campaigns"}
+        rows.append({"rank": rank, **row, "ready": counts.get(rank, 0)})
     return rows
+
+
+# ---------------------------------------------------------------------------
+# The day's window
+# ---------------------------------------------------------------------------
+
+# Only reached when no campaign is armed, so there is no config to read a window
+# from. Every stored config carries its own — `with_defaults` fills it in.
+DEFAULT_WINDOW = {"start": "09:00", "end": "20:00"}
+
+
+def _day_window(configs: dict[int, dict[str, Any]], ready: dict[int, int],
+                floor: int, today: bool) -> dict[str, Any]:
+    """The day's dialling window and its ceiling, from every armed campaign.
+
+    `dial_window` and `max_per_minute` are per-campaign, and each is one PUT away
+    from being edited on its own, so no single campaign's config is the day's.
+    Reading the first armed one and labelling it "the window" showed nothing while
+    every campaign happened to agree — all 69 land on 09:00-20:00 once
+    `with_defaults` retires the stale 09:30-19:00 snapshot — and would have named
+    a close time the other 68 do not keep the moment one was narrowed.
+
+    The window reported is the ENVELOPE: no call goes out before its start or
+    after its end, whichever campaign places it. `varies` says the campaigns do
+    not agree, so the screen can say so instead of implying a shared close.
+
+    `open` is true while ANY campaign can still dial — approving is worth doing
+    for the campaigns still open even once the others have shut.
+
+    The ceiling is capped PER campaign before it is summed: a campaign that shuts
+    at 19:00 cannot absorb another's leads, so one total capacity against one
+    total ready would promise a day that does not exist.
+    """
+    if not configs:
+        return {"window": DEFAULT_WINDOW, "varies": False, "open": False, "capacity": 0}
+
+    spans, capacity = set(), 0
+    for campaign_id, config in configs.items():
+        window = config.get("dial_window") or DEFAULT_WINDOW
+        start = parse_hhmm(window.get("start", DEFAULT_WINDOW["start"]))
+        end = parse_hhmm(window.get("end", DEFAULT_WINDOW["end"]))
+        spans.add((start, end))
+        waiting = ready.get(campaign_id, 0)
+        if not today:
+            capacity += waiting
+            continue
+        room = max(0, end - max(start, floor)) * int(config.get("max_per_minute") or 1)
+        capacity += min(room, waiting)
+
+    return {
+        "window": {"start": hhmm(min(s for s, _ in spans)), "end": hhmm(max(e for _, e in spans))},
+        "varies": len(spans) > 1,
+        "open": any((max(start, floor) if today else start) < end for start, end in spans),
+        "capacity": capacity,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -191,11 +273,14 @@ def get_day(date: Optional[str] = Query(None), kind: str = Query(MORNING)) -> di
         log = _dialled_today(conn, day)
 
         from .db import current_config                  # noqa: PLC0415 — avoids a cycle
-        first = campaigns[0] if campaigns else None
-        config = current_config(conn, first["id"]) if first is not None else {}
+        # Every armed campaign's own config. There is no campaign whose settings
+        # are the day's — window, max_per_minute and red_priority are all
+        # per-campaign — and reading only the first one's made this screen
+        # describe a day the other campaigns were not having.
+        configs = {c["id"]: current_config(conn, c["id"]) for c in campaigns}
 
-    bands = _bands(config)
-    window = config.get("dial_window") or {"start": "09:00", "end": "20:00"}
+    bands = {cid: _bands(config) for cid, config in configs.items()}
+    campaign_of_run = {run["id"]: campaign_id for campaign_id, run in runs.items()}
     per_run: dict[int, dict[str, Any]] = {}
     buckets: dict[str, dict[str, Any]] = {}
     band_counts: dict[int, int] = {}
@@ -203,7 +288,10 @@ def get_day(date: Optional[str] = Query(None), kind: str = Query(MORNING)) -> di
         entry = per_run.setdefault(row["run_id"], {"ready": 0, "buckets": {}})
         entry["ready"] += row["n"]
         entry["buckets"][row["bucket"]] = entry["buckets"].get(row["bucket"], 0) + row["n"]
-        rank = red_rank(row["dte"], bands)
+        # Ranked by the bands of the campaign the lead belongs to, not by one
+        # borrowed table. Rank stays comparable across campaigns because it is a
+        # position — rank 0 is whatever that campaign calls first.
+        rank = red_rank(row["dte"], bands[campaign_of_run[row["run_id"]]])
         band_counts[rank] = band_counts.get(rank, 0) + row["n"]
         bucket = buckets.setdefault(row["bucket"], {
             "bucket": row["bucket"], "label": row["bucket_label"] or row["bucket"], "ready": 0,
@@ -236,27 +324,27 @@ def get_day(date: Optional[str] = Query(None), kind: str = Query(MORNING)) -> di
     else:
         status = "approved"
 
-    # A ceiling, not a promise: minutes left in the window times how many calls a
-    # minute may hold. Approve re-plans, so the real number is decided then — but
-    # an operator opening this at 18:00 needs to see that the day no longer fits
-    # BEFORE they approve, not in the drop count afterwards.
+    # A ceiling, not a promise: minutes left in each campaign's own window times
+    # how many calls a minute it may hold, summed. Approve re-plans, so the real
+    # number is decided then — but an operator opening this at 18:00 needs to see
+    # that the day no longer fits BEFORE they approve, not in the drop count
+    # afterwards.
     first_free = _earliest_dialable(now)
-    start = parse_hhmm(window.get("start", "09:00"))
-    end = parse_hhmm(window.get("end", "20:00"))
-    floor = max(start, first_free.hour * 60 + first_free.minute) if today else start
-    per_minute = int(config.get("max_per_minute") or 1)
-    capacity = max(0, end - floor) * per_minute
+    span = _day_window(configs, {c["id"]: c["ready"] for c in listed},
+                       first_free.hour * 60 + first_free.minute, today)
 
     return {
         "date": day.isoformat(), "kind": kind, "wave": WAVE_LABEL[kind],
         "now": now.strftime("%H:%M"), "dry_run": dry_run(),
-        "window": window, "window_open": floor < end,
+        # The envelope across the armed campaigns, not one campaign's own hours.
+        "window": span["window"], "window_varies": span["varies"],
+        "window_open": span["open"],
         "status": status,
         "totals": {"campaigns": len(listed), "ready": ready,
                    "posted": sum(c["posted"] for c in listed),
                    "failed": sum(c["failed"] for c in listed),
                    "dropped": sum(c["dropped"] for c in listed)},
-        "capacity_before_close": min(capacity, ready) if today else ready,
+        "capacity_before_close": span["capacity"],
         # Best RED band first, then the bucket order inside it — the same order
         # `approve` will dial in, so the screen cannot promise a sequence the
         # dispatcher will not honour.

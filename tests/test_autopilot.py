@@ -335,6 +335,151 @@ def test_red_bands_lead_the_order_and_the_buckets_follow_them(client, armed):
     assert ranks == sorted(ranks), "buckets are listed in RED-band order"
 
 
+# ---------------------------------------------------------------------------
+# No campaign's config is the day's
+# ---------------------------------------------------------------------------
+# `dial_window`, `max_per_minute` and `red_priority` are per-campaign and each is
+# editable per campaign, but the day view read `campaigns[0]`'s and presented it
+# as the whole day's. Nothing showed today: all 69 live campaigns land on
+# 09:00-20:00 once `with_defaults` retires the stale 09:30-19:00 snapshot, so the
+# borrowed value happened to be right. It stops being right the first time an
+# operator narrows one campaign's window — which is one PUT away, and is what
+# `test_one_campaigns_edited_window_does_not_become_the_days` exercises.
+
+def _cfg(start: str, end: str, per_minute: int = 10, red=None):
+    body = {"dial_window": {"start": start, "end": end}, "max_per_minute": per_minute}
+    return {**body, "red_priority": red} if red else body
+
+
+def test_the_days_window_is_the_envelope_and_says_when_it_is_not_shared():
+    from api.day import _day_window
+
+    same = _day_window({1: _cfg("09:30", "19:00"), 2: _cfg("09:30", "19:00")},
+                       {1: 0, 2: 0}, floor=600, today=True)
+    assert same["window"] == {"start": "09:30", "end": "19:00"}
+    assert same["varies"] is False
+
+    mixed = _day_window({1: _cfg("09:30", "19:00"), 2: _cfg("09:00", "20:00")},
+                        {1: 0, 2: 0}, floor=600, today=True)
+    assert mixed["window"] == {"start": "09:00", "end": "20:00"}, "earliest start, latest end"
+    assert mixed["varies"] is True, "the screen must not imply a shared close time"
+
+
+def test_the_day_is_open_while_any_campaign_can_still_dial():
+    from api.day import _day_window
+
+    late = 19 * 60 + 30           # 19:30 — past the 19:00 campaign, inside the 20:00 one
+    configs = {1: _cfg("09:30", "19:00"), 2: _cfg("09:00", "20:00")}
+    assert _day_window(configs, {}, floor=late, today=True)["open"] is True
+    assert _day_window({1: configs[1]}, {}, floor=late, today=True)["open"] is False
+
+    shut = 20 * 60
+    assert _day_window(configs, {}, floor=shut, today=True)["open"] is False
+
+
+def test_capacity_is_capped_per_campaign_before_it_is_summed():
+    """A campaign that shuts at 19:00 cannot absorb another campaign's leads.
+
+    One total capacity against one total ready would promise a day that does not
+    exist: the roomy campaign's spare minutes would silently cover the shut one's
+    backlog.
+    """
+    from api.day import _day_window
+
+    # 18:00. Campaign 1 has 60 minutes left at 10/min = 600 slots for 5000 leads;
+    # campaign 2 has 120 minutes at 10/min = 1200 slots but only 10 leads waiting.
+    span = _day_window({1: _cfg("09:30", "19:00"), 2: _cfg("09:00", "20:00")},
+                       {1: 5000, 2: 10}, floor=18 * 60, today=True)
+    assert span["capacity"] == 600 + 10
+
+    # Its own max_per_minute, not the first campaign's.
+    slow = _day_window({1: _cfg("09:30", "19:00", per_minute=1)},
+                       {1: 5000}, floor=18 * 60, today=True)
+    assert slow["capacity"] == 60
+
+
+def test_a_day_with_nothing_armed_still_answers_with_a_window():
+    from api.day import _day_window
+
+    empty = _day_window({}, {}, floor=600, today=True)
+    assert empty["open"] is False and empty["capacity"] == 0
+    assert empty["window"] == {"start": "09:00", "end": "20:00"}
+
+
+def test_each_campaigns_leads_are_ranked_by_its_own_red_bands():
+    """Rank is a position, so it stays comparable — the LABEL is what cannot be
+    borrowed. Where the campaigns disagree the row says so rather than naming
+    days most of them do not treat as priority."""
+    from api.day import _band_rows
+
+    shared = ((-1, -3), (0, 7))
+    agreed = _band_rows({1: shared, 2: shared}, {0: 5, 1: 3, 2: 1})
+    assert [(b["dte_from"], b["dte_to"]) for b in agreed] == [(-1, -3), (7, 0), (None, None)]
+    assert agreed[0]["label"] == "1-3 days past RED"
+    assert agreed[-1]["label"] == "outside the priority bands"
+    assert [b["ready"] for b in agreed] == [5, 3, 1]
+
+    split = _band_rows({1: shared, 2: ((0, 7), (-1, -3))}, {0: 5})
+    assert split[0]["label"] == "priority 1 — differs between campaigns"
+    assert (split[0]["dte_from"], split[0]["dte_to"]) == (None, None)
+    assert split[0]["ready"] == 5, "the count is still the whole day's"
+    assert split[-1]["label"] == "outside the priority bands"
+
+
+def test_a_campaign_with_more_bands_does_not_swallow_the_catch_all_row():
+    """Rank len(bands) is 'outside' for one campaign and a real band for another,
+    so that position holds both and cannot be labelled either."""
+    from api.day import _band_rows
+
+    rows = _band_rows({1: ((-1, -3), (0, 7)), 2: ((-1, -3), (0, 7), (8, 15))}, {})
+    assert len(rows) == 4
+    assert rows[2]["label"] == "priority 3 — differs between campaigns"
+    assert rows[3]["label"] == "outside the priority bands"
+
+
+def test_one_campaigns_edited_window_does_not_become_the_days(client):
+    """The whole path, not the helper: an operator narrows ONE campaign's hours.
+
+    This is how the borrowed config surfaces. Every live campaign shares
+    09:00-20:00 today, so reading the first one's was accidentally right; one PUT
+    on one campaign is all it takes for the header to name a close time the other
+    campaigns do not keep.
+    """
+    conn = _db()
+    ids = [r["id"] for r in conn.execute(
+        "SELECT id FROM campaigns WHERE enabled=1 AND paused=0 ORDER BY id LIMIT 2")]
+    conn.execute("UPDATE campaigns SET autopilot=0")
+    conn.executemany("UPDATE campaigns SET autopilot=1 WHERE id=?", [(i,) for i in ids])
+    conn.commit()
+    conn.close()
+    assert len(ids) == 2, "this test needs two campaigns to disagree"
+
+    shared = client.get(f"/api/day?date={TODAY.isoformat()}").json()
+    assert shared["window_varies"] is False
+    assert shared["window"] == {"start": "09:00", "end": "20:00"}
+
+    # The LOWER id is edited, so a run reading campaigns[0] would report 18:00 for
+    # both campaigns — the failure this is here to catch — and the higher one is
+    # left alone so there is a campaign the edit must not speak for.
+    config = client.get(f"/api/campaigns/{ids[0]}/config").json()
+    saved = client.put(f"/api/campaigns/{ids[0]}/config",
+                       json={**config, "dial_window": {"start": "09:00", "end": "18:00"}})
+    assert saved.status_code == 200, saved.text
+
+    try:
+        day = client.get(f"/api/day?date={TODAY.isoformat()}").json()
+        assert day["window_varies"] is True, "the screen must say the campaigns disagree"
+        assert day["window"] == {"start": "09:00", "end": "20:00"}, (
+            "the envelope — no call goes out before 09:00 or after 20:00, and the "
+            "edited campaign's 18:00 is not the day's close")
+    finally:
+        # The `client` fixture is session-scoped and a config PUT appends a
+        # version rather than replacing one, so a narrowed window left behind
+        # here would silently shorten this campaign's day for every test after
+        # it — and only after 18:00 IST, which is the worst kind of flake.
+        client.put(f"/api/campaigns/{ids[0]}/config", json=config)
+
+
 @pytest.fixture
 def armed_all(monkeypatch):
     """Every campaign in the daily plan — one plan across all of them, as asked."""

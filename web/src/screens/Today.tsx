@@ -52,6 +52,14 @@ export const pickable = (c: Campaign) => c.enabled !== false;
  *  overwrite the note saying why it last stopped, and disarming one that is
  *  already out would invent a "stopped by operator" it never had. A campaign
  *  the server would refuse never reaches either list. */
+/** How to name the moment dialling stops, in a sentence reading "before …".
+ *
+ *  Each campaign carries its own dial window, so a single close time is only
+ *  honest when they all share one. When they do not, `day.window` is the
+ *  envelope across them and no campaign necessarily shuts at its end. */
+export const closesAt = (day: DayView) =>
+  day.window_varies ? 'their campaigns close' : day.window.end;
+
 export function autopilotDiff(all: Campaign[], chosen: Set<number>) {
   const ok = all.filter(pickable);
   return {
@@ -102,6 +110,7 @@ export function Today() {
           <span className="eyebrow">
             Server clock {d?.now ?? '—'} IST · window {d?.window.start ?? '09:00'}–
             {d?.window.end ?? '20:00'}
+            {d?.window_varies && ' · varies by campaign'}
           </span>
           <h1>The day</h1>
         </div>
@@ -257,7 +266,7 @@ export function Headline({
           </h2>
           <p className="hero-sub">
             This wave has been approved. {day.totals.dropped > 0 && (
-              <>{n(day.totals.dropped)} did not fit before {day.window.end} and return in tomorrow’s
+              <>{n(day.totals.dropped)} did not fit before {closesAt(day)} and return in tomorrow’s
               plan. </>
             )}
             The call log says whether each one was actually dialled.
@@ -287,14 +296,14 @@ export function Headline({
             </>
           ) : short ? (
             <>
-              Only about {n(day.capacity_before_close)} of them still fit before {day.window.end}.
+              Only about {n(day.capacity_before_close)} of them still fit before {closesAt(day)}.
               Approving takes them in RED order — the rest are not dialled today and come back in
               tomorrow’s plan.
             </>
           ) : (
             <>
-              Approving puts them on Formi’s clock inside {day.window.start}–{day.window.end}, best
-              RED band first.
+              Approving puts them on Formi’s clock inside {day.window.start}–{day.window.end}
+              {day.window_varies && ', each within its own campaign’s window'}, best RED band first.
             </>
           )}
         </p>
@@ -767,7 +776,10 @@ export function ApproveDay({
         <Fact k="Buckets" v={buckets.length === 0 ? 'all of them' : shown.join(', ')} />
         <Fact k="Selected" v={n(ready)} />
         <Fact k="Fits before close" v={n(fits)} tone={fits < ready ? 'var(--warn)' : undefined} />
-        <Fact k="Window" v={`${day.window.start}–${day.window.end} IST`} />
+        <Fact
+          k="Window"
+          v={`${day.window.start}–${day.window.end} IST${day.window_varies ? ' · varies by campaign' : ''}`}
+        />
       </div>
 
       {shown.length === 0 && (
@@ -781,7 +793,7 @@ export function ApproveDay({
         <Info />
         <span>
           Approving re-plans from {day.now} first, so only what genuinely fits before{' '}
-          {day.window.end} is scheduled — best RED band first. Whatever does not fit is{' '}
+          {closesAt(day)} is scheduled — best RED band first. Whatever does not fit is{' '}
           <b>not dialled today</b> and returns in tomorrow’s plan.
         </span>
       </div>
