@@ -338,7 +338,28 @@ _MONTH_ABBR = ("jan", "feb", "mar", "apr", "may", "jun",
                "jul", "aug", "sep", "oct", "nov", "dec")
 
 
-def _day_month_sql(text: str, ref: str) -> str:
+def _plain_text_sql(column: str) -> str:
+    """Drop the weekday, the ordinal suffix and the commas, keep everything else.
+
+    Mirrors `red_engine._plain_text`, and applied the same way: once, before any
+    branch, so every format below gains the hand-written spelling of itself
+    ('10th October', 'Friday, October 10, 2026') without any of them growing a
+    case for it. Both shapes yielded NULL before this, and a lead with no RED is
+    a lead the engine never dials.
+
+    Full weekday names are matched before the abbreviations so 'Friday' is not
+    cut down to 'day'; no weekday abbreviation is also a month abbreviation, so
+    nothing here can eat a month. The suffix rule is anchored on a digit, which
+    leaves the words in 'twenty first september' alone.
+    """
+    text = f"REPLACE(BTRIM(({column})::text), ',', ' ')"
+    text = (f"REGEXP_REPLACE({text}, '^((mon|tues|wednes|thurs|fri|satur|sun)day"
+            f"|mon|tue|wed|thu|fri|sat|sun)\\s+', '', 'i')")
+    text = f"REGEXP_REPLACE({text}, '([0-9])(st|nd|rd|th)\\y', '\\1', 'gi')"
+    return f"BTRIM(REGEXP_REPLACE({text}, '\\s+', ' ', 'g'))"
+
+
+def _day_month_sql(text: str, ref: str, month_first: bool = False) -> str:
     """`dd-Mon` carrying NO year -> the occurrence nearest `ref`.
 
     Chola's 29-Aug upload (campaigns 1703/1706) writes RED as bare '04-Sep'.
@@ -351,9 +372,13 @@ def _day_month_sql(text: str, ref: str) -> str:
     each value lands on whichever side of `ref` it is closer to. Anything that
     far out is outside every dial window anyway, so the fuzziness of the
     boundary costs nothing.
+
+    `month_first` reads the same two parts the other way round, for 'Oct 10'.
+    A named month is unambiguous whichever side of the day it falls.
     """
-    return _infer_year_sql(f"SPLIT_PART({text}, '-', 1)::int",
-                           _month_number_sql(f"SPLIT_PART({text}, '-', 2)"), ref)
+    day_part, month_part = (2, 1) if month_first else (1, 2)
+    return _infer_year_sql(f"SPLIT_PART({text}, '-', {day_part})::int",
+                           _month_number_sql(f"SPLIT_PART({text}, '-', {month_part})"), ref)
 
 
 def _month_number_sql(expr: str) -> str:
@@ -362,19 +387,37 @@ def _month_number_sql(expr: str) -> str:
     return f"(CASE LOWER(LEFT({expr}, 3)) {cases} ELSE NULL END)"
 
 
-def _worded_day_month_sql(column: str, ref: str) -> str:
+def _worded_day_month_sql(text: str, ref: str) -> str:
     """`<day in words> <month>` -> a date. Mirrors red_engine.parse_red.
 
     'eleventh september', the whole of the 05-Sep-2026 upload. Year-less like
     '04-Sep', so the year is inferred by the same rule.
     """
-    low = f"LOWER(BTRIM(({column})::text))"
+    low = f"LOWER({text})"
     # Greedy prefix, so the LAST word is the month and everything before it is
     # the day -- 'twenty-first september' splits where a naive one would not.
     day_words = f"REGEXP_REPLACE(SUBSTRING({low} FROM '^(.*)[^a-z]+[a-z]+$'), '[^a-z]', '', 'g')"
     cases = " ".join(f"WHEN '{w}' THEN {n}" for w, n in sorted(DAY_WORDS.items()))
     return _infer_year_sql(f"(CASE {day_words} {cases} ELSE NULL END)",
                            _month_number_sql(f"SUBSTRING({low} FROM '([a-z]+)$')"), ref)
+
+
+def _named_month_ymd_sql(text: str, month_first: bool = False) -> str:
+    """`d-Mon-yyyy` / `Mon-d-yyyy` -> a date, whichever side the month falls.
+
+    TO_DATE is deliberately not used here. Its `Mon` pattern consumes exactly
+    three characters, so 'October-10-2026' leaves 'ober-10-2026' behind and the
+    query ABORTS with `invalid value "ob" for "DD"` — a whole sync failing on one
+    lead's spelling. `_month_number_sql` matches the same first three letters
+    every other branch does and yields NULL for anything it does not know.
+    """
+    month_index, day_index = (1, 2) if month_first else (2, 1)
+    month = _month_number_sql(f"SPLIT_PART({text}, '-', {month_index})")
+    day = f"SPLIT_PART({text}, '-', {day_index})::int"
+    year = f"SPLIT_PART({text}, '-', 3)::int"
+    return (f"CASE WHEN {month} IS NOT NULL"
+            f" AND {day} BETWEEN 1 AND {_days_in_month_sql(year, month)}"
+            f" THEN MAKE_DATE({year}, {month}, {day}) ELSE NULL END")
 
 
 def _infer_year_sql(day: str, month: str, ref: str) -> str:
@@ -407,16 +450,21 @@ def red_parse_expression(column: str = "v.red", month_first_expr: str | None = N
       * d-Mon                     4-Sep -- year missing, inferred from `today`
       * 2-digit years, '.' as a separator, and a SPACE where a named month's
         separator should be ('02 Sep', '02 September')
+      * Mon-d-yyyy / Mon-d       October 10, 2026 -- a named month is unambiguous
+                                 on either side of the day
+      * hand-written             '10th October', 'Friday, October 10, 2026' --
+                                 weekday, ordinal suffix and commas come off
+                                 first, in `_plain_text_sql`
 
     Anything else, and anything self-contradictory, yields NULL rather than a
     wrong date. Nothing in here can raise.
     """
-    text = f"NULLIF(BTRIM(REPLACE(({column})::text, '.', '-')), '')"
-    slashed = f"NULLIF(BTRIM(({column})::text), '')"
+    plain = _plain_text_sql(column)
+    text = f"NULLIF(REPLACE({plain}, '.', '-'), '')"
+    slashed = f"NULLIF({plain}, '')"
     # Named months only. Spaces cannot be normalised in `text` because the ISO
     # branch matches the space between date and time ('2026-09-15 00:00:00').
-    named = (f"NULLIF(REGEXP_REPLACE(BTRIM(({column})::text), "
-             f"'[[:space:].]+', '-', 'g'), '')")
+    named = f"NULLIF(REGEXP_REPLACE({plain}, '[[:space:].]+', '-', 'g'), '')"
     ref = f"DATE '{today.isoformat()}'" if today else "CURRENT_DATE"
     return f"""CASE
     WHEN {column} IS NULL OR LOWER(BTRIM(({column})::text)) IN ('', 'null', 'none', 'nan', '-') THEN NULL
@@ -430,14 +478,19 @@ def red_parse_expression(column: str = "v.red", month_first_expr: str | None = N
     WHEN {text} ~ '^[0-9]{{1,2}}-[0-9]{{1,2}}-([0-9]{{2}}|[0-9]{{4}})$' THEN
       {_three_part_sql(text, "-", year_first=False, month_first_default=False,
                        month_first_expr=month_first_expr)}
-    WHEN {named} ~ '^[0-9]{{1,2}}-[A-Za-z]{{3,}}-[0-9]{{4}}$' THEN TO_DATE({named}, 'FMDD-Mon-YYYY')
+    WHEN {named} ~ '^[0-9]{{1,2}}-[A-Za-z]{{3,}}-[0-9]{{4}}$' THEN {_named_month_ymd_sql(named)}
+    -- The same value written month first ('October 10, 2026'), which the weekday
+    -- and commas are already off by the time it reaches here.
+    WHEN {named} ~ '^[A-Za-z]{{3,}}-[0-9]{{1,2}}-[0-9]{{4}}$' THEN
+      {_named_month_ymd_sql(named, month_first=True)}
     -- Year-less named month ('04-Sep', '02 Sep'): the year is inferred, never
     -- assumed to be the current one. Matches red_engine.parse_red.
     WHEN {named} ~ '^[0-9]{{1,2}}-[A-Za-z]{{3,}}$' THEN {_day_month_sql(named, ref)}
+    WHEN {named} ~ '^[A-Za-z]{{3,}}-[0-9]{{1,2}}$' THEN {_day_month_sql(named, ref, month_first=True)}
     -- Day spelled out ('eleventh september'). Letters only, so nothing numeric
     -- reaches here; an unrecognised word yields NULL like any other bad RED.
-    WHEN LOWER(BTRIM(({column})::text)) ~ '^[a-z][a-z -]*[ -][a-z]{{3,}}$' THEN
-      {_worded_day_month_sql(column, ref)}
+    WHEN LOWER({plain}) ~ '^[a-z][a-z -]*[ -][a-z]{{3,}}$' THEN
+      {_worded_day_month_sql(plain, ref)}
     WHEN {slashed} ~ '^[0-9]{{1,2}}/[0-9]{{1,2}}/([0-9]{{2}}|[0-9]{{4}})$' THEN
       {_three_part_sql(slashed, "/", year_first=False, month_first_default=False,
                        month_first_expr=month_first_expr)}

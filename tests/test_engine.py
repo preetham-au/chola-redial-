@@ -314,6 +314,45 @@ def test_manual_never_returns_an_excluded_lead():
     assert [p[0]["lead_uuid"] for p in pairs] == ["c"]
 
 
+@pytest.mark.parametrize("text,want", [
+    ("10th October", date(2026, 10, 10)), ("1st October", date(2026, 10, 1)),
+    ("21st Oct", date(2026, 10, 21)), ("3rd Oct 2026", date(2026, 10, 3)),
+    ("2nd September", date(2026, 9, 2)),
+    ("Friday, October 10, 2026", date(2026, 10, 10)),
+    ("Fri, 10 October 2026", date(2026, 10, 10)),
+    ("Monday, 15-Sep-2026", date(2026, 9, 15)),
+    ("October 10, 2026", date(2026, 10, 10)), ("Oct 10", date(2026, 10, 10)),
+    ("10-October-2026", date(2026, 10, 10)), ("tenth October", date(2026, 10, 10)),
+    # Nothing above may be reached by loosening what the parser already rejects.
+    ("garbage", None), ("someday october", None), ("31-02-2026", None),
+])
+def test_red_written_by_hand_still_lands_on_the_day_it_says(text, want):
+    """A RED a person typed is a RED, not a NULL.
+
+    Every shape here yielded None before the weekday, the ordinal suffix and the
+    commas were stripped, and a lead with no RED falls outside every band and is
+    never dialled — the same silent drop 'eleventh september' caused on 5 Sep
+    2026, which took campaigns 1740/1744/1746 out of the console entirely.
+
+    Verified in lockstep against `metabase_source.red_parse_expression` on the
+    live warehouse: 40 shapes, 40 identical answers. The SQL cannot run here, so
+    this half is what CI keeps honest.
+    """
+    from engine.red_engine import parse_red
+    assert parse_red(text, today=date(2026, 9, 9)) == want
+
+
+def test_a_named_month_never_reaches_to_date():
+    """`Mon` consumes exactly three characters, so TO_DATE aborts the query.
+
+    'October-10-2026' leaves 'ober-10-2026' behind and Postgres raises
+    `invalid value "ob" for "DD"` — not a NULL for that one lead, but a failed
+    sync for every campaign in the batch. Verified against the real warehouse.
+    """
+    from engine.metabase_source import red_parse_expression
+    assert "TO_DATE" not in red_parse_expression()
+
+
 # ---------------------------------------------------------------------------
 # Seed fixture
 # ---------------------------------------------------------------------------

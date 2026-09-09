@@ -491,9 +491,26 @@ DEFAULT_CONFIG = RedConfig()
 # scheduler never disagree about a lead's RED.
 RENEWAL_MONTH_HINT = (8, 9)
 
-_MONTH_NAMES = ("%d-%b-%Y", "%d-%B-%Y")
+# A named month is unambiguous whichever side of the day it falls, so both
+# orders are read: '1-Sep-2026' and 'October 10, 2026' are the same kind of
+# value, and only the second one used to be thrown away.
+_MONTH_NAMES = ("%d-%b-%Y", "%d-%B-%Y", "%b-%d-%Y", "%B-%d-%Y")
 # Year-less named month — the shape Chola's 29-Aug upload uses ('04-Sep').
-_MONTH_NAMES_NO_YEAR = ("%d-%b", "%d-%B")
+_MONTH_NAMES_NO_YEAR = ("%d-%b", "%d-%B", "%b-%d", "%B-%d")
+
+# What a person adds when writing a date by hand and no parser below can use:
+# the ordinal suffix on '10th October', the weekday and commas on 'Friday,
+# October 10, 2026'. Both shapes reached ELSE NULL as they stood, and a lead
+# with no RED is a lead the engine never dials — the same silent drop that
+# 'eleventh september' caused on 5 Sep 2026. Mirrors `metabase_source._plain_text_sql`.
+#
+# Full weekday names are matched first so 'Friday' is not cut down to 'day' by
+# the abbreviation arm; no weekday abbreviation is also a month abbreviation,
+# so nothing here can eat a month.
+_WEEKDAY = re.compile(r"^(?:(?:mon|tues|wednes|thurs|fri|satur|sun)day"
+                      r"|mon|tue|wed|thu|fri|sat|sun)\b[,\s]+", re.I)
+# Anchored on a digit, so the words in 'twenty first september' are untouched.
+_ORDINAL_SUFFIX = re.compile(r"(?<=\d)(?:st|nd|rd|th)\b", re.I)
 
 _ORDINALS = ("first second third fourth fifth sixth seventh eighth ninth tenth eleventh "
              "twelfth thirteenth fourteenth fifteenth sixteenth seventeenth eighteenth "
@@ -509,6 +526,15 @@ _ORDINALS = ("first second third fourth fifth sixth seventh eighth ninth tenth e
 DAY_WORDS: dict[str, int] = {w: i for i, w in enumerate(_ORDINALS, 1)}
 DAY_WORDS.update({"twentieth": 20, "thirtieth": 30, "thirtyfirst": 31})
 DAY_WORDS.update({f"twenty{w}": 20 + i for i, w in enumerate(_ORDINALS[:9], 1)})
+
+
+def _plain_text(text: str) -> str:
+    """Drop the weekday, the ordinal suffix and the commas, keep everything else.
+
+    Applied once before any branch, so every format below gains the hand-written
+    spelling of itself without any of them growing a case for it.
+    """
+    return " ".join(_ORDINAL_SUFFIX.sub("", _WEEKDAY.sub("", text)).replace(",", " ").split())
 
 
 def _nearest_year(month: int, day: int, today: Optional[date] = None) -> Optional[date]:
@@ -588,6 +614,8 @@ def parse_red(value: Any, month_first: Optional[bool] = None,
         02 Sep / 4-Sep        named month, NO year -> nearest occurrence to today
         15.09.2026            '.' separator
         15/9/26               2-digit year -> 20xx
+        10th October          hand-written: ordinal suffix, year inferred
+        Friday, October 10, 2026   hand-written: weekday, month first, commas
 
     `month_first` is the campaign's own convention, learned in SQL from its
     unambiguous rows and passed back as `campaign_month_first`. Supplying it is
@@ -608,6 +636,7 @@ def parse_red(value: Any, month_first: Optional[bool] = None,
     text = str(value).strip()
     if not text or text.lower() in {"null", "none", "nan", "-"}:
         return None
+    text = _plain_text(text)
 
     # An ISO timestamp is machine-written, so its order is not in doubt.
     head = text.replace("T", " ").split(" ")[0].split("+")[0].strip()
