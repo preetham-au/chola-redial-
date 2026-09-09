@@ -119,9 +119,9 @@ export const mockDay = (date: string, kind: string): DayView => {
       { bucket: 'F4', label: 'High frequency', ready: Math.round(ready * 0.17), best_rank: 2 },
     ],
     red_bands: [
-      { rank: 0, dte_from: 3, dte_to: 1, label: 'renewal due in 1-3 days',
+      { rank: 0, dte_from: -1, dte_to: -3, label: '1-3 days past RED',
         ready: Math.round(ready * 0.59) },
-      { rank: 1, dte_from: 0, dte_to: -7, label: 'RED day to 7 days past it',
+      { rank: 1, dte_from: 7, dte_to: 0, label: 'RED day and the 7 days before it',
         ready: Math.round(ready * 0.24) },
       { rank: 2, dte_from: null, dte_to: null, label: 'outside the priority bands',
         ready: Math.round(ready * 0.17) },

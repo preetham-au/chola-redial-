@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from engine.dispatcher import DEFAULT_RED_PRIORITY
 from engine.red_engine import NEVER_DIAL
 from engine.seed import TEST_NUMBERS
 
@@ -174,10 +175,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
         {"bucket": "F6", "label": "Grace period",     "from_dte": -2, "to_dte": -3, "calls_per_week": 0, "calls_per_day": 2},
     ],
     "bucket_priority": ["M0", "E0", "F6", "F5", "F4", "F3", "F2", "F1", "D0"],
-    # Applied AHEAD of bucket_priority — see dispatcher.DEFAULT_RED_PRIORITY.
-    # Decides what survives when a run is capped or approved with too few hours
-    # left in the day.
-    "red_priority": [[3, 1], [0, -7]],
+    # Applied AHEAD of bucket_priority. Decides what survives when a run is
+    # capped or approved with too few hours left in the day.
+    #
+    # Derived, not retyped. This used to be a second literal copy of the
+    # dispatcher's default, and when the bands were corrected for the client's
+    # sign convention only the engine copy changed -- this one still shadowed it
+    # at runtime, so the suite went green against bands nothing was using.
+    "red_priority": [list(band) for band in DEFAULT_RED_PRIORITY],
     "auto_dispositions": ["did_not_pick", "hung_up", "unreachable", "rnr",
                           "beep_tone_number_busy_not_reachable_switched_off",
                           "voicemail", "telephony_failed", "dialer_nc",

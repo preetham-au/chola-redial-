@@ -184,13 +184,18 @@ class RedWindow:
         }
 
 
-# The design doc's table 3, converted to the dte convention. Intensity roughly
-# doubles per window (1 -> 2 -> 3 -> 5 -> 14 calls/week) as RED approaches.
+# The client's calling schedule, converted to the dte convention (their table is
+# signed the other way: negative = before RED). Intensity steps up as RED nears —
+# 2 -> 2 -> 3 -> 3 calls/week, then 14 as the last week turns into 2 calls/day.
+#
+# F1 and F4 are the client's numbers, not a curve: they asked for 2/week in the
+# warm-up and 3/week at 15..8 days out, so F1 is not lighter than F2 and F4 is
+# not heavier than F3. Do not "smooth" these back into a doubling ladder.
 DEFAULT_FREQUENCY_TABLE: tuple[RedWindow, ...] = (
-    RedWindow("F1", "Warm-up",         from_dte=45, to_dte=32, calls_per_week=1),
+    RedWindow("F1", "Warm-up",         from_dte=45, to_dte=32, calls_per_week=2),
     RedWindow("F2", "Early engagement", from_dte=31, to_dte=24, calls_per_week=2),
     RedWindow("F3", "Building urgency", from_dte=23, to_dte=16, calls_per_week=3),
-    RedWindow("F4", "High frequency",   from_dte=15, to_dte=8,  calls_per_week=5),
+    RedWindow("F4", "High frequency",   from_dte=15, to_dte=8,  calls_per_week=3),
     RedWindow("F5", "Critical window",  from_dte=7,  to_dte=1,  calls_per_day=2),
     # Expiry day and the day after, split out of F5/F6 because it is the moment
     # the policy actually lapses: same intensity, but its own bucket so it can
@@ -399,9 +404,17 @@ class RedConfig:
     # interested, directed to branch -- are CALLBACK class and are reachable
     # only from the manual screen, because a human decides when to chase a warm
     # lead. Adding CALLBACK here restores the old auto-callback behaviour.
+    #
+    # This is the client's rule, not a conservative default: for those six they
+    # said "you dont make any calls, only do calls for this on t0 and t-1 days".
+    # Their redial table still gives each one a date (appointment+1, CMRL+2,
+    # branch+2/visit+1, premium+1, link+1, followup+5) -- that date is computed
+    # and shown so a human can work it, but nothing automated dials on it. The
+    # only automated call these leads get is the RED-1/RED mandatory pair, which
+    # is why the mandatory branch sits ABOVE this gate in `decide`.
     auto_classes: tuple[str, ...] = (DNP, FRESH)
 
-    # Dial order, most urgent first. E0/F6/F5 (RED-3 .. RED+7) are the critical
+    # Dial order, most urgent first. E0/F6/F5 (RED-7 .. RED+3) are the critical
     # window and are planned before anything else, so if a run is capped or the
     # dialler falls behind it is the far-from-expiry leads that get dropped,
     # never the ones about to lapse. E0 (expiry day and the day after) outranks

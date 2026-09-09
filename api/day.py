@@ -6,11 +6,16 @@ every campaign that is in the daily plan (`campaigns.autopilot`) and leaves it
 how many leads are ready, split by RED band and by bucket — and one Approve puts
 it on Formi's clock. If nobody approves, nothing goes out that day.
 
-Ordering is the client's, and it is not the bucket order. Renewals due in the
-next three days (RED dte 3..1) go first, then the RED day itself and the week
-after it (0..-7); everything else follows. That is `red_priority` in the config,
-applied by the dispatcher ahead of `bucket_priority`, so it is what decides who
-survives when a day is capped or approved with few hours left.
+Ordering is the client's, and it is not the bucket order. Their schedule's two
+2-calls/day rows lead it, in the order they named them: the three days AFTER
+expiry first (their "1 to 3", dte -1..-3), then the week running up to it (their
+"-7 to 0", dte 0..7); everything else follows. That is `red_priority` in the
+config, applied by the dispatcher ahead of `bucket_priority`, so it is what
+decides who survives when a day is capped or approved with few hours left.
+
+Their table is signed the other way round from our dte -- negative means before
+RED, per their own "calls needs to be initiated on RED - 1 and RED date" -- so
+both bands are negated on the way in. See dispatcher.DEFAULT_RED_PRIORITY.
 
 Approving late does not dial into the night. Approve RE-PLANS each campaign from
 the current minute, so only what genuinely fits before the window shuts is
@@ -97,11 +102,18 @@ def _band_label(first: int, second: int) -> str:
     negative one is a policy already past its RED date.
     """
     lo, hi = min(first, second), max(first, second)
-    if lo > 0:
+    if lo > 0:                      # wholly ahead of RED
         return f"renewal due in {lo}-{hi} days"
-    if hi <= 0:
-        return f"RED day to {-lo} days past it"
-    return f"{hi} days before RED to {-lo} days past it"
+    if hi < 0:                      # wholly past it — the client's "1 to 3"
+        return (f"{-hi} days past RED" if lo == hi
+                else f"{-hi}-{-lo} days past RED")
+    if lo == 0 and hi == 0:
+        return "RED day"
+    if lo == 0:                     # RED day and the run-up — the client's "-7 to 0"
+        return f"RED day and the {hi} days before it"
+    if hi == 0:
+        return f"RED day and the {-lo} days after it"
+    return f"{hi} days before RED to {-lo} days after"
 
 
 def _band_rows(bands, counts: dict[int, int]) -> list[dict[str, Any]]:

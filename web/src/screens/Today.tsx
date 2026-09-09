@@ -4,10 +4,11 @@
  *  and afternoon and leaves it waiting; this screen is where an operator reads
  *  what is ready and approves it. If nobody approves, no call goes out.
  *
- *  The order is the client's, not the bucket order: renewals due in the next
- *  three days first, then the RED day and the week after it. That is what
- *  decides who survives when the day is approved with few hours left, so it is
- *  the first thing on the page — above the buckets, which follow it.
+ *  The order is the client's, not the bucket order: the three days just PAST
+ *  expiry first (their "1 to 3"), then the week running up to it (their "-7 to
+ *  0"). That is what decides who survives when the day is approved with few
+ *  hours left, so it is the first thing on the page — above the buckets, which
+ *  follow it.
  */
 import { useEffect, useMemo, useState } from 'react';
 import {
@@ -22,7 +23,7 @@ import {
   RefreshCw,
 } from 'lucide-react';
 import { api } from '../lib/api';
-import { bucketColor, friendlyBucket, n } from '../lib/domain';
+import { bandRange, bucketColor, friendlyBucket, n } from '../lib/domain';
 import { navigate, useAsync, useStore } from '../lib/store';
 import { Card, Empty, Fact, Modal, TypeToConfirm } from '../components/ui';
 import type { DayBucket, DayView } from '../lib/types';
@@ -286,7 +287,7 @@ function RedBands({ day }: { day: DayView }) {
             <tr>
               <th style={{ width: 34 }}>#</th>
               <th>Band</th>
-              <th>Days to renewal</th>
+              <th>When it renews</th>
               <th className="n">Ready</th>
               <th style={{ width: '32%' }} />
             </tr>
@@ -296,9 +297,7 @@ function RedBands({ day }: { day: DayView }) {
               <tr key={b.rank}>
                 <td className="cell-dim">{b.rank + 1}</td>
                 <td><b>{b.label}</b></td>
-                <td className="mono cell-dim">
-                  {b.dte_from === null ? 'everything else' : `${b.dte_from} … ${b.dte_to}`}
-                </td>
+                <td className="mono cell-dim">{bandRange(b.dte_from, b.dte_to)}</td>
                 <td className="n" style={{ fontWeight: 600 }}>{n(b.ready)}</td>
                 <td>
                   <div className="bucket-bar">

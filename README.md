@@ -61,7 +61,7 @@ Nothing dials on its own. The clock only ever *prepares*:
 If nobody approves, no call goes out that day. Approving late does not dial into
 the night: approve re-plans from the current minute, so only what fits before
 20:00 is scheduled and the rest returns in tomorrow's plan — best RED band first
-(`red_priority`, renewals due in 3..1 days, then RED day to RED−7).
+(`red_priority`: the 1–3 days past RED, then RED day and the week before it).
 
 Pausing a campaign **in the Formi platform** pauses it here and takes its queued
 calls back off Formi's clock. Un-pausing it there does *not* restart calls here —

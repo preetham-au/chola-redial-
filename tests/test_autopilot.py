@@ -316,13 +316,18 @@ def test_the_day_waits_for_an_approval_and_dials_nothing_before_it(client, armed
 
 
 def test_red_bands_lead_the_order_and_the_buckets_follow_them(client, armed):
-    """RED 3..1 first, then 0..-7 — ahead of the bucket order, not inside it."""
+    """Just-lapsed (RED+1..+3) first, then the run-up (RED-7..RED).
+
+    Ahead of the bucket order, not inside it. The pair is the client's two
+    2-calls/day rows negated out of their sign convention into dte.
+    """
     _prepare(client, armed)
     day = client.get(f"/api/day?date={TODAY.isoformat()}").json()
 
     bands = day["red_bands"]
-    assert [(b["dte_from"], b["dte_to"]) for b in bands[:2]] == [(3, 1), (0, -7)]
-    assert bands[0]["label"] == "renewal due in 1-3 days"
+    assert [(b["dte_from"], b["dte_to"]) for b in bands[:2]] == [(-1, -3), (7, 0)]
+    assert bands[0]["label"] == "1-3 days past RED"
+    assert bands[1]["label"] == "RED day and the 7 days before it"
     assert bands[-1]["rank"] == len(bands) - 1, "the catch-all band is always last"
     assert sum(b["ready"] for b in bands) == day["totals"]["ready"]
 

@@ -43,11 +43,15 @@ enforced server-side.
     { "bucket": "F6", "label": "Grace period",     "from_dte": -2, "to_dte": -3, "calls_per_week": 0, "calls_per_day": 2 }
   ],
   "bucket_priority": ["M0","E0","F6","F5","F4","F3","F2","F1","D0"],
-  // RED bands, applied AHEAD of bucket_priority: renewals due in 3..1 days go
-  // first, then the RED day and the week after it, then everything else. This is
-  // what decides who survives when a day is capped or approved with few hours
-  // left, so it outranks the bucket order rather than living inside it.
-  "red_priority": [[3, 1], [0, -7]],
+  // RED bands, applied AHEAD of bucket_priority. The client's two 2-calls/day
+  // rows, in the order they named them: the three days PAST expiry first, then
+  // the week running up to it, then everything else. This is what decides who
+  // survives when a day is capped or approved with few hours left, so it
+  // outranks the bucket order rather than living inside it.
+  //
+  // Their schedule is signed the other way round (negative = before RED), so
+  // their "1 to 3" is dte -1..-3 here and their "-7 to 0" is dte 0..7.
+  "red_priority": [[-1, -3], [0, 7]],
   "auto_dispositions": ["did_not_pick","hung_up","unreachable","rnr",
                         "beep_tone_number_busy_not_reachable_switched_off",
                         "voicemail","telephony_failed","dialer_nc",

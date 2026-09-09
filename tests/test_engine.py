@@ -72,11 +72,124 @@ def test_mandatory_day_overrides_the_gate_for_a_connected_lead():
     assert decision.trigger == "mandatory"
 
 
+# The six connected dispositions from the client's redial-logic table. Their
+# "when" column (appointment+1, CMRL+2, branch+2/visit+1, premium+1, link+1,
+# followup+5) sets a callback DATE, but the client does not want the AI dialling
+# on it: "for this you dont make any calls, only do calls for this on t0 and t-1".
+# So the date is computed and shown, and the only automated call these leads get
+# is the RED-1 / RED mandatory pair.
+CONNECTED_SIX = [
+    "lead_appointment_fixed", "lead_cmrl_interested", "lead_directed_to_branch",
+    "share_premium_quotation", "lead_link_sent_online", "lead_positive_followup",
+]
+
+
+@pytest.mark.parametrize("stage", CONNECTED_SIX)
+def test_a_connected_disposition_is_never_auto_dialled_on_its_callback_date(stage):
+    """Even standing exactly on the callback date, the AI does not dial."""
+    # dte 9 keeps this clear of the mandatory days and of E0/F6, so the only
+    # thing that could schedule it is the disposition callback itself.
+    warm = lead(stage=stage, red=(TODAY + timedelta(days=9)).isoformat(),
+                last_interaction_time=f"{TODAY.isoformat()} 10:00:00")
+    decision = decide(warm, NOW, DEFAULT_CONFIG)
+    assert decision.schedule is False
+    assert decision.action == SKIP_MANUAL_ONLY
+    assert decision.bucket == "D0", "still counted, still dialable by hand"
+
+
+@pytest.mark.parametrize("stage", CONNECTED_SIX)
+@pytest.mark.parametrize("dte", [1, 0])
+def test_the_connected_six_are_called_on_t0_and_t_minus_1(stage, dte):
+    """t-1 and t0 are the two days the client wants these dialled, and only those."""
+    warm = lead(stage=stage, red=(TODAY + timedelta(days=dte)).isoformat(),
+                last_interaction_time=f"{TODAY.isoformat()} 10:00:00")
+    decision = decide(warm, NOW, DEFAULT_CONFIG)
+    assert decision.schedule is True
+    assert decision.bucket == "M0" and decision.trigger == "mandatory"
+
+
 def test_auto_dispositions_can_re_enable_callbacks():
     config = red_config_from_body({"auto_dispositions": ["did_not_pick", "positive_followup"]})
     decision = decide(lead(stage="positive_followup", red=(TODAY).isoformat(),
                            last_interaction_time="2026-08-27 10:00:00"), NOW, config)
     assert decision.action != SKIP_MANUAL_ONLY
+
+
+# ---------------------------------------------------------------------------
+# The client's calling schedule, transcribed
+# ---------------------------------------------------------------------------
+
+# Their table, verbatim, in THEIR sign convention: negative = days before RED
+# (fixed by their own line "calls needs to be initiated on RED - 1 and RED
+# date"). Kept in client form so this reads against the source document rather
+# than against our translation of it -- the negation is what is under test.
+CLIENT_SCHEDULE = [
+    (-45, -32, "2 Calls/Week"), (-31, -24, "2 Calls/Week"),
+    (-23, -16, "3 Calls/Week"), (-15, -8, "3 Calls/week"),
+    (-7, 0, "16 ( 2 calls/day )"), (1, 3, "6 ( 2 calls/day )"),
+]
+
+
+@pytest.mark.parametrize("c_from, c_to, calls", CLIENT_SCHEDULE)
+def test_every_row_of_the_client_schedule_is_configured(c_from, c_to, calls):
+    """Each client row, negated into dte, must be covered at the stated rate."""
+    from engine.red_engine import find_window
+
+    for c_day in range(c_from, c_to + 1):
+        window = find_window(-c_day)        # their sign -> ours
+        assert window is not None, f"client day {c_day} (dte {-c_day}) has no window"
+        if "day" in calls:
+            assert window.calls_per_day == 2, f"client day {c_day}: {window.bucket}"
+        else:
+            assert window.calls_per_week == int(calls.split()[0]), \
+                f"client day {c_day}: {window.bucket} is {window.calls_per_week}/week"
+
+
+def test_the_schedule_stops_three_days_past_red():
+    """No window past RED+3 -- the client's table ends there, so we do too.
+
+    This is the other half of the sign fix: read in OUR convention the second
+    priority band would run to RED+7, and the ~5k live leads at RED+4..RED+7
+    would be ranked top-priority with no window to dial them from.
+    """
+    from engine.red_engine import find_window
+
+    assert find_window(-3) is not None and find_window(-3).bucket == "F6"
+    for c_day in range(4, 9):
+        assert find_window(-c_day) is None, f"RED+{c_day} should be out of schedule"
+
+
+def test_the_api_default_config_matches_the_engine_table():
+    """The shipped config and the engine fallback are the same schedule.
+
+    They are two hand-written copies of one table. When F1/F4 were corrected to
+    the client's 2 and 3 per week, only one copy was updated for a while and the
+    other silently served the old rates to every campaign that never PUT a config.
+    """
+    from api.db import DEFAULT_CONFIG
+    from engine.red_engine import DEFAULT_FREQUENCY_TABLE
+
+    shipped = {row["bucket"]: row for row in DEFAULT_CONFIG["frequency_table"]}
+    assert set(shipped) == {w.bucket for w in DEFAULT_FREQUENCY_TABLE}
+    for window in DEFAULT_FREQUENCY_TABLE:
+        row = shipped[window.bucket]
+        assert (row["from_dte"], row["to_dte"]) == (window.from_dte, window.to_dte)
+        assert row["calls_per_week"] == (window.calls_per_week or 0), window.bucket
+        assert row["calls_per_day"] == (window.calls_per_day or 0), window.bucket
+
+
+def test_the_red_bands_are_the_two_intensive_rows_of_that_table():
+    """Bands 0/1 are the client's "1 to 3" and "-7 to 0", negated into dte."""
+    from engine.dispatcher import DEFAULT_RED_PRIORITY, red_rank
+
+    # Just-lapsed outranks the run-up: the client named "1 to 3" first.
+    for c_day in (1, 2, 3):
+        assert red_rank(-c_day, DEFAULT_RED_PRIORITY) == 0
+    for c_day in range(-7, 1):
+        assert red_rank(-c_day, DEFAULT_RED_PRIORITY) == 1
+    # Everything outside RED-7..RED+3 falls to the catch-all.
+    for dte in (8, 20, 45, -4, -8):
+        assert red_rank(dte, DEFAULT_RED_PRIORITY) == len(DEFAULT_RED_PRIORITY)
 
 
 # ---------------------------------------------------------------------------

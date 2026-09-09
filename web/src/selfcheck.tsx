@@ -23,6 +23,7 @@ import {
 } from './lib/mock';
 import {
   agentsFrom,
+  bandRange,
   BUCKET_COLOR,
   BUCKET_ORDER,
   configurableBuckets,
@@ -358,6 +359,22 @@ ok(
      passState('15:00', fired, 'auto_pm', '15:00') === 'missed');
   ok('a server too old to send its clock claims nothing',
      passState('15:00', fired, 'auto_pm', '') === 'waiting');
+}
+
+// --- RED band ranges read in the client's terms, not raw dte ---------------
+{
+  // The whole point: the just-lapsed band is dte -1..-3, and printing that
+  // verbatim under a renewal column reads as a negative countdown.
+  ok('the just-lapsed band reads as days PAST red',
+     bandRange(-1, -3) === 'RED+1 … RED+3');
+  ok('the run-up band starts at RED and counts backwards',
+     bandRange(7, 0) === 'RED … RED−7');
+  ok('the catch-all band says so in words',
+     bandRange(null, null) === 'everything else');
+  ok('a single-day band is not written as a range',
+     bandRange(0, 0) === 'RED');
+  ok('argument order does not change the reading',
+     bandRange(-3, -1) === bandRange(-1, -3));
 }
 
 // --- scope leak guard (async: exercises the api layer's offline fallback) ----

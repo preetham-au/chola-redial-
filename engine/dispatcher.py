@@ -78,15 +78,27 @@ def validate_dial_window(start: Any, end: Any) -> tuple[int, int]:
     return start_min, end_min
 
 
-# Days-to-expiry bands, best first, applied AHEAD of `bucket_priority`. The
-# client's order: renewal due in the next three days, then RED day itself and
-# the week after it. Whatever is shed by `max_per_run` or will not fit in the
-# hours left comes off the bottom of this, so a late approval keeps the calls
-# that cannot be made up tomorrow and drops the ones that can.
+# Days-to-expiry bands, best first, applied AHEAD of `bucket_priority`. Whatever
+# is shed by `max_per_run` or will not fit in the hours left comes off the bottom
+# of this, so a late approval keeps the calls that cannot be made up tomorrow and
+# drops the ones that can.
 #
-# A band, not a bucket, because the bands cut ACROSS buckets: dte 3..1 is the
-# tail of F5 (7..1) and has to outrank the rest of it.
-DEFAULT_RED_PRIORITY = ((3, 1), (0, -7))
+# These are the client schedule's two 2-calls/day rows, in THEIR sign convention
+# (negative = before RED, per "calls needs to be initiated on RED - 1 and RED
+# date"): "1 to 3" is the three days AFTER expiry, "-7 to 0" is the week running
+# up to it. Negated here into our dte (= red - today, positive before RED):
+#
+#     client  1 .. 3   ->  dte -1 .. -3   band 0   policy has just lapsed
+#     client -7 .. 0   ->  dte  0 ..  7   band 1   the week before it lapses
+#
+# Together they cover RED-7 .. RED+3 exactly, which is the whole intensive part
+# of the schedule and nothing else. Read in OUR convention instead, "0 to -7"
+# would mean RED..RED+7 -- four days past where the client's schedule stops, and
+# 5,069 live leads sit in that phantom range with no window to call them from.
+#
+# A band, not a bucket, because the bands cut ACROSS buckets: E0 is dte 0..-1 and
+# straddles the pair, its RED day ranking under its day-after.
+DEFAULT_RED_PRIORITY = ((-1, -3), (0, 7))
 
 
 @dataclass(frozen=True)
@@ -109,8 +121,9 @@ class DispatchConfig:
 def red_rank(dte: Any, bands: Sequence[tuple[int, int]] = DEFAULT_RED_PRIORITY) -> int:
     """Index of the first band containing `dte`; len(bands) for everything else.
 
-    Bands are written high-to-low the way a person says them ("1 to 3", "0 to -7"),
-    so either order of the pair is accepted.
+    Either order of the pair is accepted, so a band can be written the way a
+    person says it. Note the values are dte, NOT the client schedule's signing —
+    their "1 to 3" is `(-1, -3)` here.
     """
     if dte is None:
         return len(bands)

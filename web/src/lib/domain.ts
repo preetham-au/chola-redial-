@@ -91,6 +91,21 @@ export function bucketRange(code: string): string {
   return BUCKET_RANGE[code] ?? '';
 }
 
+/** A RED band's span, written the way the client's schedule writes it.
+ *
+ *  dte is `red - today`, so it counts DOWN to renewal and goes negative after
+ *  it: the just-lapsed band reads `-1 … -3`, which under a column headed "days
+ *  to renewal" looks like a mistake or a minus sign nobody explained. The
+ *  client's own sheet says RED-1 / RED+3, so say that. */
+export function bandRange(from: number | null, to: number | null): string {
+  if (from === null || to === null) return 'everything else';
+  const red = (d: number) =>
+    d === 0 ? 'RED' : d > 0 ? `RED−${d}` : `RED+${-d}`;
+  // Written near-to-RED first, so both bands read outward from the renewal.
+  const [near, far] = Math.abs(from) <= Math.abs(to) ? [from, to] : [to, from];
+  return near === far ? red(near) : `${red(near)} … ${red(far)}`;
+}
+
 /** Bucket keys the server accepts in `bucket_dispositions`: the frequency-table
  *  buckets plus M0 and D0. Anything else is a 422 on PUT. */
 export function configurableBuckets(freq: FrequencyRow[]): string[] {
