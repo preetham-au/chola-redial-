@@ -11,6 +11,7 @@ import { BucketOffWhy } from './screens/Dashboard';
 import { TestCallResultView, TestNumberTable, TriggerConfirm } from './screens/TestCall';
 import { ApproveDay, Headline, autopilotDiff, closesAt, wireBuckets } from './screens/Today';
 import { Row as LogRow } from './screens/CallLog';
+import { selectionSplit } from './screens/CampaignVisibility';
 import { api } from './lib/api';
 import {
   mockBuckets,
@@ -289,6 +290,17 @@ ok(
     ok('re-saving without a change puts nothing on the wire',
        autopilotDiff(all, new Set([2, 3])).arm.length === 0 &&
        autopilotDiff(all, new Set([2, 3])).disarm.length === 0);
+
+    // The settings screen ticks both lists with one Set, and its two buttons
+    // each fire one request per row. Sending a campaign to the wrong button is
+    // dozens of pointless writes, and un-hide rewrites a note hide never wrote.
+    const s = selectionSplit(all, new Set([1, 2, 5]));
+    ok('Hide selected acts only on the campaigns that are visible',
+       s.hide.map((x) => x.id).join() === '1,2');
+    ok('Un-hide selected acts only on the campaigns that are hidden',
+       s.unhide.map((x) => x.id).join() === '5');
+    ok('an untouched campaign is in neither list',
+       !s.hide.some((x) => x.id === 3) && !s.unhide.some((x) => x.id === 3));
   }
   ok('an unbuilt plan offers to build it, and says building dials nothing',
      has(head(day({ status: 'not_prepared' })), 'dials nothing'));

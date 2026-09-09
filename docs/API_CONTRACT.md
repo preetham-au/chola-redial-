@@ -148,6 +148,14 @@ appears here on its own. Hiding does **not** set `autopilot_latched`: that latch
 is pause/resume's, and borrowing it would let a later resume silently re-arm a
 hidden campaign. Un-hiding restores visibility only — arming is a separate act.
 
+Two screens send these, and both ask for `?include_hidden=true` — nothing else
+in the console does. The day's picker hides one row at a time, in the moment it
+is noticed; **Settings → Campaign visibility** (`#visibility`) lists every
+campaign of every agent, hidden included, and hides or un-hides a batch of them
+one request at a time. That screen is deliberately outside the agent scope and
+outside the "pick a campaign first" gate: it is the way back from hiding, so it
+has to work when the campaign switcher is empty.
+
 Hiding does not reach out and cancel calls already accepted by Formi for today;
 `live_today` in the response says how many are still to go, and `pause` is the
 switch that takes them back. While such a campaign still has slots ahead of the
@@ -354,8 +362,8 @@ selector, not a filter chip.
 An agent is `paused: true` when every one of its enabled campaigns is paused.
 `campaigns`, `enabled` and `paused_campaigns` count only the campaigns the
 console shows, so a tab cannot claim 40 while six of them are hidden. An agent
-whose campaigns are *all* hidden still gets a row — losing it would leave no way
-back to the picker that un-hides them.
+whose campaigns are *all* hidden still gets a row — losing it would drop the
+agent out of the switcher entirely.
 
 ### Test call
 

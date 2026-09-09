@@ -4,6 +4,7 @@ import {
   CalendarCheck,
   CheckCircle2,
   CircleSlash,
+  EyeOff,
   FlaskConical,
   History,
   LayoutGrid,
@@ -27,6 +28,7 @@ import { PlanReview } from './screens/PlanReview';
 import { ConfigScreen } from './screens/ConfigScreen';
 import { ManualRedial } from './screens/ManualRedial';
 import { BulkStage } from './screens/BulkStage';
+import { CampaignVisibility } from './screens/CampaignVisibility';
 import { Today } from './screens/Today';
 import { CallLog } from './screens/CallLog';
 import type { Campaign } from './lib/types';
@@ -51,11 +53,16 @@ const NAV = [
   { group: 'Lead data', items: [
     { id: 'bulk', label: 'Bulk stage change', icon: Tags },
   ]},
+  { group: 'Settings', items: [
+    { id: 'visibility', label: 'Campaign visibility', icon: EyeOff },
+  ]},
 ];
 
 // The day and the call log span every campaign, so the campaign picker and the
-// "pick a campaign first" gate do not apply to them.
-const CAMPAIGN_FREE = new Set(['today', 'calllog', 'testcall']);
+// "pick a campaign first" gate do not apply to them. Nor does visibility: it is
+// the screen that puts a campaign back, so it must work when the picker is empty
+// because everything is hidden.
+const CAMPAIGN_FREE = new Set(['today', 'calllog', 'testcall', 'visibility']);
 
 export function App() {
   const [route, go] = useRoute();
@@ -311,6 +318,8 @@ function Screen({ route }: { route: string }) {
       return <TestCall />;
     case 'bulk':
       return <BulkStage />;
+    case 'visibility':
+      return <CampaignVisibility />;
     case 'dashboard':
       return <Dashboard />;
     default:
