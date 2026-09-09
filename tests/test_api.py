@@ -105,6 +105,62 @@ def test_campaigns_and_pause(client):
     assert client.get("/api/campaigns/999/config").status_code == 404
 
 
+def test_hiding_takes_a_campaign_out_of_every_list_and_out_of_reach(client):
+    """The operator's own decision, and the one thing a sync must never undo.
+
+    69 campaigns in one picker means a retired one is always a mis-click from
+    being armed. Hiding is the switch that makes that click impossible, so it has
+    to hold on the server: gone from the list every screen loads from, and refused
+    outright if a stale client posts its id anyway.
+    """
+    listed = client.get("/api/campaigns").json()
+    target = next(c for c in listed if c["enabled"] and not c["paused"])
+    cid, agent_id = target["id"], target["agent_id"]
+    before = {a["agent_id"]: a for a in client.get("/api/agents").json()}
+    try:
+        assert client.post(f"/api/campaigns/{cid}/autopilot", json={"on": True}).status_code == 200
+
+        body = client.post(f"/api/campaigns/{cid}/hide").json()
+        assert body["hidden"] is True
+        assert body["autopilot"] is False, "hidden but still in the plan"
+        # Nothing is queued in this test, and the count must say so rather than
+        # guess: the UI tells the operator what hiding leaves running.
+        assert body["live_today"] == 0
+        # Deliberately NOT latched. The latch belongs to pause/resume, and
+        # borrowing it would let a later resume put a hidden campaign back in the
+        # plan without anyone asking for it.
+        assert body["autopilot_latched"] is False
+
+        assert cid not in [c["id"] for c in client.get("/api/campaigns").json()]
+        opted_in = client.get("/api/campaigns?include_hidden=true").json()
+        assert [c["id"] for c in opted_in] == [c["id"] for c in listed]
+        # Scoping and hiding compose: the picker can be both.
+        assert cid in [c["id"] for c in
+                       client.get(f"/api/campaigns?agent_id={agent_id}&include_hidden=true").json()]
+
+        # Refused at the API, not merely absent from the picker.
+        refused = client.post(f"/api/campaigns/{cid}/autopilot", json={"on": True})
+        assert refused.status_code == 409 and "hidden" in refused.json()["error"]
+
+        # The agent tab counts what the console shows, or it claims campaigns
+        # nobody on that tab can reach.
+        after = {a["agent_id"]: a for a in client.get("/api/agents").json()}
+        assert after[agent_id]["campaigns"] == before[agent_id]["campaigns"] - 1
+        assert after[agent_id]["enabled"] == before[agent_id]["enabled"] - 1
+        assert set(after) == set(before), "an agent lost its tab and its way back"
+
+        back = client.post(f"/api/campaigns/{cid}/unhide").json()
+        assert back["hidden"] is False
+        assert back["autopilot"] is False, "un-hiding re-armed it"
+    finally:
+        client.post(f"/api/campaigns/{cid}/unhide")
+        client.post(f"/api/campaigns/{cid}/autopilot", json={"on": False})
+
+    assert len(client.get("/api/campaigns").json()) == len(listed)
+    assert client.post("/api/campaigns/999/hide").status_code == 404
+    assert client.post("/api/campaigns/999/unhide").status_code == 404
+
+
 # ---------------------------------------------------------------------------
 # Config versioning
 # ---------------------------------------------------------------------------

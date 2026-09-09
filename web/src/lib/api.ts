@@ -130,13 +130,20 @@ const q = (o: Record<string, string | number | undefined>) => {
 
 const json = (body: unknown): RequestInit => ({ method: 'POST', body: JSON.stringify(body) });
 
-/** Scoped campaign list. The filter is re-applied client-side on purpose: a
+/** Scoped campaign list. Both filters are re-applied client-side on purpose: a
  *  server that ignores `?agent_id` must not be able to leak another agent's
  *  campaigns into a scoped picker — that is how a script gets dialled at the
- *  wrong cohort. */
-async function listCampaigns(agent_id?: number): Promise<Campaign[]> {
-  const all = await req<Campaign[]>(`/api/campaigns${q({ agent_id })}`, undefined, () => mockCampaigns);
-  return agent_id === undefined ? all : all.filter((c) => c.agent_id === agent_id);
+ *  wrong cohort — and one that ignores `include_hidden` must not be able to put
+ *  a campaign the operator retired back in front of them. */
+async function listCampaigns(agent_id?: number, includeHidden = false): Promise<Campaign[]> {
+  const all = await req<Campaign[]>(
+    `/api/campaigns${q({ agent_id, include_hidden: includeHidden ? 'true' : undefined })}`,
+    undefined,
+    () => mockCampaigns,
+  );
+  return all.filter(
+    (c) => (agent_id === undefined || c.agent_id === agent_id) && (includeHidden || !c.hidden),
+  );
 }
 
 export const api = {
@@ -199,6 +206,24 @@ export const api = {
       ...(mockCampaigns.find((c) => c.id === id) ?? mockCampaigns[0]),
       paused: false,
     })),
+
+  /** Take a campaign out of circulation: gone from every list here, and it can
+   *  no longer be armed. `live_today` is what it already put on Formi's clock
+   *  for the rest of today — hiding does not reach out and cancel those. */
+  hide: (id: number) =>
+    req<Campaign & { live_today: number }>(`/api/campaigns/${id}/hide`, { method: 'POST' }, () => {
+      const c = mockCampaigns.find((x) => x.id === id) ?? mockCampaigns[0];
+      Object.assign(c, { hidden: true, autopilot: false, autopilot_note: 'hidden by operator' });
+      return { ...c, live_today: 0 };
+    }),
+
+  /** Put it back in the lists — disarmed. Arming is a separate, deliberate act. */
+  unhide: (id: number) =>
+    req<Campaign>(`/api/campaigns/${id}/unhide`, { method: 'POST' }, () => {
+      const c = mockCampaigns.find((x) => x.id === id) ?? mockCampaigns[0];
+      Object.assign(c, { hidden: false, autopilot_note: 'un-hidden by operator' });
+      return { ...c };
+    }),
 
   /* --- The day -----------------------------------------------------------
      One screen, one decision. `day` is cheap enough to poll: the server reads

@@ -28,7 +28,10 @@ enforced server-side.
   // The pause took autopilot away; a resume HERE puts it back. Nothing else
   // does — see the pause/resume rows below.
   "autopilot_latched": false,
-  "platform_status": "active" }                // last status Formi reported
+  "platform_status": "active",                 // last status Formi reported
+  // Retired by the operator: absent from every list here and impossible to
+  // arm. No sync writes it — see Hidden below.
+  "hidden": false }
 
 // Config (versioned; PUT creates a new version, never mutates)
 { "version": 3, "created_at": "2026-08-28T09:12:00",
@@ -112,9 +115,11 @@ enforced server-side.
 ### Campaigns & config
 | Method | Path | Notes |
 |---|---|---|
-| `GET` | `/api/campaigns` | list |
+| `GET` | `/api/campaigns` | list; `?include_hidden=true` opts hidden ones back in |
 | `POST` | `/api/campaigns/{id}/pause` | sets `paused=true`, blocks approve/commit, **and takes today's un-dialled calls back off Formi's clock**. A pause that leaves calls booked is not a pause. Latches `autopilot` and clears it. |
 | `POST` | `/api/campaigns/{id}/resume` | clears the pause and restores the latched `autopilot`. **The only way back** — see the platform-pause latch below. |
+| `POST` | `/api/campaigns/{id}/hide` | sets `hidden=true`, clears `autopilot`. Returns the campaign plus `live_today` — see below. |
+| `POST` | `/api/campaigns/{id}/unhide` | clears `hidden`. Never re-arms: `autopilot` stays off. |
 | `GET` | `/api/campaigns/{id}/config` | current version |
 | `PUT` | `/api/campaigns/{id}/config` | body = config; **422** if `dial_window` outside 09:00–20:00 or `start >= end`; returns new version |
 | `GET` | `/api/campaigns/{id}/config/history` | `[{version, created_at}]` |
@@ -128,6 +133,27 @@ the campaign stays held until somebody hits `POST /api/campaigns/{id}/resume` on
 this console. `autopilot_latched` is how the campaign remembers it was in the
 daily plan, so a resume puts it back exactly as it was rather than arming a
 campaign nobody armed.
+
+**Hidden.** `hidden` is the operator's own decision to take a campaign out of
+circulation for good. `GET /api/campaigns` leaves hidden campaigns out unless
+asked, and that is the only list the console loads campaigns from, so hiding
+removes one from the campaign switcher, the config screen, the dial log filter
+and the picker at once. The day path (`ARMED` in `api/day.py`) requires
+`hidden=0`, and `POST /api/campaigns/{id}/autopilot {"on": true}` returns **409**
+for a hidden campaign — a stale client cannot put one back in the plan.
+
+No sync writes `hidden` (`upsert_campaign` names its SET columns), unlike
+`enabled` and `paused`, and it defaults to `0`, so a campaign created in Formi
+appears here on its own. Hiding does **not** set `autopilot_latched`: that latch
+is pause/resume's, and borrowing it would let a later resume silently re-arm a
+hidden campaign. Un-hiding restores visibility only — arming is a separate act.
+
+Hiding does not reach out and cancel calls already accepted by Formi for today;
+`live_today` in the response says how many are still to go, and `pause` is the
+switch that takes them back. While such a campaign still has slots ahead of the
+clock it stays in `GET /api/day`'s `stopped` list with
+`why: "hidden — the calls it already put on Formi's clock today are still going
+out"`, so a live campaign is never entirely off-screen.
 
 ### The daily plan (autopilot)
 
@@ -321,11 +347,15 @@ selector, not a filter chip.
 | Method | Path | Notes |
 |---|---|---|
 | `GET` | `/api/agents` | `[{agent_id, name, campaigns, enabled, paused_campaigns, paused}]` |
-| `GET` | `/api/campaigns?agent_id=` | scoped list; omitting `agent_id` returns all |
+| `GET` | `/api/campaigns?agent_id=` | scoped list; omitting `agent_id` returns all. Hidden campaigns are excluded from both. |
 | `POST` | `/api/agents/{agent_id}/pause` | pauses **every** campaign on that agent |
 | `POST` | `/api/agents/{agent_id}/resume` | |
 
 An agent is `paused: true` when every one of its enabled campaigns is paused.
+`campaigns`, `enabled` and `paused_campaigns` count only the campaigns the
+console shows, so a tab cannot claim 40 while six of them are hidden. An agent
+whose campaigns are *all* hidden still gets a row — losing it would leave no way
+back to the picker that un-hides them.
 
 ### Test call
 

@@ -132,7 +132,8 @@ def init_db(conn: sqlite3.Connection | None = None) -> sqlite3.Connection:
                         ("autopilot_note", "TEXT NOT NULL DEFAULT ''"),
                         ("stopped_reason", "TEXT NOT NULL DEFAULT ''"),
                         ("autopilot_latched", "INTEGER NOT NULL DEFAULT 0"),
-                        ("platform_status", "TEXT NOT NULL DEFAULT ''")):
+                        ("platform_status", "TEXT NOT NULL DEFAULT ''"),
+                        ("hidden", "INTEGER NOT NULL DEFAULT 0")):
         if campaign_columns and column not in campaign_columns:
             conn.execute(f"ALTER TABLE campaigns ADD COLUMN {column} {ddl}")
     conn.executescript(SCHEMA.read_text(encoding="utf-8"))

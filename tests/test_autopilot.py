@@ -561,6 +561,74 @@ def test_approving_twice_does_not_dial_twice(client, armed):
     assert sent == first["posted"], "the second approval sent something"
 
 
+def test_a_hidden_campaign_is_neither_planned_nor_approved(client, armed):
+    """Hidden has to hold on the day path, not just in the picker.
+
+    Un-ticking a campaign and hiding it look the same on screen; only one of them
+    survives a stale client posting the id back, which is why approve is handed
+    the id explicitly here.
+    """
+    _prepare(client, armed)
+    before = client.get(f"/api/day?date={TODAY.isoformat()}").json()
+    assert before["totals"]["ready"] > 0, "nothing was planned, so nothing is being tested"
+
+    try:
+        assert client.post(f"/api/campaigns/{armed}/hide").status_code == 200
+
+        day = client.get(f"/api/day?date={TODAY.isoformat()}").json()
+        assert day["campaigns"] == []
+        assert day["totals"]["ready"] == 0 and day["totals"]["campaigns"] == 0
+        assert day["capacity_before_close"] == 0
+
+        again = client.post("/api/day/prepare", json={"date": TODAY.isoformat()}).json()
+        assert [c for c in again["campaigns"] if c["campaign_id"] == armed] == []
+
+        result = client.post("/api/day/approve",
+                             json={"date": TODAY.isoformat(), "campaign_ids": [armed]}).json()
+        assert result["approved"] == 0 and result["posted"] == 0
+    finally:
+        client.post(f"/api/campaigns/{armed}/unhide")
+
+
+def test_a_hidden_campaign_still_dialling_today_is_never_off_screen(client, armed):
+    """Hiding leaves today's queued calls running — so it stays listed while they run.
+
+    Invisible everywhere plus still dialling is the one state this console must
+    not have: a call goes out with nothing on any screen saying so. It shows under
+    "held back" for as long as it has slots left on Formi's clock, then drops off.
+    """
+    _prepare(client, armed)
+    conn = _db()
+    run = conn.execute("SELECT id FROM runs WHERE campaign_id=? AND run_date=?",
+                       (armed, TODAY.isoformat())).fetchone()["id"]
+    conn.execute("UPDATE runs SET status='committed' WHERE id=?", (run,))
+    # An hour out, so this does not depend on what time the suite runs -- except
+    # after 23:00, when nothing can still be queued for today and the point is moot.
+    later = (now_ist() + datetime.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:00")
+    if later[:10] != TODAY.isoformat():
+        conn.close()
+        pytest.skip("past 23:00 IST: no slot can still be ahead of the clock today")
+    conn.execute("UPDATE plan_items SET status='simulated', scheduled_time=? WHERE run_id=?",
+                 (later, run))
+    conn.commit()
+
+    try:
+        body = client.post(f"/api/campaigns/{armed}/hide").json()
+        assert body["live_today"] > 0, "the count the operator is shown was wrong"
+
+        day = client.get(f"/api/day?date={TODAY.isoformat()}").json()
+        assert day["campaigns"] == [], "a hidden campaign was still offered for approval"
+        held = [c for c in day["stopped"] if c["id"] == armed]
+        assert len(held) == 1 and "hidden" in held[0]["why"]
+        assert "still going out" in held[0]["why"]
+    finally:
+        client.post(f"/api/campaigns/{armed}/unhide")
+        conn.execute("UPDATE runs SET status='planned' WHERE id=?", (run,))
+        conn.execute("UPDATE plan_items SET status='planned' WHERE run_id=?", (run,))
+        conn.commit()
+        conn.close()
+
+
 def test_a_paused_campaign_is_neither_planned_nor_approved(client, armed):
     _prepare(client, armed)
     assert client.post(f"/api/campaigns/{armed}/pause").status_code == 200

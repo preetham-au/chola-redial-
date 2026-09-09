@@ -52,6 +52,12 @@ KINDS = (MORNING, AFTERNOON)
 
 WAVE_LABEL = {MORNING: "morning", AFTERNOON: "afternoon"}
 
+# Who is in today's plan. One string because the question is asked three times —
+# the day view, the prepare pass and the approve — and a campaign that answers
+# yes to one but not the others is a campaign that gets planned off-screen or
+# dialled after it was taken out. Widening the roster means editing this line.
+ARMED = "autopilot=1 AND enabled=1 AND paused=0 AND hidden=0"
+
 
 class PrepareBody(BaseModel):
     date: Optional[str] = None
@@ -256,9 +262,7 @@ def get_day(date: Optional[str] = Query(None), kind: str = Query(MORNING)) -> di
     today = day == now.date()
 
     with session() as conn:
-        campaigns = conn.execute(
-            "SELECT * FROM campaigns WHERE autopilot=1 AND enabled=1 AND paused=0 "
-            "ORDER BY id").fetchall()
+        campaigns = conn.execute(f"SELECT * FROM campaigns WHERE {ARMED} ORDER BY id").fetchall()
         # Stopped campaigns are still shown: "why is nothing happening for X" is
         # the question this screen exists to answer, and an empty list answers it
         # with silence. Keyed on the LATCH as well as the switch, because a stop
@@ -268,6 +272,18 @@ def get_day(date: Optional[str] = Query(None), kind: str = Query(MORNING)) -> di
         stopped = conn.execute(
             "SELECT * FROM campaigns WHERE (autopilot=1 OR autopilot_latched=1) "
             "AND (paused=1 OR enabled=0) ORDER BY id").fetchall()
+        # A hidden campaign is gone from every list in the console, and hiding
+        # deliberately leaves today's queued calls on Formi's clock. Those two
+        # together would put calls on the wire with nothing on any screen saying
+        # so, which is the one thing this console must never do. It appears here
+        # while — and only while — it still has calls to place, then drops off.
+        dialling_while_hidden = conn.execute(
+            "SELECT DISTINCT c.* FROM campaigns c "
+            "JOIN runs r ON r.campaign_id=c.id JOIN plan_items i ON i.run_id=r.id "
+            "WHERE c.hidden=1 AND r.run_date=? AND r.status='committed' "
+            "AND i.status IN ('posted','simulated') AND i.scheduled_time > ? "
+            "ORDER BY c.id",
+            (day.isoformat(), now.strftime("%Y-%m-%dT%H:%M:00"))).fetchall()
         runs = _plan_rows(conn, [c["id"] for c in campaigns], day, kind)
         counts = _slot_counts(conn, [r["id"] for r in runs.values()])
         log = _dialled_today(conn, day)
@@ -353,7 +369,10 @@ def get_day(date: Optional[str] = Query(None), kind: str = Query(MORNING)) -> di
         "campaigns": listed,
         "stopped": [{**_campaign_json(c),
                      "why": c["stopped_reason"] or ("disabled" if not c["enabled"] else "paused")}
-                    for c in stopped],
+                    for c in stopped]
+                   + [{**_campaign_json(c), "why": "hidden — the calls it already "
+                       "put on Formi's clock today are still going out"}
+                      for c in dialling_while_hidden],
         # The honest half of "did the call happen": counts straight off the dial
         # log, where `dialled` means the warehouse showed a real interaction.
         "dial_log": log,
@@ -393,7 +412,7 @@ def prepare_day(day: Optional[date] = None, kind: str = MORNING,
 
     with session() as conn:
         ids = [r["id"] for r in conn.execute(
-            "SELECT id FROM campaigns WHERE autopilot=1 AND enabled=1 AND paused=0 ORDER BY id")]
+            f"SELECT id FROM campaigns WHERE {ARMED} ORDER BY id")]
 
     results = [_prepare_one(campaign_id, day, kind, resync) for campaign_id in ids]
     return {"date": day.isoformat(), "kind": kind, "wave": WAVE_LABEL[kind],
@@ -483,9 +502,7 @@ def approve_day(body: ApproveBody = Body(default_factory=ApproveBody)) -> dict[s
 
     results: list[dict[str, Any]] = []
     with session() as conn:
-        campaigns = conn.execute(
-            "SELECT * FROM campaigns WHERE autopilot=1 AND enabled=1 AND paused=0 "
-            "ORDER BY id").fetchall()
+        campaigns = conn.execute(f"SELECT * FROM campaigns WHERE {ARMED} ORDER BY id").fetchall()
         for campaign in campaigns:
             if wanted and campaign["id"] not in wanted:
                 continue

@@ -148,16 +148,30 @@ def _campaign_json(row: sqlite3.Row) -> dict[str, Any]:
             "autopilot": bool(row["autopilot"]), "autopilot_note": row["autopilot_note"],
             "stopped_reason": row["stopped_reason"],
             "autopilot_latched": bool(row["autopilot_latched"]),
-            "platform_status": row["platform_status"]}
+            "platform_status": row["platform_status"],
+            "hidden": bool(row["hidden"])}
 
 
 @router.get("/api/campaigns")
-def list_campaigns(agent_id: Optional[int] = Query(None)) -> list[dict[str, Any]]:
-    """Every campaign, or only one agent's. The console is always agent-scoped."""
-    sql, args = "SELECT * FROM campaigns", []
+def list_campaigns(agent_id: Optional[int] = Query(None),
+                   include_hidden: bool = Query(False)) -> list[dict[str, Any]]:
+    """Every campaign, or only one agent's. The console is always agent-scoped.
+
+    Hidden campaigns are left out unless asked for. This is the ONLY list the
+    console loads campaigns from, so excluding them here is what takes them off
+    the campaign switcher, the config screen, the dial log filter and the
+    picker — one filter rather than one per screen, and no screen can forget it.
+    The picker asks for them so it can offer them back.
+    """
+    where, args = [], []
     if agent_id is not None:
-        sql += " WHERE agent_id=?"
+        where.append("agent_id=?")
         args.append(agent_id)
+    if not include_hidden:
+        where.append("hidden=0")
+    sql = "SELECT * FROM campaigns"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
     with session() as conn:
         return [_campaign_json(r) for r in conn.execute(sql + " ORDER BY id", args)]
 
@@ -178,9 +192,14 @@ def list_agents() -> list[dict[str, Any]]:
                  # of it is paused. A disabled campaign is not "running".
                  "paused": bool(r["enabled"]) and r["paused_campaigns"] == r["enabled"]}
                 for r in conn.execute(
-                    "SELECT agent_id, COUNT(*) AS campaigns, "
-                    "  SUM(enabled) AS enabled, "
-                    "  SUM(enabled AND paused) AS paused_campaigns "
+                    # Counted over the campaigns the console shows, so a tab
+                    # cannot claim 40 while six of them are hidden. The GROUP BY
+                    # still reads every row, so an agent whose campaigns are ALL
+                    # hidden keeps its tab -- losing it would leave no way back
+                    # to the picker that un-hides them.
+                    "SELECT agent_id, SUM(hidden=0) AS campaigns, "
+                    "  SUM(enabled AND hidden=0) AS enabled, "
+                    "  SUM(enabled AND paused AND hidden=0) AS paused_campaigns "
                     "FROM campaigns GROUP BY agent_id ORDER BY agent_id")]
 
 
@@ -277,6 +296,64 @@ def resume_campaign(conn: sqlite3.Connection, campaign_id: int) -> None:
         "UPDATE campaigns SET paused=0, stopped_reason='', "
         "autopilot=CASE WHEN autopilot_latched=1 THEN 1 ELSE autopilot END, "
         "autopilot_latched=0 WHERE id=?", (campaign_id,))
+
+
+@router.post("/api/campaigns/{campaign_id}/hide")
+def hide(campaign_id: int) -> dict[str, Any]:
+    """Take a campaign out of circulation: gone from the console, never planned.
+
+    For the campaigns that are never going to be dialled again. Un-ticking them
+    in the picker is not the same thing — the tick comes back one mis-click
+    later, and with 69 campaigns in one list that click is easy to make.
+
+    Deliberately NOT `autopilot_latched`: that latch is `stop_campaign`'s, and
+    an un-pause honours it. Borrowing it here would let un-pausing a campaign
+    that was hidden while armed put it back in the plan without anyone asking.
+
+    Calls already accepted by Formi for today are left alone — hiding stops the
+    next plan, it does not reach out and cancel a call. `live_today` says how
+    many are still to go so the caller can say so rather than imply silence;
+    `stop_campaign` (pause) is the switch that actually takes them back.
+    """
+    with session() as conn:
+        campaign = _campaign(conn, campaign_id)
+        live = _live_today(conn, campaign_id)
+        conn.execute(
+            "UPDATE campaigns SET hidden=1, autopilot=0, autopilot_note=? WHERE id=?",
+            (f"hidden by operator {now_ist().isoformat(timespec='minutes')}", campaign_id))
+        conn.commit()
+        return {**_campaign_json(_campaign(conn, campaign_id)), "live_today": live}
+
+
+@router.post("/api/campaigns/{campaign_id}/unhide")
+def unhide(campaign_id: int) -> dict[str, Any]:
+    """Put a campaign back in the lists. It comes back disarmed, always.
+
+    Same reasoning as `resume_campaign`: restoring visibility must never restore
+    a plan. The operator un-hides it, sees it, and arms it if that is what they
+    meant — two acts, because only one of them can place a call.
+    """
+    with session() as conn:
+        _campaign(conn, campaign_id)
+        conn.execute(
+            "UPDATE campaigns SET hidden=0, autopilot_note=? WHERE id=?",
+            (f"un-hidden by operator {now_ist().isoformat(timespec='minutes')}", campaign_id))
+        conn.commit()
+        return _campaign_json(_campaign(conn, campaign_id))
+
+
+def _live_today(conn: sqlite3.Connection, campaign_id: int) -> int:
+    """Calls this campaign still has queued on Formi's clock for the rest of today.
+
+    The same predicate `_pause_run` cancels by, so the number reported is exactly
+    what pausing would take back — not a looser count that overstates it.
+    """
+    return conn.execute(
+        "SELECT COUNT(*) c FROM plan_items i JOIN runs r ON r.id=i.run_id "
+        "WHERE r.campaign_id=? AND r.run_date=? AND r.status='committed' "
+        "AND i.status IN ('posted','simulated') AND i.scheduled_time > ?",
+        (campaign_id, now_ist().date().isoformat(),
+         now_ist().strftime("%Y-%m-%dT%H:%M:00"))).fetchone()["c"]
 
 
 @router.get("/api/campaigns/{campaign_id}/config")

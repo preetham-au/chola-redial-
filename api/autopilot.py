@@ -127,7 +127,8 @@ def _resync_status(day: date) -> list[int]:
     schema = ms.describe_schema(config)
     with session() as conn:
         agents = [r["agent_id"] for r in conn.execute(
-            "SELECT DISTINCT agent_id FROM campaigns WHERE autopilot=1 AND enabled=1")]
+            "SELECT DISTINCT agent_id FROM campaigns WHERE autopilot=1 AND enabled=1 "
+            "AND hidden=0")]
         return refresh_campaign_status(conn, agents, config, schema, today=day)
 
 
@@ -224,6 +225,11 @@ def set_autopilot(campaign_id: int, body: AutopilotBody) -> dict[str, Any]:
         campaign = _campaign(conn, campaign_id)
         if body.on and not campaign["enabled"]:
             raise HTTPException(409, f"campaign {campaign_id} is disabled")
+        # Refused at the API, not hidden in the picker: a stale tab holding the
+        # campaign list from before it was hidden would otherwise re-arm it on
+        # the operator's next save, and they would never see which one.
+        if body.on and campaign["hidden"]:
+            raise HTTPException(409, f"campaign {campaign_id} is hidden — un-hide it first")
         conn.execute("UPDATE campaigns SET autopilot=?, autopilot_note=? WHERE id=?",
                      (int(body.on), f"{'started' if body.on else 'stopped'} by operator "
                                     f"{now_ist().isoformat(timespec='minutes')}", campaign_id))

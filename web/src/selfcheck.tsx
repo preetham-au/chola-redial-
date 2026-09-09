@@ -269,15 +269,20 @@ ok(
   {
     const c = (id: number, over: Partial<Campaign> = {}): Campaign =>
       ({ id, agent_id: 1, warehouse_id: id, name: `c${id}`, enabled: true, paused: false, ...over });
-    const all = [c(1), c(2, { autopilot: true }), c(3, { autopilot: true }), c(4, { enabled: false })];
+    const all = [c(1), c(2, { autopilot: true }), c(3, { autopilot: true }), c(4, { enabled: false }),
+                 c(5, { hidden: true })];
 
-    const d = autopilotDiff(all, new Set([1, 2, 4]));
+    const d = autopilotDiff(all, new Set([1, 2, 4, 5]));
     ok('picking a campaign that is already in the plan sends nothing for it',
        !d.arm.includes(2) && !d.disarm.includes(2));
     ok('a newly ticked campaign is armed', d.arm.join() === '1');
     ok('an unticked campaign that was in the plan is taken out', d.disarm.join() === '3');
     ok('a disabled campaign is never armed, however it was ticked',
        !d.arm.includes(4) && !d.disarm.includes(4));
+    // A stale tick on a campaign hidden since the picker opened would be a 409
+    // on save, and the operator would have to work out which of 69 rows it was.
+    ok('a hidden campaign is never armed, however it was ticked',
+       !d.arm.includes(5) && !d.disarm.includes(5));
     ok('ticking nothing takes every armed campaign out and arms none',
        autopilotDiff(all, new Set()).arm.length === 0 &&
        autopilotDiff(all, new Set()).disarm.join() === '2,3');
@@ -419,8 +424,19 @@ ok(
 
 // --- scope leak guard (async: exercises the api layer's offline fallback) ----
 (async () => {
+  const visible = mockCampaigns.filter((c) => !c.hidden);
+  ok('the fixtures carry a hidden campaign, or nothing below is being tested',
+     visible.length < mockCampaigns.length);
+
   const all = await api.campaigns();
-  ok('an unscoped call returns every campaign', all.length === mockCampaigns.length);
+  ok('an unscoped call returns every campaign that is not hidden',
+     all.length === visible.length);
+  ok('a hidden campaign never reaches a screen, even if the server ignores ?include_hidden',
+     all.every((c) => !c.hidden));
+  const withHidden = await api.campaigns(undefined, true);
+  ok('asking for them gets them back — the picker is the way out of hidden',
+     withHidden.length === mockCampaigns.length);
+
   const only127 = await api.campaigns(127);
   ok(
     'a scoped call cannot leak another agent’s campaigns, even if the server ignores ?agent_id',

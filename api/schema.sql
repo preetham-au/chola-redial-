@@ -31,7 +31,13 @@ CREATE TABLE IF NOT EXISTS campaigns (
   -- triggered off this: entering 'paused' stops the campaign here, staying
   -- paused does nothing. Without it every sync would re-stop a campaign the
   -- operator had deliberately resumed in this console.
-  platform_status TEXT NOT NULL DEFAULT ''
+  platform_status TEXT NOT NULL DEFAULT '',
+  -- Taken out of circulation by the operator: gone from every list in the
+  -- console and impossible to arm. Unlike `paused` and `enabled` no sync ever
+  -- writes it (`upsert_campaign` names its SET columns), so a warehouse pull
+  -- cannot undo the decision. Defaults to 0 so a campaign created in Formi
+  -- shows up here on its own -- hiding is always something someone chose.
+  hidden INTEGER NOT NULL DEFAULT 0
 );
 
 -- Versioned and append-only: a PUT inserts, it never updates. The current

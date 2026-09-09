@@ -45,7 +45,9 @@ export const mockCampaigns: Campaign[] = [
   { id: 3, agent_id: 125, warehouse_id: 1652, name: '0308Redial -PV Telugu', enabled: true, paused: true },
   { id: 4, agent_id: 125, warehouse_id: 1653, name: '0308Redial -PV Kannada', enabled: false, paused: false },
   { id: 5, agent_id: 127, warehouse_id: 1599, name: '1008Redial -CV Hindi', enabled: true, paused: false },
-  { id: 6, agent_id: 127, warehouse_id: 1600, name: '1008Redial -CV Tamil', enabled: true, paused: false },
+  // Live in Formi and deliberately retired here — the one combination that has
+  // to render, or the picker's hidden section is never seen offline.
+  { id: 6, agent_id: 127, warehouse_id: 1600, name: '1008Redial -CV Tamil', enabled: true, paused: false, hidden: true },
   { id: 7, agent_id: 127, warehouse_id: 1601, name: '1008Redial -CV Marathi', enabled: true, paused: true },
   { id: 8, agent_id: 127, warehouse_id: 1602, name: '1008Redial -CV Telugu', enabled: false, paused: false },
   { id: 9, agent_id: 131, warehouse_id: 1710, name: '1508Redial -TW Hindi', enabled: true, paused: false },

@@ -13,6 +13,10 @@ export interface Campaign {
   autopilot?: boolean;
   /** Why it last stopped, or the result of its last pass. */
   autopilot_note?: string;
+  /** Taken out of circulation by the operator: absent from every list in the
+   *  console and impossible to arm. Only the campaign picker asks for these,
+   *  so it can offer them back. Optional so an older backend still typechecks. */
+  hidden?: boolean;
 }
 
 /** The console is scoped to exactly one agent at a time. `paused` is true only

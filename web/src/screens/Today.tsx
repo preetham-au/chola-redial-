@@ -15,6 +15,8 @@ import {
   AlertTriangle,
   CircleSlash,
   ClipboardList,
+  Eye,
+  EyeOff,
   FlaskConical,
   Info,
   ListChecks,
@@ -40,18 +42,11 @@ const WAVES = [
 export const wireBuckets = (chosen: string[], all: string[]) =>
   chosen.length === all.length ? [] : chosen;
 
-/** A campaign the server will accept into the daily plan. A disabled one is
- *  refused with a 409, so it is shown and not offered rather than failing on
- *  save. */
-export const pickable = (c: Campaign) => c.enabled !== false;
+/** A campaign the server will accept into the daily plan. Disabled and hidden
+ *  are both refused with a 409, so they are shown and not offered rather than
+ *  failing on save. */
+export const pickable = (c: Campaign) => c.enabled !== false && !c.hidden;
 
-/** Which campaigns to arm and which to disarm — the only thing this screen puts
- *  on the wire that changes who gets called.
- *
- *  Only the DIFFERENCE is sent. Re-arming an already-armed campaign would
- *  overwrite the note saying why it last stopped, and disarming one that is
- *  already out would invent a "stopped by operator" it never had. A campaign
- *  the server would refuse never reaches either list. */
 /** How to name the moment dialling stops, in a sentence reading "before …".
  *
  *  Each campaign carries its own dial window, so a single close time is only
@@ -60,6 +55,13 @@ export const pickable = (c: Campaign) => c.enabled !== false;
 export const closesAt = (day: DayView) =>
   day.window_varies ? 'their campaigns close' : day.window.end;
 
+/** Which campaigns to arm and which to disarm — the only thing this screen puts
+ *  on the wire that changes who gets called.
+ *
+ *  Only the DIFFERENCE is sent. Re-arming an already-armed campaign would
+ *  overwrite the note saying why it last stopped, and disarming one that is
+ *  already out would invent a "stopped by operator" it never had. A campaign
+ *  the server would refuse never reaches either list. */
 export function autopilotDiff(all: Campaign[], chosen: Set<number>) {
   const ok = all.filter(pickable);
   return {
@@ -494,10 +496,20 @@ function PickCampaigns({
   onDone: () => void;
 }) {
   const toast = useStore((s) => s.toast);
-  const list = useAsync(() => api.campaigns(), []);
+  const agentId = useStore((s) => s.agentId);
+  const setAgent = useStore((s) => s.setAgent);
+  // The one place that asks for hidden campaigns: this is where they are taken
+  // out of circulation, so it has to be where they can be put back.
+  const list = useAsync(() => api.campaigns(undefined, true), []);
   const [ticked, setTicked] = useState<Set<number> | null>(null);
   const [filter, setFilter] = useState('');
   const [saving, setSaving] = useState(false);
+  const [showHidden, setShowHidden] = useState(false);
+  // The campaign whose hide is waiting to be confirmed, in-place rather than in
+  // a second modal: two stacked overlays share one Escape key and closing the
+  // confirm would close the picker with it.
+  const [confirming, setConfirming] = useState<Campaign | null>(null);
+  const [hiding, setHiding] = useState(0);
 
   // What is armed right now, straight from the server. Kept apart from `ticked`
   // so saving can send only what the operator actually changed — re-arming an
@@ -511,12 +523,14 @@ function PickCampaigns({
   }, [list.data, armed]);
 
   const chosen = ticked ?? armed;
-  const shown = useMemo(() => {
+  const matching = useMemo(() => {
     const needle = filter.trim().toLowerCase();
     return (list.data ?? [])
       .filter((c) => !needle || c.name.toLowerCase().includes(needle) || String(c.id) === needle)
       .sort((a, b) => a.name.localeCompare(b.name));
   }, [list.data, filter]);
+  const shown = useMemo(() => matching.filter((c) => !c.hidden), [matching]);
+  const hiddenOnes = useMemo(() => matching.filter((c) => c.hidden), [matching]);
 
   const toggle = (id: number) =>
     setTicked((t) => {
@@ -539,6 +553,47 @@ function PickCampaigns({
     () => autopilotDiff(list.data ?? [], chosen),
     [list.data, chosen],
   );
+
+  /** Take a campaign out of circulation, or put it back.
+   *
+   *  Both reload this list AND the store's, because the store is what the topbar
+   *  switcher and every other screen read from: without it a campaign hidden
+   *  here would stay selectable up there until the next reload.
+   *
+   *  A hidden campaign is also un-ticked here by hand. The server disarms it, but
+   *  `ticked` is local state seeded once from `armed`, so it would otherwise keep
+   *  a stale tick and the footer would offer to arm something that cannot be.
+   */
+  const setVisible = async (c: Campaign, visible: boolean) => {
+    setHiding(c.id);
+    try {
+      if (visible) {
+        await api.unhide(c.id);
+        toast('ok', `${c.name} is back in the lists. It is not in the plan — tick it to add it.`);
+      } else {
+        const res = await api.hide(c.id);
+        setTicked((t) => {
+          const next = new Set(t ?? armed);
+          next.delete(c.id);
+          return next;
+        });
+        toast(
+          'ok',
+          res.live_today > 0
+            ? `${c.name} is hidden and will not be planned again. ${n(res.live_today)} call(s) it ` +
+                'already put on today’s clock are still going out — pause it to take those back.'
+            : `${c.name} is hidden. It will not be planned again.`,
+        );
+      }
+      setConfirming(null);
+      list.reload();
+      if (agentId !== null) await setAgent(agentId);
+    } catch (e) {
+      toast('bad', (e as Error).message);
+    } finally {
+      setHiding(0);
+    }
+  };
 
   const save = async () => {
     setSaving(true);
@@ -630,8 +685,33 @@ function PickCampaigns({
         </div>
       )}
       {list.loading && <p className="cell-dim">Reading the campaign list…</p>}
-      {!list.loading && shown.length === 0 && (
+      {!list.loading && matching.length === 0 && (
         <Empty title="No campaign matches" note="Clear the filter to see them all." />
+      )}
+
+      {confirming && (
+        <div className="warnbox">
+          <AlertTriangle />
+          <span style={{ flex: 1 }}>
+            Hide <b>{confirming.name}</b>? It leaves every list in this console and can no longer be
+            put in a plan. Calls it already placed on today’s clock keep going out — hiding stops
+            the next plan, it does not cancel a call. You can un-hide it here.
+          </span>
+          <button
+            className="btn btn-sm btn-ghost"
+            onClick={() => setConfirming(null)}
+            disabled={hiding > 0}
+          >
+            Cancel
+          </button>
+          <button
+            className="btn btn-sm btn-primary"
+            onClick={() => setVisible(confirming, false)}
+            disabled={hiding > 0}
+          >
+            {hiding > 0 ? <Loader2 className="spin" /> : <EyeOff />} Hide it
+          </button>
+        </div>
       )}
 
       <div className="grid" style={{ gap: 2, maxHeight: 340, overflowY: 'auto' }}>
@@ -657,10 +737,53 @@ function PickCampaigns({
               {/* Armed and paused is the one combination that looks selected and
                   produces nothing: the day query skips paused campaigns. */}
               {ok && c.paused && <span className="badge">paused — skipped today</span>}
+              <button
+                className="icon-btn"
+                aria-label={`Hide ${c.name}`}
+                title="Never schedule this campaign — take it out of the console"
+                disabled={hiding > 0}
+                onClick={(e) => {
+                  e.preventDefault(); // the row is a <label>: don't tick the box
+                  setConfirming(c);
+                }}
+              >
+                <EyeOff />
+              </button>
             </label>
           );
         })}
       </div>
+
+      {hiddenOnes.length > 0 && (
+        <div style={{ marginTop: 10 }}>
+          <div className="row" style={{ gap: 8 }}>
+            <span className="cell-dim" style={{ flex: 1 }}>
+              {hiddenOnes.length} hidden — never scheduled
+            </span>
+            <button className="btn btn-sm btn-ghost" onClick={() => setShowHidden((v) => !v)}>
+              {showHidden ? 'Hide these' : 'Show hidden'}
+            </button>
+          </div>
+          {showHidden && (
+            <div className="grid" style={{ gap: 2, maxHeight: 200, overflowY: 'auto' }}>
+              {hiddenOnes.map((c) => (
+                <div key={c.id} className="row" style={{ gap: 8, padding: '4px 2px', opacity: 0.6 }}>
+                  <span style={{ flex: 1 }}>
+                    {c.name} <span className="cell-dim">· {c.id} · agent {c.agent_id}</span>
+                  </span>
+                  <button
+                    className="btn btn-sm btn-ghost"
+                    onClick={() => setVisible(c, true)}
+                    disabled={hiding > 0}
+                  >
+                    {hiding === c.id ? <Loader2 className="spin" /> : <Eye />} Un-hide
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
     </Modal>
   );
 }
