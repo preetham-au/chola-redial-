@@ -738,30 +738,37 @@ def test_trigger_under_dry_run_simulates_and_never_dials(client, no_network):
     assert history[0]["would_post"] == triggered["would_post"]
 
 
-def test_a_hand_picked_test_call_time_obeys_the_dial_window(client, no_network):
-    """Picking the time must not become a way around dialling hours."""
+def test_a_hand_picked_test_call_time_is_free_of_the_dial_window(client, no_network):
+    """A rehearsal to your own number may go out at any hour.
+
+    The dial window protects customers; the only number this endpoint will dial
+    is one the operator listed as their own. What still holds is Formi's floor
+    and the calendar: a time in the past, or minutes from now, is not dialable.
+    """
     from engine.seed import TEST_NUMBERS
 
     phone = TEST_NUMBERS[0]
     day = TOMORROW_AM[:10]
-    for bad in (f"{day}T04:00", f"{day}T23:30", "2020-01-01T10:00", "nonsense"):
+    for hour in ("04:00", "23:30", "15:07"):
+        r = client.post("/api/test-call/preview",
+                        json={"phone": phone, "scheduled_time": f"{day}T{hour}"})
+        assert r.status_code == 200, f"{hour}: {r.text}"
+        assert r.json()["would_post"]["body"]["scheduled_time"] == f"{day}T{hour}:00"
+
+    for bad in ("2020-01-01T10:00", "nonsense"):
         r = client.post("/api/test-call/preview",
                         json={"phone": phone, "scheduled_time": bad})
         assert r.status_code == 422, bad
 
-    ok = client.post("/api/test-call/preview",
-                     json={"phone": phone, "scheduled_time": f"{day}T15:07"}).json()
-    assert ok["would_post"]["body"]["scheduled_time"] == f"{day}T15:07:00"
-
-    # Omitted still means "next minute inside the window", not an error.
+    # Omitted means "the next dialable minute", whatever the hour is now.
     auto = client.post("/api/test-call/preview", json={"phone": phone}).json()
-    assert "09:00" <= auto["would_post"]["body"]["scheduled_time"][11:16] <= "20:00"
+    assert auto["would_post"]["body"]["scheduled_time"] >= now_ist().strftime("%Y-%m-%dT%H:%M:00")
 
     # A rejected time is never recorded as an attempt.
     with _db() as conn:
         assert conn.execute(
             "SELECT COUNT(*) c FROM test_calls WHERE scheduled_time LIKE ?",
-            (f"{day}T04:%",)).fetchone()["c"] == 0
+            ("2020-01-01T%",)).fetchone()["c"] == 0
 
 
 def test_trigger_ignores_pause_but_not_exclusions(client, no_network):

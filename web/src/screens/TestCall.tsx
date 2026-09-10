@@ -337,15 +337,10 @@ export function TestCall() {
     return `${d.toLocaleDateString('en-CA')}T${d.toTimeString().slice(0, 5)}`;
   };
 
-  // Mirrors the server's `_chosen_slot`: inside the window, never in the past.
-  // The server re-checks all of it — this is only so the operator sees why.
-  const whenError = !when
-    ? ''
-    : when < nowLocal()
-      ? 'That minute has already passed.'
-      : dialWindow && (when.slice(11) < dialWindow.start || when.slice(11) > dialWindow.end)
-        ? `Outside the dial window ${dialWindow.start}–${dialWindow.end} of campaign ${campaign_id}.`
-        : '';
+  // Mirrors the server's `_chosen_slot`: never in the past, any hour of the day.
+  // The dial window does not apply to a rehearsal — the only number this reaches
+  // is one the operator listed as their own. The server re-checks the rest.
+  const whenError = !when ? '' : when < nowLocal() ? 'That minute has already passed.' : '';
 
   const pick = (p: string) => {
     setPhone(p);
@@ -461,13 +456,12 @@ export function TestCall() {
                 ) : when ? (
                   <>
                     The call is booked for <span className="mono">{when.replace('T', ' ')}</span>.
-                    {dialWindow && ` Dial window ${dialWindow.start}–${dialWindow.end}.`}
+                    {dialWindow && ` Campaign ${campaign_id} dials ${dialWindow.start}–${dialWindow.end}; a test call is not held to that.`}
                   </>
                 ) : (
                   <>
-                    Left empty, the server takes the next minute inside the dial window
-                    {dialWindow ? ` (${dialWindow.start}–${dialWindow.end})` : ''} — or tomorrow&apos;s
-                    opening if it has already shut.
+                    Left empty, the server takes the next dialable minute — whatever the hour.
+                    A rehearsal to your own number is not held to the campaign&apos;s dial window.
                   </>
                 )}
               </p>

@@ -1061,36 +1061,31 @@ def _resolve_lead(conn: sqlite3.Connection, phone: str,
                         args).fetchone()
 
 
-def _next_slot(dcfg: DispatchConfig) -> str:
-    """The next dialable minute inside the window; tomorrow's opening if it has shut."""
+def _next_slot() -> str:
+    """The next dialable minute. No window: a rehearsal may go out at any hour.
+
+    The dial window is a customer-protection rule, and the only number this can
+    reach is one the operator put on `config.test_numbers` -- their own handset.
+    Clamping it meant "Test call now" at 23:00 silently booked tomorrow morning,
+    which is not a rehearsal of anything.
+    """
     now = _earliest_dialable(now_ist())
-    day, minute = now.date(), now.hour * 60 + now.minute
-    if minute < dcfg.start_min:
-        minute = dcfg.start_min
-    elif minute >= dcfg.end_min:
-        day, minute = day + timedelta(days=1), dcfg.start_min
-    return f"{day.isoformat()}T{minute // 60:02d}:{minute % 60:02d}:00"
+    return now.strftime("%Y-%m-%dT%H:%M:00")
 
 
-def _chosen_slot(text: str, dcfg: DispatchConfig) -> str:
-    """Validate an operator-picked rehearsal time. Same rules a planned slot gets.
+def _chosen_slot(text: str) -> str:
+    """Validate an operator-picked rehearsal time.
 
-    A test call is still a real call to a real handset, so "pick your own time"
-    cannot become a way around dialling hours or a way to post a time that has
-    already gone. Any date is fine -- rehearsing tomorrow morning is legitimate.
-    "Not in the past" is not enough: Formi refuses anything under five minutes
-    out, so a rehearsal booked for two minutes' time is a 400, not a call.
+    Any hour of any day is fine -- see `_next_slot` for why the dial window does
+    not apply to a number on the allow-list. Formi's floor is not ours to waive:
+    it refuses anything under five minutes out, so a rehearsal booked for two
+    minutes' time is a 400 rather than a call, and is worth saying so here.
     """
     try:
         raw = text.strip().replace(" ", "T")
         parsed = datetime.fromisoformat(raw[:19] if len(raw) >= 19 else raw)
     except ValueError:
         raise HTTPException(422, f"scheduled_time must be ISO-8601; got {text!r}")
-    minute = parsed.hour * 60 + parsed.minute
-    if not dcfg.start_min <= minute <= dcfg.end_min:
-        raise HTTPException(
-            422, f"{hhmm(minute)} is outside this campaign's dial window "
-                 f"{hhmm(dcfg.start_min)}-{hhmm(dcfg.end_min)}")
     first = _earliest_dialable(now_ist())
     if parsed < first:
         raise HTTPException(
@@ -1124,7 +1119,7 @@ def _test_call(conn: sqlite3.Connection, body: TestCallBody, commit: bool) -> di
         return out
 
     cfg = current_config(conn, lead["campaign_id"])
-    red, dcfg = _configs(cfg)
+    red, _dcfg = _configs(cfg)
     stage = str(lead["stage"] or "")
     klass, rule = classify_disposition(stage, red)
     # A rehearsal may ignore a campaign pause -- that is exactly when you want
@@ -1134,8 +1129,8 @@ def _test_call(conn: sqlite3.Connection, body: TestCallBody, commit: bool) -> di
                                  f"({rule.note if rule else 'excluded'}); a test call never "
                                  f"overrides an exclusion")
 
-    scheduled = (_chosen_slot(body.scheduled_time, dcfg) if body.scheduled_time
-                 else _next_slot(dcfg))
+    scheduled = (_chosen_slot(body.scheduled_time) if body.scheduled_time
+                 else _next_slot())
     out: dict[str, Any] = {
         "found": True, "dry_run": dry_run(),
         "lead": {"lead_uuid": lead["lead_uuid"], "phone": lead["phone"],
