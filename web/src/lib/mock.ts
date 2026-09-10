@@ -567,10 +567,10 @@ export function mockItems(runId: number): PlanItem[] {
 }
 
 export const mockStageJobs: StageJob[] = [
-  { id: 12, kind: 'expired', mode: 'commit', target_stage: 'policy_expired', would_change: 812, changed: 812, created_at: '2026-08-26T19:20:00', dry_run: false },
-  { id: 11, kind: 'expired', mode: 'preview', target_stage: 'policy_expired', would_change: 812, changed: 0, created_at: '2026-08-26T19:18:00', dry_run: true },
-  { id: 10, kind: 'policies', mode: 'commit', target_stage: 'renewed', would_change: 46, changed: 46, created_at: '2026-08-25T16:04:00', dry_run: false },
-  { id: 9, kind: 'policies', mode: 'commit', target_stage: 'do_not_call', would_change: 8, changed: 8, created_at: '2026-08-22T10:11:00', dry_run: false },
+  { id: 12, kind: 'expired', mode: 'commit', target_stage: 'policy_expired', would_change: 812, committed: 812, created_at: '2026-08-26T19:20:00', dry_run: false },
+  { id: 11, kind: 'expired', mode: 'preview', target_stage: 'policy_expired', would_change: 812, committed: 0, created_at: '2026-08-26T19:18:00', dry_run: true },
+  { id: 10, kind: 'policies', mode: 'commit', target_stage: 'renewed', would_change: 46, committed: 46, created_at: '2026-08-25T16:04:00', dry_run: false },
+  { id: 9, kind: 'policies', mode: 'commit', target_stage: 'do_not_call', would_change: 8, committed: 8, created_at: '2026-08-22T10:11:00', dry_run: false },
 ];
 
 export function mockStagePreview(policies: string[], target: string) {
@@ -595,6 +595,21 @@ export function mockStagePreview(policies: string[], target: string) {
       stage: pool[Math.floor(r() * pool.length)],
     })),
   };
+}
+
+export function mockRedPreview(policies: string[], red: string) {
+  const r = rng(policies.length * 613 + red.length);
+  const unchanged = Math.floor(policies.length * 0.15);
+  const by_stage: Record<string, number> = {};
+  const sample = policies.slice(0, 12).map((p, i) => ({
+    policy_no: p,
+    lead_name: `${FIRST[Math.floor(r() * FIRST.length)]} ${LAST[Math.floor(r() * LAST.length)]}`,
+    stage: 'did_not_pick',
+    red: `2026-0${(i % 8) + 1}-${String(((i * 5) % 28) + 1).padStart(2, '0')}`,
+    new_red: red,
+  }));
+  sample.forEach((s) => { by_stage[s.red] = (by_stage[s.red] ?? 0) + 1; });
+  return { would_change: policies.length - unchanged, unchanged, by_stage, sample, red };
 }
 
 export function mockExpiredPreview(redBefore: string) {

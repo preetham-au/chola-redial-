@@ -32,6 +32,7 @@ from api.db import init_db, load_env, purge_campaigns, current_config
 
 from . import metabase_source as ms
 from .red_engine import config_from_settings
+from .stage_ops import apply_red_overrides
 from .seed import AGENTS, TEST_NUMBERS
 
 DEFAULT_MAX_CAMPAIGNS = 20
@@ -394,6 +395,10 @@ def store_leads(conn: sqlite3.Connection, campaign_id: int, leads: Iterable[dict
         ":last_interaction_time,:total_interactions,:calls_today,:calls_last_7d,:queued_today,"
         ":callback_date,:appointment_date)", rows)
     conn.commit()
+    # The DELETE above takes a renewal date corrected in the console with it, so
+    # it is put back here. Overrides the warehouse has since moved past are
+    # dropped inside — see `apply_red_overrides`.
+    apply_red_overrides(conn, campaign_id)
     return len(rows)
 
 

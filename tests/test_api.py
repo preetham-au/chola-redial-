@@ -9,6 +9,7 @@ import pytest
 import requests
 
 from api.db import DEFAULT_CONFIG, NO_TOKEN, db_path, formi_token, now_ist, with_defaults
+from engine.stage_ops import apply_red_overrides
 
 # The seed anchors every RED to the day it was written, so bucket-sensitive
 # assertions have to ask about today.
@@ -635,6 +636,70 @@ def test_a_policy_sweep_can_be_narrowed_to_chosen_campaigns(client, no_network):
     # is a different write.
     job = client.get("/api/stage/jobs").json()[0]
     assert job["params"]["campaign_ids"] == [elsewhere]
+
+
+def test_a_corrected_renewal_date_is_written_and_survives_a_sync(client, no_network):
+    """The RED a policy is scheduled from can be corrected, and it sticks.
+
+    Sticking is the whole point: `engine.sync` DELETEs and re-inserts every lead
+    of a campaign, so a date written into `leads.red` alone would last until the
+    next "Sync now". The override table is what puts it back — and it steps
+    aside once the warehouse reports something different itself, so a one-off
+    correction cannot clobber a real update for ever.
+    """
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT id, campaign_id, policy_no, red FROM leads WHERE policy_no IS NOT NULL "
+            "ORDER BY id LIMIT 1").fetchone()
+        lead_id, campaign, policy, was = (
+            row["id"], row["campaign_id"], row["policy_no"], row["red"])
+
+    body = {"policies": [policy], "red": "2027-03-14", "campaign_ids": [campaign]}
+    try:
+        preview = client.post("/api/stage/red/preview", json=body).json()
+        assert preview["would_change"] >= 1 and preview["not_found"] == []
+        # A preview writes nothing.
+        with _db() as conn:
+            assert conn.execute("SELECT red FROM leads WHERE id=?", (lead_id,)).fetchone()[0] == was
+
+        # A date the scheduler cannot read is refused, not stored: an unreadable
+        # RED is a lead that never gets scheduled at all.
+        assert client.post("/api/stage/red/preview",
+                           json={**body, "red": "whenever"}).status_code == 422
+
+        commit = client.post("/api/stage/red/commit", json=body).json()
+        assert commit["applied"] == preview["would_change"]
+        # Local only — there is no Formi endpoint that writes a renewal date.
+        assert commit["applied_formi"] == 0 and commit["formi_notified"] is False
+        with _db() as conn:
+            assert conn.execute("SELECT red FROM leads WHERE id=?", (lead_id,)).fetchone()[0] == "2027-03-14"
+
+        # Re-running writes nothing: already on that date is unchanged.
+        assert client.post("/api/stage/red/preview", json=body).json()["would_change"] == 0
+
+        # What a sync does: wipe the lead's red and put it back from the source.
+        with _db() as conn:
+            conn.execute("UPDATE leads SET red=? WHERE id=?", (was, lead_id))
+            conn.commit()
+            assert apply_red_overrides(conn, campaign) >= 1
+            assert conn.execute("SELECT red FROM leads WHERE id=?",
+                                (lead_id,)).fetchone()[0] == "2027-03-14"
+
+            # ...but when the warehouse itself moves on, the warehouse wins and
+            # the override is dropped rather than reapplied for ever.
+            conn.execute("UPDATE leads SET red='2028-01-01' WHERE id=?", (lead_id,))
+            conn.commit()
+            apply_red_overrides(conn, campaign)
+            assert conn.execute("SELECT red FROM leads WHERE id=?",
+                                (lead_id,)).fetchone()[0] == "2028-01-01"
+            assert conn.execute("SELECT COUNT(*) FROM lead_red_overrides WHERE lead_id=?",
+                                (lead_id,)).fetchone()[0] == 0
+    finally:
+        # The client fixture is session-scoped, so put the row back.
+        with _db() as conn:
+            conn.execute("DELETE FROM lead_red_overrides WHERE lead_id=?", (lead_id,))
+            conn.execute("UPDATE leads SET red=? WHERE id=?", (was, lead_id))
+            conn.commit()
 
 
 def test_expired_preview_keeps_renewed_and_paid_untouched(client):

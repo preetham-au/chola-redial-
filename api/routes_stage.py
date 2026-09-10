@@ -10,7 +10,8 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from engine.stage_ops import (
-    DEFAULT_KEEP, apply_stage, bulk_update, preview_expired, preview_policies, read_policies,
+    DEFAULT_KEEP, apply_red, apply_stage, bulk_update, preview_expired, preview_policies,
+    preview_red, read_policies,
 )
 
 from .db import dry_run, now_iso, session
@@ -23,6 +24,15 @@ class ExpiredBody(BaseModel):
     red_before: str
     target_stage: str = "policy_expired"
     keep: Optional[list[str]] = None
+
+
+class RedBody(BaseModel):
+    policies: list[str] = Field(default_factory=list)
+    policies_text: str = ""
+    red: str
+    # Empty means every campaign the policy appears in — see `preview_policies`.
+    campaign_ids: list[int] = Field(default_factory=list)
+    note: str = ""
 
 
 class PolicyRequest(NamedTuple):
@@ -85,6 +95,7 @@ def _record(conn: sqlite3.Connection, kind: str, mode: str, result: dict[str, An
 def _public(result: dict[str, Any]) -> dict[str, Any]:
     out = dict(result)
     out.pop("lead_ids", None)
+    out.pop("rows", None)
     return out
 
 
@@ -178,6 +189,50 @@ async def policies_commit(request: Request) -> dict[str, Any]:
         applied = _commit(conn, result)
         job_id = _record(conn, "policies", "commit", result, _policy_params(req), applied)
     return {**_public(result), "job_id": job_id, "dry_run": dry_run(), **_applied(result, applied)}
+
+
+def _red(conn: sqlite3.Connection, body: RedBody) -> tuple[dict[str, Any], dict[str, Any]]:
+    """(preview, the params the job history records)."""
+    policies = [str(p).strip() for p in
+                (body.policies or read_policies(body.policies_text)) if str(p).strip()]
+    if not policies:
+        raise HTTPException(422, "no policy numbers supplied")
+    try:
+        result = preview_red(conn, policies, body.red, body.campaign_ids)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
+    return result, {"policies": len(policies), "red": result["red"],
+                    "campaign_ids": result["campaign_ids"]}
+
+
+@router.post("/api/stage/red/preview")
+def red_preview(body: RedBody) -> dict[str, Any]:
+    with session() as conn:
+        result, params = _red(conn, body)
+        _record(conn, "red", "preview", result, params, applied=0)
+    return _public(result)
+
+
+@router.post("/api/stage/red/commit")
+def red_commit(body: RedBody) -> dict[str, Any]:
+    """Write the corrected renewal date into the local store.
+
+    DRY_RUN does not gate this the way it gates a stage commit, and the
+    difference is not an oversight: a stage commit POSTs to Formi, and DRY_RUN
+    exists to keep this console off the phone. There is no Formi endpoint that
+    writes a renewal expiry date, so this write never leaves the box. Gating it
+    would make the feature unusable while protecting nothing.
+
+    What that costs is stated rather than hidden: this changes the date THIS
+    console schedules from. It does not change what the agent reads out on the
+    call, which comes from Formi's own copy.
+    """
+    with session() as conn:
+        result, params = _red(conn, body)
+        applied = apply_red(conn, result["rows"], result["red"], now_iso(), body.note)
+        job_id = _record(conn, "red", "commit", result, params, applied)
+    return {**_public(result), "job_id": job_id, "applied": applied, "applied_local": applied,
+            "applied_formi": 0, "rejected_formi": 0, "dry_run": dry_run(), "formi_notified": False}
 
 
 @router.post("/api/stage/expired/preview")

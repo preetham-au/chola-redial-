@@ -42,6 +42,7 @@ import {
   mockHealth,
   mockItems,
   mockManualPreview,
+  mockRedPreview,
   mockRuns,
   mockStageJobs,
   mockStagePreview,
@@ -415,12 +416,30 @@ export const api = {
     ),
 
   policiesCommit: (body: { policies: string[]; target_stage: string; campaign_ids: number[] }) =>
-    req<StagePreview & { dry_run: boolean; changed: number }>(
+    req<StagePreview & { dry_run: boolean; applied: number }>(
       '/api/stage/policies/commit',
       json(body),
       () => {
         const p = mockStagePreview(body.policies, body.target_stage);
-        return { ...p, changed: p.would_change, dry_run: true };
+        return { ...p, applied: p.would_change, dry_run: true };
+      },
+    ),
+
+  // A renewal date corrected here is written locally and re-applied after every
+  // sync. Formi exposes no endpoint that writes one, so it changes what this
+  // console schedules from, not what the agent reads out on the call.
+  redPreview: (body: { policies: string[]; red: string; campaign_ids: number[] }) =>
+    req<StagePreview & { red: string }>('/api/stage/red/preview', json(body), () =>
+      mockRedPreview(body.policies, body.red),
+    ),
+
+  redCommit: (body: { policies: string[]; red: string; campaign_ids: number[] }) =>
+    req<StagePreview & { red: string; applied: number; dry_run: boolean }>(
+      '/api/stage/red/commit',
+      json(body),
+      () => {
+        const p = mockRedPreview(body.policies, body.red);
+        return { ...p, applied: p.would_change, dry_run: true };
       },
     ),
 
@@ -428,12 +447,12 @@ export const api = {
     req<StagePreview>('/api/stage/expired/preview', json(body), () => mockExpiredPreview(body.red_before)),
 
   expiredCommit: (body: { campaign_ids: number[]; red_before: string; target_stage: string }) =>
-    req<StagePreview & { dry_run: boolean; changed: number }>(
+    req<StagePreview & { dry_run: boolean; applied: number }>(
       '/api/stage/expired/commit',
       json(body),
       () => {
         const p = mockExpiredPreview(body.red_before);
-        return { ...p, changed: p.would_change, dry_run: true };
+        return { ...p, applied: p.would_change, dry_run: true };
       },
     ),
 

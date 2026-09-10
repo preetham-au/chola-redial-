@@ -324,19 +324,37 @@ but **never** bypasses exclusions. `do_not_call`, `dnc`, `wrong_number`,
 `number_not_working` and other `excluded`-class leads are rejected server-side
 even if the UI asks for them. This is regulatory (TRAI/NCPR), not a preference.
 
-### Bulk stage update
+### Bulk lead edits
 | Method | Path | Notes |
 |---|---|---|
-| `POST` | `/api/stage/policies/preview` | multipart or `{policies: [...], target_stage}` → what would change |
+| `POST` | `/api/stage/policies/preview` | multipart or `{policies: [...], target_stage, campaign_ids?}` → what would change |
 | `POST` | `/api/stage/policies/commit` | wraps `mark_stage_by_policy` |
+| `POST` | `/api/stage/red/preview` | `{policies: [...], red, campaign_ids?}` → whose renewal date would move |
+| `POST` | `/api/stage/red/commit` | writes the corrected date locally; see below |
 | `POST` | `/api/stage/expired/preview` | `{campaign_ids[], red_before, target_stage:"policy_expired"}` |
 | `POST` | `/api/stage/expired/commit` | wraps `mark_stage_by_red`; keeps `already_paid_to_chola`/`renewed`/`policy_expired` untouched |
-| `GET` | `/api/stage/jobs` | history |
+| `GET` | `/api/stage/jobs` | history; `kind` is `policies` \| `red` \| `expired` |
 
-Both preview endpoints return `{ "would_change": N, "unchanged": N, "by_stage": {...}, "sample": [...] }`.
+`campaign_ids` narrows a policy sweep to the campaigns named. Omitted or empty
+means every campaign the policy appears in — the ported default. A policy that
+exists but not in the chosen campaigns is returned under `not_found`.
 
-Both commit endpoints return
+Every preview returns `{ "would_change": N, "unchanged": N, "by_stage": {...}, "sample": [...],
+"not_found": [...] }`. For a RED preview `by_stage` is keyed by the date the leads carry
+today, and `target_stage` is the new date.
+
+Every commit returns
 `{ "applied": N, "applied_formi": N, "applied_local": N, "rejected_formi": N, "job_id": N, "dry_run": bool }`.
+
+**`/api/stage/red/*` is local.** Formi exposes no endpoint that writes a renewal
+expiry date, so the correction changes the date THIS console schedules from and
+not what the agent reads out on the call — the commit answers
+`"applied_formi": 0, "formi_notified": false` and `DRY_RUN` does not gate it,
+because nothing is sent. The value is kept in `lead_red_overrides` and
+re-applied by `engine.sync` after each refresh (a sync replaces every lead of a
+campaign). An override is dropped once the warehouse reports a date matching
+neither the correction nor the value it replaced: the source has moved on and
+wins.
 Stage writes always go to Formi regardless of `LEADS_SOURCE`; `applied_local` counts only
 seeded rows (`campaign_id != warehouse_id`), which have no lead id Formi would recognise.
 A single `applied` that mixes the two reads as success when nothing reached Formi.

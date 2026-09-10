@@ -23,7 +23,8 @@ from typing import Any, Iterable, Sequence
 from .red_engine import parse_red
 
 __all__ = ["DEFAULT_KEEP", "BULK_URL", "CHUNK", "read_policies", "preview_policies",
-           "preview_expired", "apply_stage", "batch_counts", "bulk_update"]
+           "preview_expired", "preview_red", "apply_red", "apply_red_overrides",
+           "apply_stage", "batch_counts", "bulk_update"]
 
 BULK_URL = "https://api.formi.co.in/v2/campaign/leads/{agent_id}/bulk-update-stage"
 CHUNK = 200
@@ -61,39 +62,124 @@ def _result(rows: Sequence[dict[str, Any]], keep: set[str], target_stage: str,
     }
 
 
-def preview_policies(conn: sqlite3.Connection, policies: Sequence[str], target_stage: str,
-                     keep: Iterable[str] | None = None,
-                     campaign_ids: Sequence[int] | None = None) -> dict[str, Any]:
-    """policy_no -> every lead carrying it, with its agent and current stage.
+def _by_policy(conn: sqlite3.Connection, policies: Sequence[str],
+               campaign_ids: Sequence[int] | None) -> tuple[list[dict[str, Any]], list[str], list[int]]:
+    """(leads carrying those policies, policies with none, the scope applied).
 
-    `campaign_ids` narrows that "every one of them". A policy is loaded into
+    `campaign_ids` narrows "every lead carrying it". A policy is loaded into
     several campaigns and the default -- all of them -- is the behaviour ported
     from `mark_stage_by_policy.py`: renewing a policy retires it everywhere. Pass
-    a list to move it in the campaigns named and nowhere else, which is what an
+    a list to touch the campaigns named and nowhere else, which is what an
     operator wants when only one campaign's copy is wrong.
 
-    A policy that exists but not in the chosen campaigns comes back under
-    `not_found`, because within the scope asked for, it was not.
+    A policy that exists but not in the chosen campaigns comes back as missing,
+    because within the scope asked for, it was not found.
     """
-    keep_set = {s.lower() for s in (keep if keep is not None else [target_stage])}
     policies = [p for p in dict.fromkeys(policies) if p]
     scope = [int(c) for c in (campaign_ids or [])]
-    where = ""
-    if scope:
-        where = f" AND l.campaign_id IN ({','.join('?' * len(scope))})"
+    where = f" AND l.campaign_id IN ({','.join('?' * len(scope))})" if scope else ""
     rows: list[dict[str, Any]] = []
     for start in range(0, len(policies), 400):     # BATCH, as in the original
         chunk = policies[start:start + 400]
         marks = ",".join("?" * len(chunk))
         rows.extend(dict(r) for r in conn.execute(
-            f"SELECT l.id, l.policy_no, l.lead_name, l.campaign_id, l.stage, c.agent_id "
+            f"SELECT l.id, l.policy_no, l.lead_name, l.campaign_id, l.stage, l.red, c.agent_id "
             f"FROM leads l JOIN campaigns c ON c.id = l.campaign_id "
             f"WHERE l.policy_no IN ({marks}){where} ORDER BY l.id",
             [*chunk, *scope]).fetchall())
     found = {r["policy_no"] for r in rows}
-    out = _result(rows, keep_set, target_stage, [p for p in policies if p not in found])
+    return rows, [p for p in policies if p not in found], scope
+
+
+def preview_policies(conn: sqlite3.Connection, policies: Sequence[str], target_stage: str,
+                     keep: Iterable[str] | None = None,
+                     campaign_ids: Sequence[int] | None = None) -> dict[str, Any]:
+    """policy_no -> every lead carrying it, with its agent and current stage."""
+    keep_set = {s.lower() for s in (keep if keep is not None else [target_stage])}
+    rows, missing, scope = _by_policy(conn, policies, campaign_ids)
+    out = _result(rows, keep_set, target_stage, missing)
     out["campaign_ids"] = scope
     return out
+
+
+def preview_red(conn: sqlite3.Connection, policies: Sequence[str], red: str,
+                campaign_ids: Sequence[int] | None = None) -> dict[str, Any]:
+    """policy_no -> the leads carrying it and the renewal expiry date they have now.
+
+    The new date is parsed with the same function the scheduler uses and stored
+    normalised. A RED the engine cannot read is a lead it can never schedule, so
+    an unreadable date is refused here rather than written and discovered later.
+
+    Leads already carrying this date count as unchanged, so a re-run writes
+    nothing -- the same shape as the stage sweeps.
+    """
+    parsed = parse_red(red)
+    if parsed is None:
+        raise ValueError(f"cannot read {red!r} as a renewal expiry date")
+    target = parsed.isoformat()
+    rows, missing, scope = _by_policy(conn, policies, campaign_ids)
+    changed = [r for r in rows if parse_red(r.get("red")) != parsed]
+    return {
+        "would_change": len(changed),
+        "unchanged": len(rows) - len(changed),
+        # Keyed like the stage sweeps so the same breakdown renders: what the
+        # leads are moving FROM, which here is the date they carry today.
+        "by_stage": dict(Counter((r["red"] or "(blank)") for r in changed).most_common()),
+        "sample": [{"lead_id": r["id"], "policy_no": r["policy_no"], "lead_name": r["lead_name"],
+                    "campaign_id": r["campaign_id"], "stage": r["stage"] or "",
+                    "red": r["red"], "new_red": target} for r in changed[:SAMPLE]],
+        "not_found": missing,
+        "lead_ids": [r["id"] for r in changed],
+        "rows": changed,
+        # `stage_jobs.target_stage` is the one "what did this job aim at" column
+        # there is; for a RED job that is the date.
+        "target_stage": target,
+        "red": target,
+        "campaign_ids": scope,
+    }
+
+
+def apply_red(conn: sqlite3.Connection, rows: Sequence[dict[str, Any]], red: str,
+              now_iso: str, note: str = "") -> int:
+    """Write the corrected date and remember it, in one transaction.
+
+    Remembering is not optional: `engine.sync` DELETEs and re-inserts every lead
+    of a campaign, so a date written into `leads.red` alone survives exactly
+    until the next "Sync now". `apply_red_overrides` puts it back afterwards.
+
+    This is a LOCAL correction. Formi has no endpoint that writes a renewal
+    expiry date -- the only lead writes it exposes are the stage bulk update and
+    the schedule call -- so this changes which slot THIS console picks and does
+    not change what the agent reads out on the call.
+    """
+    if not rows:
+        return 0
+    conn.executemany(
+        "INSERT OR REPLACE INTO lead_red_overrides (lead_id, red, was, note, created_at) "
+        "VALUES (?,?,?,?,?)",
+        [(r["id"], red, r.get("red"), note, now_iso) for r in rows])
+    conn.executemany("UPDATE leads SET red=? WHERE id=?", [(red, r["id"]) for r in rows])
+    conn.commit()
+    return len(rows)
+
+
+def apply_red_overrides(conn: sqlite3.Connection, campaign_id: int) -> int:
+    """Re-apply this campaign's corrected dates after a sync has replaced its leads.
+
+    An override whose lead now reports a date matching neither the correction nor
+    the value it replaced is dropped: the warehouse has changed its mind since,
+    and a one-off correction must not clobber a real update for ever.
+    """
+    conn.execute(
+        "DELETE FROM lead_red_overrides WHERE lead_id IN ("
+        "  SELECT o.lead_id FROM lead_red_overrides o JOIN leads l ON l.id = o.lead_id"
+        "  WHERE l.campaign_id = ? AND IFNULL(l.red,'') NOT IN (IFNULL(o.was,''), o.red))",
+        (campaign_id,))
+    cur = conn.execute(
+        "UPDATE leads SET red = (SELECT o.red FROM lead_red_overrides o WHERE o.lead_id = leads.id) "
+        "WHERE campaign_id = ? AND id IN (SELECT lead_id FROM lead_red_overrides)", (campaign_id,))
+    conn.commit()
+    return cur.rowcount
 
 
 def preview_expired(conn: sqlite3.Connection, campaign_ids: Sequence[int], red_before: str,

@@ -116,7 +116,7 @@ CREATE INDEX IF NOT EXISTS ix_decisions_bucket ON decisions(run_id, bucket);
 
 CREATE TABLE IF NOT EXISTS stage_jobs (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
-  kind         TEXT NOT NULL,            -- policies | expired
+  kind         TEXT NOT NULL,            -- policies | expired | red
   mode         TEXT NOT NULL,            -- preview | commit
   target_stage TEXT NOT NULL,
   params       TEXT NOT NULL,            -- JSON echo of the request
@@ -153,6 +153,25 @@ CREATE TABLE IF NOT EXISTS leads (
 CREATE INDEX IF NOT EXISTS ix_leads_campaign ON leads(campaign_id);
 CREATE INDEX IF NOT EXISTS ix_leads_policy   ON leads(policy_no);
 CREATE INDEX IF NOT EXISTS ix_leads_phone    ON leads(phone);
+
+-- A renewal expiry date corrected in this console.
+--
+-- It needs its own table because a sync DELETEs and re-inserts every lead of a
+-- campaign (engine/sync.py), so a date written into leads.red alone would live
+-- until the next "Sync now" and no longer. engine.sync re-applies these rows
+-- after each refresh.
+--
+-- `was` is the value the correction replaced. When the warehouse itself later
+-- reports something different from both `was` and `red`, the source has changed
+-- its mind and the override is dropped -- a one-off correction must not clobber
+-- a real update for ever.
+CREATE TABLE IF NOT EXISTS lead_red_overrides (
+  lead_id    INTEGER PRIMARY KEY REFERENCES leads(id),
+  red        TEXT NOT NULL,               -- ISO, unlike leads.red: typed once, stored unambiguous
+  was        TEXT,
+  note       TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
 
 -- Every test-call attempt, allow-listed by config.test_numbers. Separate from
 -- plan_items on purpose: a rehearsal belongs to no run, so hanging it off one

@@ -437,16 +437,25 @@ export interface StagePreview {
   would_change: number;
   unchanged: number;
   by_stage: Record<string, number>;
-  sample: Array<{ policy_no: string; lead_name?: string | null; stage: string; red?: string | null }>;
+  sample: Array<{
+    /** Present on a live server; the sample lists key on it because one policy
+     *  is several leads and policy_no alone is not unique. */
+    lead_id?: number;
+    policy_no: string;
+    lead_name?: string | null;
+    stage: string;
+    red?: string | null;
+    new_red?: string | null;
+  }>;
 }
 
 export interface StageJob {
   id: number;
-  kind: 'policies' | 'expired';
+  kind: 'policies' | 'expired' | 'red';
   mode: 'preview' | 'commit';
   target_stage: string;
   would_change: number;
-  changed: number;
+  committed: number;
   created_at: string;
   dry_run: boolean;
 }
