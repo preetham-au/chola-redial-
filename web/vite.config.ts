@@ -23,7 +23,10 @@ export default defineConfig(({ command }) => ({
         // and the console came up looking dead -- no campaigns, no buckets, no
         // error worth reading, just failed fetches against a server that was
         // running fine one port over.
-        target: 'http://127.0.0.1:8000',
+        // API_TARGET is the same escape hatch PORT is above: when 8000 is
+        // already taken by an unrelated app, the backend moves rather than
+        // this file changing.
+        target: process.env.API_TARGET || 'http://127.0.0.1:8000',
         changeOrigin: true,
       },
     },

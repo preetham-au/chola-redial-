@@ -22,14 +22,22 @@ export function selectionSplit(all: Campaign[], sel: Set<number>) {
  *  place, hidden ones included, so a batch of retired campaigns can be taken out
  *  together and any of them put back.
  *
- *  Deliberately NOT scoped to the agent in the rail. Visibility is a decision
- *  about the console, not about one agent's day, and a hidden campaign that only
- *  reappears under the right scope is a hidden campaign nobody can find again.
+ *  Scoped to the agent in the rail, like every other screen. It is still outside
+ *  the "pick a campaign first" gate, because it has to work when the campaign
+ *  switcher is empty; the agent tabs are what reaches the other agent's list, and
+ *  `/api/agents` keeps a row for an agent whose campaigns are ALL hidden, so
+ *  scoping can never strand one out of reach.
  */
 export function CampaignVisibility() {
   const toast = useStore((s) => s.toast);
+  const agentId = useStore((s) => s.agentId);
   const bootstrap = useStore((s) => s.bootstrap);
-  const list = useAsync(() => api.campaigns(undefined, true), []);
+  // Nothing before the scope is known: loading unscoped first would flash the
+  // other agent's campaigns into a list whose buttons hide things.
+  const list = useAsync(
+    () => (agentId === null ? Promise.resolve([]) : api.campaigns(agentId, true)),
+    [agentId],
+  );
 
   const [filter, setFilter] = useState('');
   const [sel, setSel] = useState<Set<number>>(new Set());
@@ -40,11 +48,7 @@ export function CampaignVisibility() {
     const needle = filter.trim().toLowerCase();
     return (list.data ?? [])
       .filter(
-        (c) =>
-          !needle ||
-          c.name.toLowerCase().includes(needle) ||
-          String(c.id) === needle ||
-          String(c.agent_id) === needle,
+        (c) => !needle || c.name.toLowerCase().includes(needle) || String(c.id) === needle,
       )
       .sort((a, b) => a.name.localeCompare(b.name));
   }, [list.data, filter]);
@@ -101,9 +105,9 @@ export function CampaignVisibility() {
     setConfirming(false);
     setBusy('');
     list.reload();
-    // Not just the scoped campaign list: this screen crosses agents, so hiding
-    // six of 127's campaigns while scoped to 125 has to move 127's tab counts
-    // too. bootstrap re-reads both and keeps the agent selected.
+    // Not just this screen's list: the agent tab in the rail carries the campaign
+    // count, and setAgent only recomputes the row for the agent it loads. bootstrap
+    // re-reads /api/agents so the count moves, and keeps the agent selected.
     await bootstrap();
   };
 
@@ -117,6 +121,9 @@ export function CampaignVisibility() {
             Hidden campaigns leave every list in this console and can never be put in a plan. Nothing
             in Formi changes — this is only what you want to see and schedule here.
           </p>
+          <p className="cell-dim">
+            Agent {agentId ?? '—'} only. Switch the scope in the rail for another agent’s campaigns.
+          </p>
         </div>
         <div className="row" style={{ marginLeft: 'auto' }}>
           <span className="badge">{shown.length} shown</span>
@@ -127,7 +134,7 @@ export function CampaignVisibility() {
       <div className="row" style={{ gap: 8 }}>
         <input
           className="input"
-          placeholder="Filter by name, campaign id or agent id"
+          placeholder="Filter by name or campaign id"
           aria-label="Filter campaigns"
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
@@ -260,7 +267,7 @@ function Row({
     <label className="row" style={{ gap: 8, padding: '4px 2px', opacity: c.hidden ? 0.6 : 1 }}>
       <input type="checkbox" checked={ticked} disabled={busy} onChange={onTick} />
       <span style={{ flex: 1 }}>
-        {c.name} <span className="cell-dim">· {c.id} · agent {c.agent_id}</span>
+        {c.name} <span className="cell-dim">· {c.id}</span>
       </span>
       {c.autopilot && <span className="badge badge-accent">in the daily plan</span>}
       {!c.enabled && <span className="badge">disabled in Formi</span>}

@@ -150,11 +150,13 @@ hidden campaign. Un-hiding restores visibility only — arming is a separate act
 
 Two screens send these, and both ask for `?include_hidden=true` — nothing else
 in the console does. The day's picker hides one row at a time, in the moment it
-is noticed; **Settings → Campaign visibility** (`#visibility`) lists every
-campaign of every agent, hidden included, and hides or un-hides a batch of them
-one request at a time. That screen is deliberately outside the agent scope and
-outside the "pick a campaign first" gate: it is the way back from hiding, so it
-has to work when the campaign switcher is empty.
+is noticed; **Settings → Campaign visibility** (`#visibility`) lists the scoped
+agent's campaigns, hidden included, and hides or un-hides a batch of them one
+request at a time. It is scoped like every other screen — the agent tabs reach
+the other agent's list — but it is outside the "pick a campaign first" gate: it
+is the way back from hiding, so it has to work when the campaign switcher is
+empty. `GET /api/agents` keeps a row for an agent whose campaigns are all
+hidden, so the scope can never strand one out of reach.
 
 Hiding does not reach out and cancel calls already accepted by Formi for today;
 `live_today` in the response says how many are still to go, and `pause` is the
