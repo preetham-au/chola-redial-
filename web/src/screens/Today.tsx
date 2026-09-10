@@ -29,7 +29,7 @@ import { api } from '../lib/api';
 import { bandRange, bucketColor, friendlyBucket, n } from '../lib/domain';
 import { navigate, useAsync, useStore } from '../lib/store';
 import { Card, Empty, Fact, Modal, TypeToConfirm } from '../components/ui';
-import type { Campaign, DayBucket, DayView } from '../lib/types';
+import type { Campaign, DayBucket, DayCampaign, DayView } from '../lib/types';
 
 const WAVES = [
   { kind: 'auto', label: 'Morning' },
@@ -74,6 +74,7 @@ export function Today() {
   const date = useStore((s) => s.date);
   const setDate = useStore((s) => s.setDate);
   const toast = useStore((s) => s.toast);
+  const agentId = useStore((s) => s.agentId);
   const [kind, setKind] = useState('auto');
   const day = useAsync(() => api.day(date, kind), [date, kind]);
   const [picked, setPicked] = useState<string[] | null>(null);
@@ -171,8 +172,15 @@ export function Today() {
 
       {picking && (
         <PickCampaigns
+          // Keyed by agent: switching scope is a different picking session, and
+          // `ticked` is seeded once from what is armed. Without the remount it
+          // would carry the previous agent's ticks into the new list.
+          key={agentId}
           date={date}
           kind={kind}
+          // What is armed right now across BOTH agents. The picker is scoped to
+          // one, so this is how it can still say what the other one is running.
+          planned={d?.campaigns ?? []}
           onClose={() => setPicking(false)}
           onDone={() => day.reload()}
         />
@@ -489,18 +497,39 @@ function PickCampaigns({
   kind,
   onClose,
   onDone,
+  planned,
 }: {
   date: string;
   kind: string;
   onClose: () => void;
   onDone: () => void;
+  planned: DayCampaign[];
 }) {
   const toast = useStore((s) => s.toast);
   const agentId = useStore((s) => s.agentId);
   const setAgent = useStore((s) => s.setAgent);
-  // The one place that asks for hidden campaigns: this is where they are taken
-  // out of circulation, so it has to be where they can be put back.
-  const list = useAsync(() => api.campaigns(undefined, true), []);
+  // Scoped to the agent in the rail, like every other screen, and asking for
+  // hidden campaigns because this is one of the two places they can be put back.
+  //
+  // Scoping only narrows what is OFFERED. The day itself stays one plan across
+  // both agents -- `api/day.py` has no notion of an agent -- so the other one's
+  // armed campaigns keep running, and `planned` is here to say so out loud
+  // rather than let them dial off-screen. `autopilotDiff` reads this same list,
+  // so a campaign the picker cannot see is also one it can never disarm.
+  const list = useAsync(
+    () => (agentId === null ? Promise.resolve([]) : api.campaigns(agentId, true)),
+    [agentId],
+  );
+  // The other agent's campaigns that are armed for today, straight from the day
+  // view the parent already loaded — no second request to ask the same thing.
+  const elsewhere = useMemo(
+    () => planned.filter((c) => c.agent_id !== agentId),
+    [planned, agentId],
+  );
+  const elsewhereAgents = useMemo(
+    () => [...new Set(elsewhere.map((c) => c.agent_id))].sort((a, b) => a - b),
+    [elsewhere],
+  );
   const [ticked, setTicked] = useState<Set<number> | null>(null);
   const [filter, setFilter] = useState('');
   const [saving, setSaving] = useState(false);
@@ -614,7 +643,15 @@ function PickCampaigns({
       if (failed.length) toast('bad', `${failed.length} campaign(s) refused — ${failed[0]}`);
 
       if (chosen.size === 0) {
-        toast('ok', 'No campaign is in the daily plan. Nothing will be dialled.');
+        // "Nothing will be dialled" is only true when the other agent is empty
+        // too: this picker can no longer see it, so it must not speak for it.
+        toast(
+          'ok',
+          elsewhere.length === 0
+            ? 'No campaign is in the daily plan. Nothing will be dialled.'
+            : `No campaign of agent ${agentId} is in the plan. ${elsewhere.length} on agent ` +
+                `${elsewhereAgents.join(', ')} are still armed — switch the scope to change those.`,
+        );
       } else {
         const res = await api.prepareDay(date, kind);
         toast(
@@ -660,6 +697,24 @@ function PickCampaigns({
         <Info className="inline-icon" /> Saving arms these campaigns and builds {date}’s plan from
         their leads’ RED. It places no call — the day still has to be approved.
       </p>
+
+      <p className="cell-dim" style={{ marginTop: 0 }}>
+        Agent {agentId ?? '—'} only. Switch the scope in the rail for another agent’s campaigns.
+      </p>
+
+      {/* The day is one plan across both agents, so what this picker no longer
+          shows can still be dialling. Said here rather than left to be noticed
+          in the table behind the modal. */}
+      {elsewhere.length > 0 && (
+        <div className="warnbox">
+          <AlertTriangle />
+          <span>
+            {elsewhere.length} campaign(s) on agent {elsewhereAgents.join(', ')} are also in today’s
+            plan and keep running. Saving here changes agent {agentId} alone — switch the scope to
+            change those.
+          </span>
+        </div>
+      )}
 
       <div className="row" style={{ gap: 8, margin: '10px 0' }}>
         <input
@@ -731,7 +786,7 @@ function PickCampaigns({
                 onChange={() => toggle(c.id)}
               />
               <span style={{ flex: 1 }}>
-                {c.name} <span className="cell-dim">· {c.id} · agent {c.agent_id}</span>
+                {c.name} <span className="cell-dim">· {c.id}</span>
               </span>
               {!ok && <span className="badge">disabled</span>}
               {/* Armed and paused is the one combination that looks selected and
@@ -769,7 +824,7 @@ function PickCampaigns({
               {hiddenOnes.map((c) => (
                 <div key={c.id} className="row" style={{ gap: 8, padding: '4px 2px', opacity: 0.6 }}>
                   <span style={{ flex: 1 }}>
-                    {c.name} <span className="cell-dim">· {c.id} · agent {c.agent_id}</span>
+                    {c.name} <span className="cell-dim">· {c.id}</span>
                   </span>
                   <button
                     className="btn btn-sm btn-ghost"
