@@ -776,6 +776,40 @@ def _int_list(values: Iterable[Any], label: str) -> list[int]:
 # Campaign stats
 # ---------------------------------------------------------------------------
 
+def _red_map(leads: set[str]) -> tuple[str, str, str]:
+    """Parse each DISTINCT RED string once instead of once per row.
+
+    Returns `(cte, expression, join)` for a query whose leads view is aliased
+    `v`: put `cte` at the front of the WITH list, select `expression` where the
+    parsed date is wanted, and add `join` beside the leads view.
+
+    The parser is a ~100 KB CASE of a dozen regexes and depends on nothing but
+    the string it is given, so running it per lead is pure waste. Agent 125 has
+    76,972 leads and 315 distinct RED values: per lead the agent-campaign query
+    took 48s and grew with every upload, and Metabase's gateway gives up at 60s.
+    That is what "Sync now" had started reporting -- three retries, three 504s,
+    no new campaigns. Per distinct value the same query is 10s.
+
+    MATERIALIZED for the reason `campaign_order` is: read from inside a join,
+    Postgres 12+ would otherwise inline it and re-run the whole thing per row,
+    which is the cost this exists to remove.
+    """
+    if "red" not in leads:
+        return "", "NULL::date", ""
+    return (
+        f"""red_map AS MATERIALIZED (
+  SELECT r.red_text, {red_parse_expression("r.red_text")} AS d
+  FROM (SELECT DISTINCT (v.red)::text AS red_text
+        FROM public.{LEADS_VIEW} v WHERE v.red IS NOT NULL) r
+),
+""",
+        "rm.d",
+        # Equality, not IS NOT DISTINCT FROM: a NULL red matches nothing and
+        # yields NULL, exactly as parsing it would, and this one can hash.
+        "LEFT JOIN red_map rm ON rm.red_text = (v.red)::text",
+    )
+
+
 def build_agent_campaigns_sql(
     config: MetabaseConfig,
     schema: dict[str, set[str]],
@@ -812,12 +846,12 @@ def build_agent_campaigns_sql(
     connected = ", ".join(f"'{s}'" for s in CONNECTED_STAGES)
     connected_pred = _connected_predicate("a")
     today_sql = f"DATE '{(today or ist_today()).isoformat()}'"
-    red_expr = red_parse_expression("v.red") if "red" in leads else "NULL::date"
+    red_cte, red_expr, red_join = _red_map(leads)
     interaction_outlet = f"AND i.outlet_id = {config.outlet_id}" if "outlet_id" in interactions else ""
 
     return f"""
 -- Campaigns for agent {agent}, with status and RED readiness. One row per campaign.
-WITH mine AS (
+WITH {red_cte}mine AS (
   SELECT c.id, c.uuid::text AS campaign_uuid, {name_select} AS campaign_name,
          {status_select} AS campaign_status
   FROM public.campaigns c
@@ -834,13 +868,14 @@ activity AS (
     {interaction_outlet}
 ),
 per_lead AS (
-  SELECT a.campaign_id, a.lead_id,
-         MAX(CASE WHEN a.call_stage IN ({dial_stages}) THEN 1 ELSE 0 END) AS dialled,
-         red.d AS red_date
-  FROM activity a
-  JOIN public.{LEADS_VIEW} v ON v.id = a.lead_id
-  CROSS JOIN LATERAL (SELECT {red_expr} AS d) red
-  GROUP BY a.campaign_id, a.lead_id, red.d
+  -- One row per (campaign, lead), and the leads view is reached once per lead
+  -- rather than once per interaction: agent 125 has 265k interactions behind
+  -- 77k leads, and only the lead count is wanted here. The dial columns are
+  -- counted from `activity` below, where the extra rows belong.
+  SELECT DISTINCT pl.campaign_id, pl.lead_id, {red_expr} AS red_date
+  FROM (SELECT DISTINCT a.campaign_id, a.lead_id FROM activity a) pl
+  JOIN public.{LEADS_VIEW} v ON v.id = pl.lead_id
+  {red_join}
 ),
 lead_totals AS (
   SELECT p.campaign_id,
@@ -922,7 +957,7 @@ def build_campaign_stats_sql(
     connected = ", ".join(f"'{s}'" for s in CONNECTED_STAGES)
     connected_pred = _connected_predicate("a")
     today_sql = f"DATE '{(today or ist_today()).isoformat()}'"
-    red_expr = red_parse_expression("v.red") if "red" in leads else "NULL::date"
+    red_cte, red_expr, red_join = _red_map(leads)
 
     status_column = _status_column(campaigns)
     status_select = (f"c.{_safe_identifier(status_column)}::text"
@@ -944,10 +979,10 @@ lead_totals AS (
   SELECT
     v.campaign_id                                                        AS campaign_id,
     COUNT(*)                                                             AS leads,
-    COUNT(*) FILTER (WHERE red.d IS NOT NULL)                            AS leads_with_red,
-    COUNT(*) FILTER (WHERE red.d - {today_sql} BETWEEN -3 AND 45)        AS leads_in_red_window
+    COUNT(*) FILTER (WHERE {red_expr} IS NOT NULL)                       AS leads_with_red,
+    COUNT(*) FILTER (WHERE {red_expr} - {today_sql} BETWEEN -3 AND 45)   AS leads_in_red_window
   FROM public.{LEADS_VIEW} v
-  CROSS JOIN LATERAL (SELECT {red_expr} AS d) red
+  {red_join}
   GROUP BY v.campaign_id
 )"""
     else:
@@ -956,18 +991,18 @@ lead_totals AS (
   SELECT
     a.campaign_id                                                        AS campaign_id,
     COUNT(DISTINCT a.lead_id)                                            AS leads,
-    COUNT(DISTINCT CASE WHEN red.d IS NOT NULL THEN a.lead_id END)       AS leads_with_red,
-    COUNT(DISTINCT CASE WHEN red.d - {today_sql} BETWEEN -3 AND 45
+    COUNT(DISTINCT CASE WHEN {red_expr} IS NOT NULL THEN a.lead_id END)  AS leads_with_red,
+    COUNT(DISTINCT CASE WHEN {red_expr} - {today_sql} BETWEEN -3 AND 45
                         THEN a.lead_id END)                              AS leads_in_red_window
   FROM activity a
   JOIN public.{LEADS_VIEW} v ON v.id = a.lead_id
-  CROSS JOIN LATERAL (SELECT {red_expr} AS d) red
+  {red_join}
   GROUP BY a.campaign_id
 )"""
 
     return f"""
 -- Per-campaign redial readiness. One row per campaign_id.
-WITH activity AS (
+WITH {red_cte}activity AS (
   SELECT i.campaign_id, i.lead_id, i.call_stage, i.scheduled_time,
          {DISPOSITION_SQL} AS disposition,
          COALESCE((i.interaction_metadata->>'call_duration')::numeric, 0) AS duration_sec
