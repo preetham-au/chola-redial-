@@ -48,6 +48,32 @@ def test_disposition_is_the_sub_in_both_eras(sql):
     assert "LOWER(COALESCE(i.lead_stage_computed, '')) AS disposition" not in sql
 
 
+def test_a_never_dialled_campaign_still_counts_its_leads():
+    """The lead count must not be reached through public.interactions.
+
+    `per_lead` used to be derived from the `activity` CTE, so a campaign's leads
+    were counted only once something had DIALLED them. A campaign uploaded and
+    not yet dialled reported `leads = 0`; `sync`'s `has_leads` filter drops
+    anything reporting 0; so a new campaign could not appear in the console
+    until some other path dialled it first. On 10 Sep 2026 that hid 20
+    campaigns holding 39,791 leads between them.
+
+    Asserted on the generated SQL because the shape IS the bug -- the counts
+    themselves were never wrong, they were simply read from a relation that has
+    no row for a campaign nobody has called yet.
+    """
+    sql = build_agent_campaigns_sql(CONFIG, SCHEMA, 125, today=TODAY)
+    per_lead = sql.split("per_lead AS (", 1)[1].split("\n),", 1)[0]
+    # Comments in there name the old shape; it is the statement that matters.
+    body = "\n".join(ln for ln in per_lead.splitlines() if not ln.strip().startswith("--"))
+
+    assert "public.leads l" in body, "the campaign_id mapping lives only on public.leads"
+    assert "activity" not in body
+    assert INTERACTIONS_TABLE not in body
+    # And still one agent's campaigns, not the whole warehouse's.
+    assert "JOIN mine m ON m.id = l.campaign_id" in body
+
+
 def test_the_two_tuples_are_disjoint():
     """A label cannot mean both `a human spoke` and `a machine answered`."""
     both = set(CONTACTED_DISPOSITIONS) & set(MACHINE_DISPOSITIONS)

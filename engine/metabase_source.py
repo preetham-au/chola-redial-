@@ -868,13 +868,26 @@ activity AS (
     {interaction_outlet}
 ),
 per_lead AS (
-  -- One row per (campaign, lead), and the leads view is reached once per lead
-  -- rather than once per interaction: agent 125 has 265k interactions behind
-  -- 77k leads, and only the lead count is wanted here. The dial columns are
-  -- counted from `activity` below, where the extra rows belong.
-  SELECT DISTINCT pl.campaign_id, pl.lead_id, {red_expr} AS red_date
-  FROM (SELECT DISTINCT a.campaign_id, a.lead_id FROM activity a) pl
-  JOIN public.{LEADS_VIEW} v ON v.id = pl.lead_id
+  -- One row per (campaign, lead), read from `public.leads` -- the only relation
+  -- that carries the mapping, since the leads VIEW has no campaign_id. This
+  -- used to start from `activity`, i.e. from `public.interactions`, and so
+  -- counted a campaign's leads only once something had DIALLED them. A campaign
+  -- uploaded and not yet dialled reported `leads = 0`, `sync` drops anything
+  -- reporting 0 (see its `has_leads` filter), and the console could therefore
+  -- never show a new campaign until some other path dialled it first. On
+  -- 10 Sep 2026 that hid 20 campaigns holding 39,791 leads between them.
+  --
+  -- `fetch_fresh_leads` and `fetch_contacts` already read `public.leads`, so
+  -- this adds no dependency. It also drops the 265k-row interaction join off
+  -- the lead-count path, which is most of why this statement was racing
+  -- Metabase's 60s gateway and losing.
+  --
+  -- No DISTINCT: `public.leads.id` is a primary key, so (campaign_id, lead_id)
+  -- is unique already and the sort the old shape needed is pure cost.
+  SELECT l.campaign_id, l.id AS lead_id, {red_expr} AS red_date
+  FROM public.leads l
+  JOIN mine m ON m.id = l.campaign_id
+  JOIN public.{LEADS_VIEW} v ON v.id = l.id
   {red_join}
 ),
 lead_totals AS (
