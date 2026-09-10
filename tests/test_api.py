@@ -596,6 +596,47 @@ def test_stage_commit_under_dry_run_never_dials(client, no_network):
     assert jobs and all(j["dry_run"] is True and j["committed"] == 0 for j in jobs)
 
 
+def test_a_policy_sweep_can_be_narrowed_to_chosen_campaigns(client, no_network):
+    """`campaign_ids` decides which copy of a policy moves.
+
+    A policy is loaded into several campaigns and the default is still to move
+    every copy — that is the ported behaviour and the right one for a renewal.
+    Naming campaigns narrows it, and a policy outside them is "not found", not
+    silently counted as unchanged.
+    """
+    with _db() as conn:
+        # A campaign that actually has leads, and one that does not have these.
+        row = conn.execute(
+            "SELECT campaign_id, policy_no FROM leads ORDER BY id LIMIT 1").fetchone()
+        mine, policy = row["campaign_id"], row["policy_no"]
+        elsewhere = conn.execute(
+            "SELECT id FROM campaigns WHERE id != ? ORDER BY id LIMIT 1", (mine,)).fetchone()["id"]
+
+    body = {"policies": [policy], "target_stage": "renewed"}
+    unscoped = client.post("/api/stage/policies/preview", json=body).json()
+    assert unscoped["would_change"] + unscoped["unchanged"] >= 1
+    assert unscoped["not_found"] == []
+
+    scoped = client.post("/api/stage/policies/preview",
+                         json={**body, "campaign_ids": [mine]}).json()
+    assert scoped["not_found"] == []
+    assert scoped["would_change"] + scoped["unchanged"] <= unscoped["would_change"] + unscoped["unchanged"]
+
+    # Out of scope is out of scope: reported as not found, and nothing to write.
+    missed = client.post("/api/stage/policies/preview",
+                         json={**body, "campaign_ids": [elsewhere]}).json()
+    assert missed["would_change"] == 0 and missed["not_found"] == [policy]
+
+    # A bad id is a 422, not a silently empty sweep.
+    assert client.post("/api/stage/policies/preview",
+                       json={**body, "campaign_ids": ["all"]}).status_code == 422
+
+    # The scope is in the audit trail — the same list against a different scope
+    # is a different write.
+    job = client.get("/api/stage/jobs").json()[0]
+    assert job["params"]["campaign_ids"] == [elsewhere]
+
+
 def test_expired_preview_keeps_renewed_and_paid_untouched(client):
     body = client.post("/api/stage/expired/preview",
                        json={"campaign_ids": [1, 2, 3], "red_before": "2026-08-25",

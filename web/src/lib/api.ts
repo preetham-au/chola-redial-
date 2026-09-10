@@ -409,12 +409,12 @@ export const api = {
       return run;
     }),
 
-  policiesPreview: (body: { policies: string[]; target_stage: string }) =>
+  policiesPreview: (body: { policies: string[]; target_stage: string; campaign_ids: number[] }) =>
     req<StagePreview>('/api/stage/policies/preview', json(body), () =>
       mockStagePreview(body.policies, body.target_stage),
     ),
 
-  policiesCommit: (body: { policies: string[]; target_stage: string }) =>
+  policiesCommit: (body: { policies: string[]; target_stage: string; campaign_ids: number[] }) =>
     req<StagePreview & { dry_run: boolean; changed: number }>(
       '/api/stage/policies/commit',
       json(body),

@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections import defaultdict
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -25,7 +25,15 @@ class ExpiredBody(BaseModel):
     keep: Optional[list[str]] = None
 
 
-async def _policy_request(request: Request) -> tuple[list[str], str, Optional[list[str]]]:
+class PolicyRequest(NamedTuple):
+    policies: list[str]
+    target: str
+    keep: Optional[list[str]]
+    # Empty means every campaign the policy appears in — see `preview_policies`.
+    campaign_ids: list[int]
+
+
+async def _policy_request(request: Request) -> PolicyRequest:
     """Accept either `{policies: [...], target_stage}` JSON or a multipart upload."""
     content_type = (request.headers.get("content-type") or "").split(";")[0].strip()
     if content_type == "application/json":
@@ -38,6 +46,7 @@ async def _policy_request(request: Request) -> tuple[list[str], str, Optional[li
         policies = body.get("policies") or read_policies(body.get("policies_text") or "")
         target = body.get("target_stage")
         keep = body.get("keep")
+        scope = body.get("campaign_ids")
     else:
         form = await request.form()
         upload = form.get("file") or form.get("policy_file")
@@ -47,13 +56,19 @@ async def _policy_request(request: Request) -> tuple[list[str], str, Optional[li
         policies = read_policies(text or str(form.get("policies") or ""))
         target = form.get("target_stage")
         keep = None
+        # One repeated field, as a form has no lists: campaign_ids=12&campaign_ids=13
+        scope = form.getlist("campaign_ids")
 
     policies = [str(p).strip() for p in (policies or []) if str(p).strip()]
     if not policies:
         raise HTTPException(422, "no policy numbers supplied")
     if not target:
         raise HTTPException(422, "target_stage is required")
-    return policies, str(target), keep
+    try:
+        campaign_ids = [int(c) for c in (scope or [])]
+    except (TypeError, ValueError):
+        raise HTTPException(422, "campaign_ids must be integers") from None
+    return PolicyRequest(policies, str(target), keep, campaign_ids)
 
 
 def _record(conn: sqlite3.Connection, kind: str, mode: str, result: dict[str, Any],
@@ -139,24 +154,29 @@ def _commit(conn: sqlite3.Connection, result: dict[str, Any]) -> int:
     return applied + result["applied_local"]
 
 
+def _policy_params(req: PolicyRequest) -> dict[str, Any]:
+    """What the job history records. The campaign scope belongs in it: the same
+    policy list against a different scope is a different write."""
+    return {"policies": len(req.policies), "target_stage": req.target,
+            "campaign_ids": req.campaign_ids}
+
+
 @router.post("/api/stage/policies/preview")
 async def policies_preview(request: Request) -> dict[str, Any]:
-    policies, target, keep = await _policy_request(request)
+    req = await _policy_request(request)
     with session() as conn:
-        result = preview_policies(conn, policies, target, keep)
-        _record(conn, "policies", "preview", result,
-                {"policies": len(policies), "target_stage": target}, applied=0)
+        result = preview_policies(conn, req.policies, req.target, req.keep, req.campaign_ids)
+        _record(conn, "policies", "preview", result, _policy_params(req), applied=0)
     return _public(result)
 
 
 @router.post("/api/stage/policies/commit")
 async def policies_commit(request: Request) -> dict[str, Any]:
-    policies, target, keep = await _policy_request(request)
+    req = await _policy_request(request)
     with session() as conn:
-        result = preview_policies(conn, policies, target, keep)
+        result = preview_policies(conn, req.policies, req.target, req.keep, req.campaign_ids)
         applied = _commit(conn, result)
-        job_id = _record(conn, "policies", "commit", result,
-                         {"policies": len(policies), "target_stage": target}, applied)
+        job_id = _record(conn, "policies", "commit", result, _policy_params(req), applied)
     return {**_public(result), "job_id": job_id, "dry_run": dry_run(), **_applied(result, applied)}
 
 

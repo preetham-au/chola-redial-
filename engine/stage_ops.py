@@ -61,11 +61,26 @@ def _result(rows: Sequence[dict[str, Any]], keep: set[str], target_stage: str,
     }
 
 
-def preview_policies(conn: sqlite3.Connection, policies: Sequence[str],
-                     target_stage: str, keep: Iterable[str] | None = None) -> dict[str, Any]:
-    """policy_no -> every lead carrying it, with its agent and current stage."""
+def preview_policies(conn: sqlite3.Connection, policies: Sequence[str], target_stage: str,
+                     keep: Iterable[str] | None = None,
+                     campaign_ids: Sequence[int] | None = None) -> dict[str, Any]:
+    """policy_no -> every lead carrying it, with its agent and current stage.
+
+    `campaign_ids` narrows that "every one of them". A policy is loaded into
+    several campaigns and the default -- all of them -- is the behaviour ported
+    from `mark_stage_by_policy.py`: renewing a policy retires it everywhere. Pass
+    a list to move it in the campaigns named and nowhere else, which is what an
+    operator wants when only one campaign's copy is wrong.
+
+    A policy that exists but not in the chosen campaigns comes back under
+    `not_found`, because within the scope asked for, it was not.
+    """
     keep_set = {s.lower() for s in (keep if keep is not None else [target_stage])}
     policies = [p for p in dict.fromkeys(policies) if p]
+    scope = [int(c) for c in (campaign_ids or [])]
+    where = ""
+    if scope:
+        where = f" AND l.campaign_id IN ({','.join('?' * len(scope))})"
     rows: list[dict[str, Any]] = []
     for start in range(0, len(policies), 400):     # BATCH, as in the original
         chunk = policies[start:start + 400]
@@ -73,9 +88,12 @@ def preview_policies(conn: sqlite3.Connection, policies: Sequence[str],
         rows.extend(dict(r) for r in conn.execute(
             f"SELECT l.id, l.policy_no, l.lead_name, l.campaign_id, l.stage, c.agent_id "
             f"FROM leads l JOIN campaigns c ON c.id = l.campaign_id "
-            f"WHERE l.policy_no IN ({marks}) ORDER BY l.id", chunk).fetchall())
+            f"WHERE l.policy_no IN ({marks}){where} ORDER BY l.id",
+            [*chunk, *scope]).fetchall())
     found = {r["policy_no"] for r in rows}
-    return _result(rows, keep_set, target_stage, [p for p in policies if p not in found])
+    out = _result(rows, keep_set, target_stage, [p for p in policies if p not in found])
+    out["campaign_ids"] = scope
+    return out
 
 
 def preview_expired(conn: sqlite3.Connection, campaign_ids: Sequence[int], red_before: str,

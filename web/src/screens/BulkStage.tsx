@@ -94,6 +94,9 @@ function PoliciesMode({ onDone }: { onDone: () => void }) {
 
   const [raw, setRaw] = useState('');
   const [target, setTarget] = useState('renewed');
+  // Empty is "every campaign the policy is in" — the ported behaviour, and the
+  // right default: a renewed policy is renewed wherever it was loaded.
+  const [ids, setIds] = useState<number[]>([]);
   const [preview, setPreview] = useState<StagePreview | null>(null);
   const [busy, setBusy] = useState(false);
   const [confirming, setConfirming] = useState(false);
@@ -105,7 +108,7 @@ function PoliciesMode({ onDone }: { onDone: () => void }) {
   const run = async (commit: boolean) => {
     setBusy(true);
     try {
-      const body = { policies, target_stage: target };
+      const body = { policies, target_stage: target, campaign_ids: ids };
       if (commit) {
         const res = await api.policiesCommit(body);
         toast('ok', `${n(res.changed)} leads moved to ${target}${res.dry_run ? ' (dry run — nothing written)' : ''}.`);
@@ -185,6 +188,17 @@ function PoliciesMode({ onDone }: { onDone: () => void }) {
           <span className="field-hint">{stageEffect(target)}</span>
         </div>
 
+        <CampaignChips
+          value={ids}
+          onChange={(next) => { setIds(next); setPreview(null); }}
+          hint={
+            ids.length === 0
+              ? 'None picked — every campaign the policy appears in is moved. Pick some to narrow it.'
+              : `Only the copy in ${ids.length} campaign(s) is moved. A policy that is not in them ` +
+                'is reported as not found.'
+          }
+        />
+
         <button
           className="btn btn-primary"
           style={{ marginTop: 16 }}
@@ -258,6 +272,7 @@ function PoliciesMode({ onDone }: { onDone: () => void }) {
             <Fact k="Policies submitted" v={n(policies.length)} />
             <Fact k="Leads changed" v={n(preview.would_change)} tone="var(--accent)" />
             <Fact k="Target stage" v={target} />
+            <Fact k="Campaigns" v={ids.length === 0 ? 'all' : ids.length} />
           </div>
           <div className="infobox">
             <Info />
@@ -278,7 +293,6 @@ function PoliciesMode({ onDone }: { onDone: () => void }) {
 const TARGET_EXPIRED = 'policy_expired';
 
 function ExpiredMode({ onDone }: { onDone: () => void }) {
-  const campaigns = useStore((s) => s.campaigns);
   const campaignId = useStore((s) => s.campaignId)!;
   const toast = useStore((s) => s.toast);
   const health = useStore((s) => s.health);
@@ -328,23 +342,11 @@ function ExpiredMode({ onDone }: { onDone: () => void }) {
           </span>
         </div>
 
-        <div className="field" style={{ marginTop: 16 }}>
-          <span className="eyebrow">Campaigns</span>
-          <div className="row" style={{ flexWrap: 'wrap', gap: 7 }}>
-            {campaigns.map((c) => (
-              <button
-                key={c.id}
-                className={`chip${ids.includes(c.id) ? ' is-on' : ''}`}
-                onClick={() => {
-                  setIds(ids.includes(c.id) ? ids.filter((x) => x !== c.id) : [...ids, c.id]);
-                  setPreview(null);
-                }}
-              >
-                {c.name} · wh {c.warehouse_id}
-              </button>
-            ))}
-          </div>
-        </div>
+        <CampaignChips
+          value={ids}
+          onChange={(next) => { setIds(next); setPreview(null); }}
+          hint="Only leads in these campaigns are swept. At least one is required."
+        />
 
         <button
           className="btn btn-primary"
@@ -453,6 +455,53 @@ function ExpiredMode({ onDone }: { onDone: () => void }) {
 }
 
 /* --- shared bits ------------------------------------------------------------- */
+
+/** Which campaigns a bulk change may touch.
+ *
+ *  Scoped to the agent in the rail, because `store.campaigns` already is — the
+ *  same scope every other screen works in. `hint` exists because an empty
+ *  selection does not mean the same thing in both modes: the policy sweep reads
+ *  it as "every campaign", the expired sweep refuses it outright, and the
+ *  difference decides how many leads move.
+ */
+function CampaignChips({
+  value,
+  onChange,
+  hint,
+}: {
+  value: number[];
+  onChange: (ids: number[]) => void;
+  hint: string;
+}) {
+  const campaigns = useStore((s) => s.campaigns);
+  return (
+    <div className="field" style={{ marginTop: 16 }}>
+      <div className="row" style={{ gap: 8 }}>
+        <span className="eyebrow" style={{ flex: 1 }}>Campaigns</span>
+        <button className="btn btn-sm btn-ghost" onClick={() => onChange(campaigns.map((c) => c.id))}>
+          Select all
+        </button>
+        <button className="btn btn-sm btn-ghost" onClick={() => onChange([])}>
+          Clear
+        </button>
+      </div>
+      <div className="row" style={{ flexWrap: 'wrap', gap: 7 }}>
+        {campaigns.map((c) => (
+          <button
+            key={c.id}
+            className={`chip${value.includes(c.id) ? ' is-on' : ''}`}
+            onClick={() =>
+              onChange(value.includes(c.id) ? value.filter((x) => x !== c.id) : [...value, c.id])
+            }
+          >
+            {c.name} · wh {c.warehouse_id}
+          </button>
+        ))}
+      </div>
+      <span className="field-hint">{hint}</span>
+    </div>
+  );
+}
 
 function StageBreakdown({ by, total, tone }: { by: Record<string, number>; total: number; tone: string }) {
   return (
