@@ -37,7 +37,13 @@ CREATE TABLE IF NOT EXISTS campaigns (
   -- writes it (`upsert_campaign` names its SET columns), so a warehouse pull
   -- cannot undo the decision. Defaults to 0 so a campaign created in Formi
   -- shows up here on its own -- hiding is always something someone chose.
-  hidden INTEGER NOT NULL DEFAULT 0
+  hidden INTEGER NOT NULL DEFAULT 0,
+  -- What the warehouse said about this campaign the last time its leads were
+  -- actually pulled (see engine.sync.campaign_fingerprint). A sync re-pulls a
+  -- campaign's leads only when this has moved -- 99 campaigns cost two Metabase
+  -- round trips each, ~2m50s of a 3m run, and most of them have not changed
+  -- since the hour before. Empty means "never pulled", which always re-pulls.
+  sync_fingerprint TEXT NOT NULL DEFAULT ''
 );
 
 -- Versioned and append-only: a PUT inserts, it never updates. The current

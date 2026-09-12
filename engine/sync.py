@@ -439,6 +439,56 @@ def store_leads(conn: sqlite3.Connection, campaign_id: int, leads: Iterable[dict
     return len(rows)
 
 
+def campaign_fingerprint(conn: sqlite3.Connection, row: dict[str, Any],
+                         today: date | None, max_leads: int, all_leads: bool) -> str:
+    """Everything that decides what a lead pull for this campaign would return.
+
+    The point of it is to not make the pull. Each campaign costs two Metabase
+    round trips -- `fetch_redial_leads` and `fetch_fresh_leads` -- about 1.7s,
+    and on 12 Sep 2026 that was 2m50s of a 3m run across 99 campaigns, most of
+    which had not changed since the sync an hour before. The campaigns query
+    that opens every run already computes the aggregates below for all 121
+    campaigns in about 9s, so the cheap read can tell us which expensive ones to
+    skip.
+
+    A COUNT on its own would not be safe -- the user's first instinct, and the
+    reason this is a tuple rather than `leads`. A lead that gets dialled changes
+    stage and disposition while the count stands still, and stage is most of
+    what the console shows. So every counter that moves when a lead moves is in
+    here: `dials`, `connected_dials` and `queued_today` all step on a dial, and
+    `last_dial_at` moves even when a re-dial leaves all three equal.
+
+    Also in here, and not from the warehouse at all:
+
+      * `today`, because the RED window is relative to it. Two runs either side
+        of midnight IST must not agree, and a rollover that happens to leave the
+        same number of leads in the window would otherwise be invisible. This
+        also buys a full, unconditional pull once a day.
+      * the campaign's OWN saved window, because `refresh_campaign_leads` reads
+        it from `current_config` rather than the engine defaults. An operator
+        widening the frequency table changes which leads a pull returns while
+        the warehouse says nothing at all.
+      * `max_leads` and `all_leads`, which change the shape of the pull itself.
+
+    What it still cannot see: a RED edited from one in-window date to another,
+    or a stage changed in the Formi platform without a dial. Both leave every
+    counter above standing. The daily `today` rollover is what bounds that, and
+    `--full` is the way to force the question now.
+    """
+    window = config_from_settings(current_config(conn, campaign_id := int(row["campaign_id"])))
+    stored = conn.execute("SELECT COUNT(*) FROM leads WHERE campaign_id=?",
+                          (campaign_id,)).fetchone()[0]
+    return "|".join(str(part) for part in (
+        "v1", row.get("campaign_status"), row.get("leads"), row.get("leads_with_red"),
+        row.get("leads_in_red_window"), row.get("dials"), row.get("connected_dials"),
+        row.get("queued_today"), row.get("last_dial_at"),
+        today or ms.ist_today(), window.dte_min, window.dte_max, max_leads, all_leads,
+        # The local side of it: a store that lost its leads must re-pull even
+        # though the warehouse has not moved a digit.
+        stored,
+    ))
+
+
 def refresh_campaign_leads(conn: sqlite3.Connection, campaign_id: int,
                            config: ms.MetabaseConfig, schema: Any,
                            today: date | None = None, max_leads: int = DEFAULT_MAX_LEADS,
@@ -486,7 +536,8 @@ def sync(agents: Sequence[int] = tuple(AGENTS),
          today: date | None = None,
          keep_local: bool = False,
          force_campaigns: Sequence[int] = (),
-         all_leads: bool = False) -> dict[str, Any]:
+         all_leads: bool = False,
+         full: bool = False) -> dict[str, Any]:
     config = ms.load_config()
     schema = retry("schema", ms.describe_schema, config)
 
@@ -546,7 +597,7 @@ def sync(agents: Sequence[int] = tuple(AGENTS),
         f"{skipped} eligible campaign(s) NOT synced.")
 
     conn = init_db()
-    total_leads = truncated = 0
+    total_leads = truncated = unchanged = 0
     per_campaign: list[tuple[int, str, int]] = []
     try:
         stopped = [row for row in chosen if upsert_campaign(conn, row)]
@@ -560,14 +611,29 @@ def sync(agents: Sequence[int] = tuple(AGENTS),
 
         for row in chosen:
             campaign_id = int(row["campaign_id"])
+            whole = all_leads or campaign_id in always
+            fingerprint = campaign_fingerprint(conn, row, today, max_leads, whole)
+            was = conn.execute("SELECT sync_fingerprint FROM campaigns WHERE id=?",
+                               (campaign_id,)).fetchone()
+            if not full and was and was[0] and was[0] == fingerprint:
+                # Nothing the warehouse can tell us about this campaign has moved
+                # since its leads were last pulled, so pulling them again buys two
+                # round trips and the same rows back. See campaign_fingerprint for
+                # what that claim does and does not cover.
+                stored = conn.execute("SELECT COUNT(*) FROM leads WHERE campaign_id=?",
+                                      (campaign_id,)).fetchone()[0]
+                unchanged += 1
+                total_leads += stored
+                per_campaign.append((campaign_id, str(row.get("campaign_name")), stored))
+                continue
+
             # A campaign is force-synced *because* of the lead we want in it —
             # the test number, or one an operator named. Applying the RED window
             # to it then drops that very lead and stores the campaign with zero,
             # which is how /api/test-call/numbers came to answer "no lead on this
             # number" for a number the sync had just gone out of its way to find.
             stored = refresh_campaign_leads(conn, campaign_id, config, schema, today=today,
-                                            max_leads=max_leads,
-                                            all_leads=all_leads or campaign_id in always)
+                                            max_leads=max_leads, all_leads=whole)
             with_phone = conn.execute(
                 "SELECT COUNT(*) FROM leads WHERE campaign_id=? AND phone IS NOT NULL",
                 (campaign_id,)).fetchone()[0]
@@ -578,18 +644,32 @@ def sync(agents: Sequence[int] = tuple(AGENTS),
             total_leads += stored
             truncated += bool(capped)
             per_campaign.append((campaign_id, str(row.get("campaign_name")), stored))
+            # Written only now, and only from the row that produced these leads:
+            # stamping it before the pull would mark a campaign fresh on a run
+            # that died halfway through it. Recomputed because the pull itself
+            # changed the local lead count the fingerprint carries.
+            conn.execute("UPDATE campaigns SET sync_fingerprint=? WHERE id=?",
+                         (campaign_fingerprint(conn, row, today, max_leads, whole),
+                          campaign_id))
+            conn.commit()
     finally:
         conn.close()
 
     log(f"CAP: {total_leads} leads stored; {truncated} campaign(s) hit the "
         f"--leads {max_leads} ceiling and are INCOMPLETE.")
+    # Said out loud every run: a fast sync and a broken sync look identical from
+    # the outside, and "it finished in 20 seconds" should be a number somebody
+    # can check rather than a thing to be relieved about.
+    log(f"UNCHANGED: {unchanged} of {len(chosen)} campaign(s) had not moved since their "
+        f"last pull, so their leads were not re-fetched ({len(chosen) - unchanged} "
+        f"pulled). Re-run with --full to pull every campaign regardless.")
     log("SCOPE: every lead in the campaign (--all-leads)" if all_leads else
         "SCOPE: today only — leads inside each campaign's RED window, plus any "
         "already scheduled or dialled today. Leads outside it are NOT in the "
         "local store and cannot be planned; re-sync with --all-leads for those.")
     return {"campaigns": len(chosen), "leads": total_leads,
             "campaigns_skipped": skipped, "campaigns_truncated": truncated,
-            "per_campaign": per_campaign}
+            "campaigns_unchanged": unchanged, "per_campaign": per_campaign}
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -604,13 +684,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="comma-separated campaign ids to sync regardless of RED filter")
     parser.add_argument("--all-leads", action="store_true",
                         help="pull every lead, not just the ones in play today")
+    parser.add_argument("--full", action="store_true",
+                        help="re-pull every campaign's leads even if nothing has changed")
     args = parser.parse_args(argv)
 
     agents = [int(a) for a in str(args.agents).split(",") if a.strip()]
     forced = [int(c) for c in str(args.force_campaigns).split(",") if c.strip()]
     try:
         result = sync(agents, args.campaigns, args.leads, keep_local=args.keep_local,
-                      force_campaigns=forced, all_leads=args.all_leads)
+                      force_campaigns=forced, all_leads=args.all_leads, full=args.full)
     except ms.MetabaseError as exc:
         log(f"sync failed: {exc}")
         return 1
