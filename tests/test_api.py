@@ -100,6 +100,23 @@ def test_save_env_value_rewrites_one_line_and_leaves_the_secrets_alone(tmp_path,
     assert 'METABASE_API_KEY="mb_secret/with=equals"' in env.read_text(encoding="utf-8")
 
 
+def test_save_env_value_keeps_crlf_endings_where_it_finds_them(tmp_path, monkeypatch):
+    """The VM's .env is CRLF. Rewriting one line must not convert the file.
+
+    `splitlines()` drops the CR, so a naive join with "\\n" rewrites every line
+    in the file to change one of them -- which is what the first deploy of this
+    did on 12 Sep 2026. Harmless to `load_env`, which strips whitespace, but it
+    turns "edited one line of a secrets file" into "rewrote all of it", and the
+    next person diffing that file cannot tell the two apart.
+    """
+    env = tmp_path / ".env"
+    env.write_bytes(b"METABASE_API_KEY=secret\r\nDRY_RUN=1\r\n")
+    monkeypatch.setenv("REDIAL_ENV_FILE", str(env))
+
+    assert save_env_value("DRY_RUN", "0") is True
+    assert env.read_bytes() == b"METABASE_API_KEY=secret\r\nDRY_RUN=0\r\n"
+
+
 def test_save_env_value_reports_failure_instead_of_raising(tmp_path, monkeypatch):
     """No .env on disk is a deployment this cannot persist to, not an exception.
 

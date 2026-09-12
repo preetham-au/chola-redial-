@@ -65,7 +65,10 @@ def save_env_value(key: str, value: str) -> bool:
     """
     path = env_path()
     try:
-        text = path.read_text(encoding="utf-8-sig")
+        # Bytes, not read_text: that opens in universal-newline mode and hands
+        # back "\n" whatever the file actually holds, so the CRLF check below
+        # could never see a CRLF file.
+        text = path.read_bytes().decode("utf-8-sig")
     except (OSError, UnicodeDecodeError):
         return False
 
@@ -82,9 +85,15 @@ def save_env_value(key: str, value: str) -> bool:
     if not found:
         out.append(line)
 
+    # The VM's .env is CRLF; `splitlines()` has just dropped those. Rejoining with
+    # "\n" would rewrite every line in the file to change one of them -- harmless
+    # to `load_env`, which strips whitespace, but it turns "edited one line of a
+    # secrets file" into "rewrote all of it", and a later diff cannot tell those
+    # apart. `newline=""` stops the write adding a second translation on Windows.
+    eol = "\r\n" if "\r\n" in text else "\n"
     tmp = path.with_name(path.name + ".tmp")
     try:
-        tmp.write_text("\n".join(out) + "\n", encoding="utf-8")
+        tmp.write_text(eol.join(out) + eol, encoding="utf-8", newline="")
         os.chmod(tmp, path.stat().st_mode & 0o777)
         os.replace(tmp, path)
     except OSError:
