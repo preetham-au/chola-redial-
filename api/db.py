@@ -274,10 +274,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
                                  "beep_tone_number_busy_not_reachable_switched_off",
                                  "voicemail", "voicemail_ivr", "telephony_failed",
                                  "dialer_nc", "new", "fresh", "not_dialed",
-                                 # Asked to be rung back, so ringing back the same
-                                 # day is the point -- 1,016 dials in the week to
-                                 # 12 Sep 2026 that used to be dropped.
-                                 "redial_required", ""],
+                                 # Both mean the customer wants another call, so
+                                 # making it the same day is the point rather than
+                                 # a mistake -- 1,016 `redial_required` dials in
+                                 # the week to 12 Sep 2026 used to be dropped.
+                                 # Note these two DID reach somebody, unlike every
+                                 # other slug here; they are on the list because
+                                 # the operator asked for them on 12 Sep 2026, not
+                                 # because the call went unanswered.
+                                 "redial_required", "follow_up_required", ""],
     # The fallback for a call that recorded NO disposition — 13,149 dials in the
     # week to 12 Sep 2026, a fifth of everything dialled, where the list above has
     # nothing to say. Under this many seconds nobody was really reached, so chase

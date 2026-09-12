@@ -687,7 +687,8 @@ AFTERNOON = datetime(2026, 8, 28, 14, 0)
     ("wrong_number", 3, False, "a wrong number stays wrong however brief"),
     ("contacted", 2, False, "a terminal outcome is not chased on a technicality"),
     ("redial_required", 600, True, "they asked to be rung back; ring them back"),
-    ("follow_up_required", 4, False, "somebody was reached and agreed a follow-up"),
+    ("follow_up_required", 600, True, "same -- another call is what was agreed"),
+    ("potentially_interested", 4, False, "reached and warm; chasing again today is pestering"),
     # --- arm 2: no disposition at all, so duration is the only evidence -----
     ("", None, True, "8,545 dnp rows carry no disposition; null = never connected"),
     ("", 4, True, "4,515 of 4,604 completed/(none) dials ran under 15s"),
@@ -767,14 +768,15 @@ def test_a_morning_conversation_with_no_disposition_does_not():
 
 
 def test_a_disposition_off_the_list_is_refused_whatever_the_duration():
-    """`follow_up_required` reaches this gate and is turned away by it.
+    """`potentially_interested` reaches this gate and is turned away by it.
 
-    Of the 52 known slugs only three get this far and are refused by their slug
-    alone: this one, `potentially_interested`, and -- until the operator asked
-    for it on 12 Sep 2026 -- `redial_required`. All three mean somebody was
-    actually reached, which is why a 4-second duration does not rescue them.
+    Of the 52 known slugs only three ever got this far and were refused by their
+    slug alone, all three meaning somebody was actually reached. The operator put
+    the other two -- `redial_required` and `follow_up_required` -- on the list on
+    12 Sep 2026, so this is the last one, and the only remaining proof that a
+    short duration does not rescue a lead the list has ruled out.
     """
-    decision = decide(_afternoon(stage="follow_up_required", last_call_duration_sec=2),
+    decision = decide(_afternoon(stage="potentially_interested", last_call_duration_sec=2),
                       AFTERNOON, SHIPPED)
     assert decision.action == SKIP_REACHED
 
