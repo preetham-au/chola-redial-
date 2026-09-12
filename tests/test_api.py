@@ -844,6 +844,79 @@ def test_trigger_under_dry_run_simulates_and_never_dials(client, no_network):
     assert history[0]["would_post"] == triggered["would_post"]
 
 
+def _live_test_call(client, monkeypatch, answer):
+    """Trigger one test call with DRY_RUN off and `_formi_post` answering `answer`."""
+    from engine.seed import TEST_NUMBERS
+    from api import routes_core
+
+    calls = []
+
+    def _fake_post(agent_id, lead_uuid, scheduled_time):
+        calls.append((agent_id, lead_uuid, scheduled_time))
+        return answer
+
+    monkeypatch.setattr(routes_core, "_formi_post", _fake_post)
+    monkeypatch.setenv("DRY_RUN", "0")
+    phone = TEST_NUMBERS[0]
+    out = client.post("/api/test-call/trigger",
+                      json={"phone": phone, "scheduled_time": TOMORROW_AM})
+    return phone, calls, out
+
+
+def test_a_live_test_call_unpacks_the_response_tuple_and_records_it(client, monkeypatch,
+                                                                    no_network):
+    """`_formi_post` answers `(response, attempts)` -- the live branch must unpack it.
+
+    That branch is unreachable while DRY_RUN is set, and every other test-call
+    test runs under the suite's DRY_RUN=1, so a straight contract mismatch sat
+    there unseen: `_test_call` bound the whole tuple to `response` and then read
+    `.status_code` off it. The first live test call, on 12 Sep 2026, reached
+    Formi and the phone rang -- and then the AttributeError meant
+    `_record_test_call` never ran, so the console held no record of a call it
+    had just placed. `_dial_live` has always unpacked it correctly; only this
+    caller did not.
+    """
+    class _Response:
+        status_code = 200
+        text = '{"scheduled": true}'
+
+    phone, calls, response = _live_test_call(client, monkeypatch, (_Response(), 1))
+    assert response.status_code == 200, response.text
+
+    out = response.json()
+    assert len(calls) == 1, "the live branch must reach _formi_post exactly once"
+    assert out["status"] == "posted"
+    assert out["http_status"] == 200
+    assert out["response"] == '{"scheduled": true}'
+    assert out["dry_run"] is False
+
+    # The record is the point: a call that went out has to be in the history.
+    history = client.get("/api/test-call/history").json()
+    assert history[0]["phone"] == phone and history[0]["status"] == "posted"
+    assert history[0]["dry_run"] is False and history[0]["http_status"] == 200
+
+
+def test_a_live_test_call_that_never_reached_formi_is_recorded_as_failed(client, monkeypatch,
+                                                                         no_network):
+    """`response` is None when every attempt died in transport.
+
+    The other half of the same contract, and it would crash on `None.status_code`
+    just as readily. A call nobody can prove went out still has to leave a row.
+    """
+    phone, calls, response = _live_test_call(client, monkeypatch, (None, 3))
+    assert response.status_code == 200, response.text
+
+    out = response.json()
+    assert len(calls) == 1
+    assert out["status"] == "failed"
+    assert out["http_status"] is None
+    assert "no response after 3 attempts" in out["response"]
+
+    history = client.get("/api/test-call/history").json()
+    assert history[0]["phone"] == phone and history[0]["status"] == "failed"
+    assert history[0]["dry_run"] is False
+
+
 def test_a_hand_picked_test_call_time_is_free_of_the_dial_window(client, no_network):
     """A rehearsal to your own number may go out at any hour.
 

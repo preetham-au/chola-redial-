@@ -1148,11 +1148,18 @@ def _test_call(conn: sqlite3.Connection, body: TestCallBody, commit: bool) -> di
     if dry_run():
         out["status"] = "simulated"
     else:
-        response = _formi_post(lead["agent_id"], lead["lead_uuid"], scheduled)
-        ok = 200 <= response.status_code < 300
+        # (response, attempts), and `response` is None when every attempt died
+        # in transport -- the same contract `_dial_live` reads. Unreachable under
+        # DRY_RUN, so binding the whole tuple here survived until the first live
+        # test call: Formi got the POST, the phone rang, and the AttributeError
+        # that followed skipped `_record_test_call` -- a placed call with nothing
+        # in the history to show for it.
+        response, attempts = _formi_post(lead["agent_id"], lead["lead_uuid"], scheduled)
+        ok = response is not None and 200 <= response.status_code < 300
         out["status"] = "posted" if ok else "failed"
-        out["http_status"] = response.status_code
-        out["response"] = response.text[:300]
+        out["http_status"] = response.status_code if response is not None else None
+        out["response"] = (response.text[:300] if response is not None
+                           else f"no response after {attempts} attempts")
     _record_test_call(conn, phone, lead, out, scheduled)
     return out
 
