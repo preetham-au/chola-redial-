@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from .db import (DEFAULT_CONFIG, db_path, dry_run, init_db, leads_source,
-                 load_env, session)
+                 load_env, save_env_value, session)
 from .day import router as day_router
 from .dial_log import router as dial_log_router
 from .routes_core import router as core_router
@@ -106,10 +106,16 @@ def set_dry_run(body: DryRunBody = Body(...)) -> dict[str, object]:
     checks it as its first statement, so writing os.environ here reaches all
     fifteen call sites immediately -- no restart, no second source of truth.
 
-    Deliberately NOT written to .env. A restart returns to whatever the file says,
-    which means the blast radius of leaving this switched on is one process life
-    rather than forever. The UI says so; do not "fix" it by persisting without
-    deciding that is what you want.
+    And then written through to .env, so it survives one. This used to be
+    deliberately in-memory only, on the argument that the blast radius of leaving
+    live dialling on was then one process life. In practice the operator went live
+    at 05:49 on 12 Sep 2026, a deploy restarted the service seven minutes later,
+    and the console was back to simulating without anyone asking it to -- which
+    reads as the switch being broken, and is the more dangerous failure of the
+    two: a dry run that is believed to be live places no calls at all. Persisting
+    was their call, made on that day. `persisted` in the response is the honest
+    answer for a deployment with no .env to write to; the UI stops promising a
+    restart-proof flip when it comes back false.
 
     Turning dialling ON costs the typed word GO LIVE, matching the approve dialog
     which costs DIAL. Turning it off is free -- a switch that is hard to flip back
@@ -119,12 +125,14 @@ def set_dry_run(body: DryRunBody = Body(...)) -> dict[str, object]:
     if going_live and body.confirm.strip().upper() != "GO LIVE":
         raise HTTPException(400, "Type GO LIVE to enable live dialling")
     os.environ["DRY_RUN"] = "0" if going_live else "1"
+    persisted = save_env_value("DRY_RUN", os.environ["DRY_RUN"])
     # Printed, not just returned: this is the one control that decides whether real
     # customers get called, and the journal is where that question gets answered later.
     print(f"DRY_RUN set to {os.environ['DRY_RUN']} "
-          f"({'LIVE DIALLING' if going_live else 'dry run'}) via /api/config/dry-run",
+          f"({'LIVE DIALLING' if going_live else 'dry run'}) via /api/config/dry-run"
+          f"{'' if persisted else ' (NOT persisted: no writable .env)'}",
           flush=True)
-    return {"dry_run": dry_run()}
+    return {"dry_run": dry_run(), "persisted": persisted}
 
 
 # chola-redial-sync.timer runs the same pull hourly at :15. That is the floor,

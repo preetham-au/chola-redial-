@@ -456,14 +456,17 @@ correct — the restart killed the thread too.
 
 | Method | Path | Notes |
 |---|---|---|
-| `POST` | `/api/config/dry-run` | `{"enabled": true}` → back to dry run, free. `{"enabled": false, "confirm": "GO LIVE"}` → **live dialling**; **400** without that exact word. Returns `{dry_run}`. |
+| `POST` | `/api/config/dry-run` | `{"enabled": true}` → back to dry run, free. `{"enabled": false, "confirm": "GO LIVE"}` → **live dialling**; **400** without that exact word. Returns `{dry_run, persisted}`. |
 
-Deliberately **not** written to `.env`. A restart returns to whatever the file
-says, so the blast radius of leaving live dialling on is one process life rather
-than forever. Every dialling helper re-reads `DRY_RUN` as its first statement, so
-the switch reaches all of them without a restart. Each flip is printed to the
-journal — this is the one control that decides whether real customers get called,
-and the journal is where that question gets answered afterwards.
+Every dialling helper re-reads `DRY_RUN` as its first statement, so the switch
+reaches all of them without a restart — and it is written through to the `DRY_RUN`
+line of the deployment's `.env` (`REDIAL_ENV_FILE`, else `<root>/.env`), so it
+survives one too. That write replaces the one line and leaves the rest of the file
+byte-for-byte; where there is no `.env` to write to, the flip still takes effect in
+the process and `persisted` comes back `false` — the UI's cue to stop promising it
+lasts. Each flip is printed to the journal, persisted or not: this is the one
+control that decides whether real customers get called, and the journal is where
+that question gets answered afterwards.
 
 ### Misc
 `GET /api/health` → `{ "ok": true, "dry_run": true, "db": "redial.db",

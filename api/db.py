@@ -17,6 +17,11 @@ ROOT = Path(__file__).resolve().parent.parent
 SCHEMA = Path(__file__).resolve().parent / "schema.sql"
 
 
+def env_path() -> Path:
+    """Read at call time so tests can point REDIAL_ENV_FILE at a temp file."""
+    return Path(os.environ.get("REDIAL_ENV_FILE") or ROOT / ".env")
+
+
 def load_env(path: Path | None = None) -> None:
     """Read `KEY=value` lines from the project .env into os.environ.
 
@@ -25,7 +30,7 @@ def load_env(path: Path | None = None) -> None:
     no-op, which is what keeps the seed path credential-free.
     """
     try:
-        text = (path or ROOT / ".env").read_text(encoding="utf-8-sig")
+        text = (path or env_path()).read_text(encoding="utf-8-sig")
     except (OSError, UnicodeDecodeError):
         return
     for line in text.splitlines():
@@ -34,6 +39,58 @@ def load_env(path: Path | None = None) -> None:
             continue
         key, _, value = line.partition("=")
         os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+def save_env_value(key: str, value: str) -> bool:
+    """Rewrite one `KEY=value` line in the .env, leaving every other byte alone.
+
+    Written for the dry-run switch, which the operator asked on 12 Sep 2026 to
+    survive a restart: before that, a deploy's `systemctl restart` silently put
+    live dialling back to a dry run and the console looked broken.
+
+    The file it edits holds the Metabase key and the Formi token, so:
+      * it edits in place and appends only when the key is genuinely absent --
+        no rewriting from a parsed dict, which would drop comments and quoting;
+      * it writes a temp file in the same directory and `os.replace`s it, so a
+        crash mid-write leaves the old file intact rather than half of one;
+      * it carries the original file's mode across, so persisting a toggle can
+        never widen a 0600 secrets file to 0644;
+      * a missing or unwritable file returns False instead of raising. The
+        caller has already set os.environ by then -- the switch works either
+        way, and failing to write must not fail the request that flipped it.
+
+    Only `load_env`'s own grammar is honoured: first `=` splits, `#` is a
+    comment. Every matching line is replaced, so a file that already carried the
+    key twice cannot come back from a restart holding the stale one.
+    """
+    path = env_path()
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError):
+        return False
+
+    line = f"{key}={value}"
+    out, found = [], False
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if (not stripped.startswith("#") and "=" in stripped
+                and stripped.partition("=")[0].strip() == key):
+            out.append(line)
+            found = True
+        else:
+            out.append(raw)
+    if not found:
+        out.append(line)
+
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text("\n".join(out) + "\n", encoding="utf-8")
+        os.chmod(tmp, path.stat().st_mode & 0o777)
+        os.replace(tmp, path)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        return False
+    return True
 
 
 def purge_campaigns(conn: sqlite3.Connection, keep_ids: Iterable[int]) -> int:

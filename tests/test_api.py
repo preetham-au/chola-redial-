@@ -8,7 +8,8 @@ import sqlite3
 import pytest
 import requests
 
-from api.db import DEFAULT_CONFIG, NO_TOKEN, db_path, formi_token, now_ist, with_defaults
+from api.db import (DEFAULT_CONFIG, NO_TOKEN, db_path, formi_token, now_ist,
+                    save_env_value, with_defaults)
 from engine.stage_ops import apply_red_overrides
 
 # The seed anchors every RED to the day it was written, so bucket-sensitive
@@ -65,12 +66,96 @@ def test_dry_run_toggle_costs_a_typed_word_one_way_only(client):
         assert client.get("/api/health").json()["dry_run"] is True
 
         live = client.post("/api/config/dry-run", json={"enabled": False, "confirm": "go live"})
-        assert live.status_code == 200 and live.json() == {"dry_run": False}
+        assert live.status_code == 200 and live.json()["dry_run"] is False
         assert client.get("/api/health").json()["dry_run"] is False
 
         # Back to safe: no word, no argument.
-        assert client.post("/api/config/dry-run", json={"enabled": True}).json() == {"dry_run": True}
+        assert client.post("/api/config/dry-run", json={"enabled": True}).json()["dry_run"] is True
     finally:
+        os.environ["DRY_RUN"] = "1"
+
+
+def test_save_env_value_rewrites_one_line_and_leaves_the_secrets_alone(tmp_path, monkeypatch):
+    """The .env this writes into holds live credentials. Touch one line, no others.
+
+    Asserted byte-for-byte on the neighbours rather than by re-parsing, because
+    a rewrite that preserves the *values* while dropping the comments, the
+    blank line or the quoting has still damaged a file nobody keeps a copy of.
+    """
+    env = tmp_path / ".env"
+    original = ('# chola\nMETABASE_API_KEY="mb_secret/with=equals"\n'
+                "DRY_RUN=1\n\nFORMI_API_KEY=tok\n")
+    env.write_text(original, encoding="utf-8")
+    monkeypatch.setenv("REDIAL_ENV_FILE", str(env))
+
+    assert save_env_value("DRY_RUN", "0") is True
+    after = env.read_text(encoding="utf-8")
+    assert after == original.replace("DRY_RUN=1", "DRY_RUN=0")
+    # And no temp file left lying next to a secrets file.
+    assert sorted(p.name for p in tmp_path.iterdir()) == [".env"]
+
+    # A key the file has never carried is appended, not silently dropped.
+    assert save_env_value("LEADS_SOURCE", "warehouse") is True
+    assert env.read_text(encoding="utf-8").endswith("\nLEADS_SOURCE=warehouse\n")
+    assert 'METABASE_API_KEY="mb_secret/with=equals"' in env.read_text(encoding="utf-8")
+
+
+def test_save_env_value_reports_failure_instead_of_raising(tmp_path, monkeypatch):
+    """No .env on disk is a deployment this cannot persist to, not an exception.
+
+    The caller has already set os.environ by then: the switch works either way,
+    and failing to write a file must not fail the request that flipped it.
+    """
+    monkeypatch.setenv("REDIAL_ENV_FILE", str(tmp_path / "nothing-here.env"))
+    assert save_env_value("DRY_RUN", "0") is False
+    assert not (tmp_path / "nothing-here.env").exists(), "must not create one either"
+
+
+def test_going_live_survives_a_restart(client, tmp_path, monkeypatch):
+    """The flip is written to .env, so a restart comes back up dialling.
+
+    `load_env` is what a restart runs, so this asserts the round trip through it
+    rather than just the file contents -- the file being right is worthless if
+    the loader would not pick it up.
+    """
+    import os
+
+    from api.db import load_env
+
+    env = tmp_path / ".env"
+    env.write_text("DRY_RUN=1\nFORMI_API_KEY=tok\n", encoding="utf-8")
+    monkeypatch.setenv("REDIAL_ENV_FILE", str(env))
+    try:
+        live = client.post("/api/config/dry-run", json={"enabled": False, "confirm": "GO LIVE"})
+        assert live.json() == {"dry_run": False, "persisted": True}
+        assert "DRY_RUN=0" in env.read_text(encoding="utf-8")
+
+        # What a restart does: fresh process, environment from the file.
+        del os.environ["DRY_RUN"]
+        load_env()
+        assert os.environ["DRY_RUN"] == "0", "a restart must come back up live"
+
+        back = client.post("/api/config/dry-run", json={"enabled": True})
+        assert back.json() == {"dry_run": True, "persisted": True}
+        assert "DRY_RUN=1" in env.read_text(encoding="utf-8")
+        assert "FORMI_API_KEY=tok" in env.read_text(encoding="utf-8")
+    finally:
+        os.environ["DRY_RUN"] = "1"
+
+
+def test_a_deployment_with_no_env_file_still_flips_but_says_it_did_not_persist(client,
+                                                                              tmp_path,
+                                                                              monkeypatch):
+    """`persisted: false` is the UI's cue to stop promising the flip survives."""
+    import os
+
+    monkeypatch.setenv("REDIAL_ENV_FILE", str(tmp_path / "absent.env"))
+    try:
+        out = client.post("/api/config/dry-run",
+                          json={"enabled": False, "confirm": "GO LIVE"}).json()
+        assert out == {"dry_run": False, "persisted": False}
+    finally:
+        client.post("/api/config/dry-run", json={"enabled": True})
         os.environ["DRY_RUN"] = "1"
 
 

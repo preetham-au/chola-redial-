@@ -26,11 +26,17 @@ export function DryRunToggle() {
       // The server is the only source of truth for this; echo what it reports
       // rather than what was asked for.
       useStore.setState({ health: { ...health, dry_run: res.dry_run } });
+      // `persisted === false` means the server had no .env to write to, so the
+      // next restart silently undoes this. Said out loud on the way to LIVE --
+      // that is the direction where believing a stale badge costs real calls.
+      const fragile = res.persisted === false && !res.dry_run
+        ? ' Could not save it — a restart will put this back to a dry run.'
+        : '';
       toast(
         res.dry_run ? 'ok' : 'bad',
         res.dry_run
           ? 'Dry run. Approving now only simulates — nothing reaches Formi.'
-          : 'LIVE DIALLING is on. Approving now calls real customers.',
+          : `LIVE DIALLING is on. Approving now calls real customers.${fragile}`,
       );
       setOpen(false);
       setTyped('');
@@ -81,9 +87,8 @@ export function DryRunToggle() {
             queued so far is affected — this changes what the <em>next</em> approve does.
           </p>
           <p className="field-hint">
-            Held in the server's environment, so a restart returns it to whatever the
-            deployment's .env says. Check the badge before approving; do not rely on
-            this having stayed on.
+            This one sticks. It is saved on the server, so a restart or a deploy comes
+            back up still dialling — it stays on until somebody turns it off here.
           </p>
           <TypeToConfirm
             word="GO LIVE"

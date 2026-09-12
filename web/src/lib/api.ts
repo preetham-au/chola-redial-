@@ -156,12 +156,14 @@ async function listCampaigns(agent_id?: number, includeHidden = false): Promise<
 export const api = {
   health: () => req<Health>('/api/health', undefined, () => mockHealth),
   /* Switching dialling ON needs confirm='GO LIVE'; switching it off needs nothing.
-     The server holds this in its environment, so it lasts until the next restart. */
+     The server writes it through to its .env, so it survives a restart --
+     `persisted` comes back false where there was no .env to write to, and the
+     toggle stops promising that it lasts. */
   setDryRun: (enabled: boolean, confirm = '') =>
-    req<{ dry_run: boolean }>(
+    req<{ dry_run: boolean; persisted?: boolean }>(
       '/api/config/dry-run',
       json({ enabled, confirm }),
-      () => ({ dry_run: enabled }),
+      () => ({ dry_run: enabled, persisted: true }),
     ),
 
   /* Returns as soon as the pull starts; poll syncStatus for the outcome. */

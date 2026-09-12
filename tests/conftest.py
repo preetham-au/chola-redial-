@@ -10,6 +10,10 @@ import pytest
 # Set before anything imports api.db, which reads these at call time.
 _TMP = Path(tempfile.mkdtemp(prefix="redial-test-"))
 os.environ["REDIAL_DB"] = str(_TMP / "test.db")
+# The dry-run switch persists itself to the .env now. Pointed at a path that does
+# not exist so the suite cannot rewrite a developer's real one -- `save_env_value`
+# treats an absent file as "nothing to persist to" and says so in its return.
+os.environ["REDIAL_ENV_FILE"] = str(_TMP / "absent.env")
 os.environ["DRY_RUN"] = "1"
 os.environ["LEADS_SOURCE"] = "seed"
 
