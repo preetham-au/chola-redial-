@@ -764,9 +764,12 @@ def _planned_pm(campaign_id: int) -> set[str]:
 
 
 @pytest.mark.parametrize("stage, duration, again, why", [
+    # A disposition is present, so it alone decides -- duration is not consulted.
     ("did_not_pick", None, True, "nobody picked up this morning"),
-    ("hung_up", 6.0, True, "six seconds is not a conversation"),
-    ("hung_up", 40.0, False, "forty seconds is, so stop calling them"),
+    ("hung_up", 6.0, True, "on the re-dial list"),
+    ("hung_up", 40.0, True, "still on it -- the length of the call is not a vote"),
+    ("redial_required", 2.0, False, "not on the list, so not chased however brief"),
+    # No disposition, so the duration is the only evidence there is.
     ("", 4.0, True, "no disposition recorded, and the call was too short to be one"),
     ("", 300.0, False, "no disposition, but five minutes says they were reached"),
 ])

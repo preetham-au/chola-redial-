@@ -657,8 +657,13 @@ def test_an_operator_added_exclusion_is_not_undone_by_a_mandatory_day():
 #
 # The operator's rule: "monitor for red 0-7 and -1 to -3 -- if they have not
 # picked or hung up or call duration is less than 15s, call them again the same
-# day". The numbers in these tests are the live ones, counted over the seven days
-# to 12 Sep 2026 for outlet 1497, because the rule is only worth what the data
+# day", and then, precisely: ">= logic should only be used when disposition is
+# not there, if not based on disposition only".
+#
+# So there are two arms and they never overlap. A disposition is an answer and is
+# taken at its word. Duration is consulted ONLY where there is no slug to read --
+# 13,149 dials of the 62,423 in the seven days to 12 Sep 2026 for outlet 1497.
+# The numbers below are that week's, because the rule is only worth what the data
 # says it separates. See `wants_second_call`.
 # ---------------------------------------------------------------------------
 
@@ -667,38 +672,52 @@ AFTERNOON = datetime(2026, 8, 28, 14, 0)
 
 
 @pytest.mark.parametrize("stage, duration, again, why", [
-    # Never connected. Duration is null for practically every row of these two
-    # stages, and that null IS the evidence -- nothing picked up.
-    ("did_not_pick", None, True, "28,186 dnp dials, 28,184 with no duration"),
-    ("telephony_failed", None, True, "3,015 dials, 3,014 with no duration"),
-    ("", None, True, "8,545 dnp rows carry no disposition at all"),
-    # Connected, and the length is what separates them. `hung_up` alone is not
-    # enough: it covers both a 6-second hang-up and a finished conversation.
+    # --- arm 1: a disposition is present, so it alone decides ---------------
+    ("did_not_pick", None, True, "28,186 dnp dials, on the re-dial list"),
+    ("telephony_failed", None, True, "3,015 dials, on the list"),
+    ("voicemail_ivr", 30, True, "a recording answering for 30s is still no contact"),
+    # The duration is deliberately ignored on these two. `hung_up` is on the
+    # list, so a 40-second hang-up is chased exactly like a 6-second one: to stop
+    # chasing it the operator takes `hung_up` off the list, which is the knob.
     ("hung_up", 6, True, "4,582 of 8,912 hung_up dials ran under 15s"),
-    ("hung_up", 40, False, "the other 4,330 ran 15s or longer"),
-    ("hung_up", 15, False, "the threshold itself counts as reached"),
-    ("", 4, True, "4,515 of 4,604 completed/(none) dials ran under 15s"),
-    ("", 120, False, "1,911 complete/(none) dials were real conversations"),
-    # A recording answered. 720 of 725 voicemail_ivr dials ran past 15s and
-    # reached nobody, so duration must not be allowed to speak for them.
-    ("voicemail_ivr", 30, True, "an IVR talking for 30s is not a contact"),
-    # Not on the re-dial list at all, so the duration never gets a vote.
+    ("hung_up", 40, True, "and the other 4,330 ran longer -- the slug still decides"),
+    ("hung_up", 600, True, "no length of call overrides a slug on the list"),
+    # Not on the list, so no duration saves them either. Symmetry is the point:
+    # the slug is the whole answer in both directions.
     ("wrong_number", 3, False, "a wrong number stays wrong however brief"),
     ("contacted", 2, False, "a terminal outcome is not chased on a technicality"),
+    ("redial_required", 4, False, "not on the shipped list -- see the note below"),
+    # --- arm 2: no disposition at all, so duration is the only evidence -----
+    ("", None, True, "8,545 dnp rows carry no disposition; null = never connected"),
+    ("", 4, True, "4,515 of 4,604 completed/(none) dials ran under 15s"),
+    ("", 120, False, "1,911 complete/(none) dials were real conversations"),
+    ("", 15, False, "the threshold itself counts as reached"),
 ])
 def test_who_has_earned_a_second_call_today(stage, duration, again, why):
     assert SHIPPED.wants_second_call(stage, duration) is again, why
 
 
+def test_the_duration_fallback_never_overrules_a_disposition():
+    """The arms do not overlap, whatever `short_call_seconds` is set to.
+
+    Pinned separately from the table because it is the whole shape of the rule:
+    changing the threshold must move only the undispositioned calls.
+    """
+    for seconds in (0, 15, 900):
+        cfg = red_config_from_body({**API_DEFAULTS, "short_call_seconds": seconds})
+        assert cfg.wants_second_call("hung_up", 600) is True
+        assert cfg.wants_second_call("wrong_number", 1) is False
+
+
 def test_an_unreadable_duration_is_treated_as_no_call_rather_than_a_long_one():
     """One extra dial costs less than dropping a lead days from expiry."""
-    assert SHIPPED.wants_second_call("hung_up", "not-a-number") is True
+    assert SHIPPED.wants_second_call("", "not-a-number") is True
 
 
-def test_the_duration_test_can_be_switched_off():
-    """0 restores "the disposition decides", which is how this shipped before."""
+def test_the_duration_fallback_can_be_switched_off():
+    """0 means an undispositioned call is always chased, however long it ran."""
     off = red_config_from_body({**API_DEFAULTS, "short_call_seconds": 0})
-    assert off.wants_second_call("hung_up", 600) is True
+    assert off.wants_second_call("", 600) is True
 
 
 def _afternoon(**over):
@@ -726,12 +745,36 @@ def test_a_short_morning_call_earns_the_afternoon_one():
     assert decision.action == SCHEDULE and decision.bucket == "F5"
 
 
-def test_a_real_morning_conversation_does_not():
+def test_a_long_one_on_the_same_disposition_earns_it_too():
+    """`hung_up` is on the list, so its duration is not consulted at all.
+
+    The pair above and here is the operator's "if not, based on disposition only"
+    in one line: same slug, 6s and 40s, same answer.
+    """
     decision = decide(_afternoon(stage="hung_up", last_call_duration_sec=40),
+                      AFTERNOON, SHIPPED)
+    assert decision.action == SCHEDULE and decision.bucket == "F5"
+
+
+def test_a_morning_conversation_with_no_disposition_does_not():
+    """The fallback arm: no slug to read, so 120 seconds is the only evidence."""
+    decision = decide(_afternoon(stage="", last_call_duration_sec=120),
                       AFTERNOON, SHIPPED)
     assert decision.action == SKIP_REACHED
     assert decision.schedule is False
-    assert "40" in decision.reason                  # the operator can see why
+    assert "120" in decision.reason                 # the operator can see why
+
+
+def test_a_disposition_off_the_list_is_refused_whatever_the_duration():
+    """`redial_required` is not on the shipped `second_call_dispositions`.
+
+    Pinned because it is the one live slug that reaches this gate and is turned
+    away by it -- 1,016 dials in the week to 12 Sep 2026. If the operator wants
+    those chased the fix is the config list, and this test is what will change.
+    """
+    decision = decide(_afternoon(stage="redial_required", last_call_duration_sec=2),
+                      AFTERNOON, SHIPPED)
+    assert decision.action == SKIP_REACHED
 
 
 def test_a_morning_that_nobody_answered_earns_it_with_no_duration_at_all():

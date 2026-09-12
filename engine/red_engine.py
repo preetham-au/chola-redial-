@@ -453,48 +453,38 @@ class RedConfig:
     # says the lead has already been dialled since midnight.
     second_call_dispositions: frozenset[str] = frozenset()
 
-    # How short a connected call has to be before it does not count as having
-    # reached anybody. The disposition alone is not enough: over the seven days
-    # to 12 Sep 2026 this outlet logged 8,912 `hung_up` dials, and 4,330 of them
-    # -- 49% -- ran 15s or longer. Those are conversations that happened and
-    # ended, not calls that need chasing the same afternoon.
-    short_call_seconds: int = 15
-
-    # Dispositions where duration proves nothing, because the seconds were spent
-    # talking to a machine. `voicemail_ivr` is the case that forces this to exist:
-    # 720 of its 725 dials in that week ran past 15s, so a plain duration test
-    # would rule that a recorded greeting had been successfully reached.
+    # The FALLBACK for a lead whose first call recorded no disposition at all --
+    # 13,149 dials in the week to 12 Sep 2026, a fifth of everything dialled. With
+    # no slug to read, the only evidence left is how long the call ran: under this
+    # many seconds nobody was really reached, so chase it. 0 switches the fallback
+    # off and an undispositioned call is always chased.
     #
-    # Only consulted for slugs already on `second_call_dispositions` -- this
-    # exempts from the duration test, it never adds anyone to the re-dial set.
-    no_contact_dispositions: frozenset[str] = frozenset(
-        {"voicemail", "voicemail_ivr", "dialer_nc",
-         "beep_tone_number_busy_not_reachable_switched_off"})
+    # Never consulted when a disposition IS present. A slug is an answer and is
+    # taken at its word, however long the call ran.
+    short_call_seconds: int = 15
 
     def wants_second_call(self, stage: Any, duration_sec: Any = None) -> bool:
         """Has today's first call left this lead still worth calling again?
 
-        `duration_sec` is the length of that call, or None when the warehouse has
-        none -- which in this data is not missing information but its own answer:
-        duration is populated for every `complete`/`completed` row and null for
-        essentially every `dnp`/`telephony_failed` one, so a null means the call
-        never connected at all.
+        The disposition decides whenever there is one. `duration_sec` is only the
+        fallback for when there is not -- and a null duration is not missing
+        information there but its own answer: the warehouse populates it for every
+        `complete`/`completed` row and leaves it empty for essentially every
+        `dnp`/`telephony_failed` one, so a null means the call never connected.
         """
         stage = str(stage or "").strip().lower()
-        # A blank disposition is a MISSING outcome, not a terminal one, so the
-        # allow-list has no opinion to offer and the duration below decides. It
-        # gets its own branch because the list cannot hold it: every list in this
-        # config is parsed with `discard("")`, so the `""` that `db.DEFAULT_CONFIG`
-        # writes into `second_call_dispositions` never survives into the frozenset
-        # -- which silently excluded the 13,149 dials of the week to 12 Sep 2026
-        # that carried no disposition, a fifth of everything dialled.
-        if stage and self.second_call_dispositions \
-                and stage not in self.second_call_dispositions:
-            return False                    # a terminal outcome: nothing to chase
+        if stage:
+            # An operator who wants `hung_up` at 40s left alone takes `hung_up` off
+            # the list; that is the knob, not a duration threshold applied behind
+            # the slug's back.
+            return (not self.second_call_dispositions
+                    or stage in self.second_call_dispositions)
+        # No disposition recorded. Note the list cannot answer for this case even
+        # in principle: every list in this config is parsed with `discard("")`, so
+        # the `""` that `db.DEFAULT_CONFIG` writes into `second_call_dispositions`
+        # never survives into the frozenset.
         if not self.short_call_seconds:
-            return True                     # duration test switched off
-        if stage in self.no_contact_dispositions:
-            return True                     # a machine answered; its seconds mean nothing
+            return True                     # fallback switched off
         if duration_sec is None:
             return True                     # never connected
         try:
@@ -1304,24 +1294,14 @@ def config_from_settings(settings: dict[str, Any] | None) -> RedConfig:
         cleaned.discard("")
         config = replace(config, second_call_dispositions=frozenset(cleaned))
 
-    raw_no_contact = settings.get("no_contact_dispositions")
-    if raw_no_contact is not None:
-        if not isinstance(raw_no_contact, (list, tuple, set, frozenset)):
-            raise ValueError("no_contact_dispositions must be a list of slugs")
-        # An empty list is honoured here, unlike bucket_dispositions: clearing it
-        # means "judge every slug by its duration", which is a real choice.
-        cleaned = {str(s).strip().lower() for s in raw_no_contact}
-        cleaned.discard("")
-        config = replace(config, no_contact_dispositions=frozenset(cleaned))
-
     numeric: dict[str, Any] = {}
     for key, caster, minimum in (
         ("calls_per_day_cap", int, 1),
         ("same_day_gap_hours", float, 0.0),
         ("spread_tolerance", float, 0.1),
         ("max_attempts", int, 0),
-        # 0 disables the duration arm: every slug on second_call_dispositions
-        # earns its second call however long the first one ran.
+        # 0 disables the fallback: a call that recorded no disposition is always
+        # chased, however long it ran.
         ("short_call_seconds", int, 0),
     ):
         if settings.get(key) not in (None, ""):

@@ -266,23 +266,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # "2nd call only if the 1st was not answered", so this is the no-contact set:
     # a lead who picked up this morning is not called again this afternoon.
     # Empty would mean everyone, which is the historic (wrong) behaviour.
+    #
+    # This list IS the decision whenever the first call recorded a disposition.
+    # Duration never overrides it — to stop chasing a slug, take it off the list.
     "second_call_dispositions": ["did_not_pick", "hung_up", "hung_up_no_contact",
                                  "unreachable", "rnr",
                                  "beep_tone_number_busy_not_reachable_switched_off",
                                  "voicemail", "voicemail_ivr", "telephony_failed",
                                  "dialer_nc", "new", "fresh", "not_dialed", ""],
-    # "Not answered" is not the same as "has a no-contact disposition". Of the
-    # 8,912 `hung_up` dials this outlet logged in the week to 12 Sep 2026, 4,330
-    # ran 15s or longer -- a conversation that happened and ended. The list above
-    # decides WHO may be chased; this decides whether the first call actually
-    # left anything to chase. 0 switches the duration test off.
+    # The fallback for a call that recorded NO disposition — 13,149 dials in the
+    # week to 12 Sep 2026, a fifth of everything dialled, where the list above has
+    # nothing to say. Under this many seconds nobody was really reached, so chase
+    # it. 0 switches the fallback off and every such call is chased.
     "short_call_seconds": 15,
-    # Slugs the duration test must not judge, because the seconds were spent on a
-    # recording. 720 of 725 `voicemail_ivr` dials that week ran past 15s and
-    # reached nobody. Narrowing scope only: a slug absent from the list above is
-    # still never re-dialled, whatever this says.
-    "no_contact_dispositions": ["voicemail", "voicemail_ivr", "dialer_nc",
-                                "beep_tone_number_busy_not_reachable_switched_off"],
     "mandatory_days": [1, 0],
     # The only dispositions a mandatory day (RED−1, RED) may NOT override. The
     # client's rule is "all cases excluding the renewed and DND cases" — so on
