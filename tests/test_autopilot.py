@@ -768,7 +768,8 @@ def _planned_pm(campaign_id: int) -> set[str]:
     ("did_not_pick", None, True, "nobody picked up this morning"),
     ("hung_up", 6.0, True, "on the re-dial list"),
     ("hung_up", 40.0, True, "still on it -- the length of the call is not a vote"),
-    ("redial_required", 2.0, False, "not on the list, so not chased however brief"),
+    ("redial_required", 600.0, True, "they asked to be rung back; ring them back"),
+    ("follow_up_required", 2.0, False, "reached, and not on the list, however brief"),
     # No disposition, so the duration is the only evidence there is.
     ("", 4.0, True, "no disposition recorded, and the call was too short to be one"),
     ("", 300.0, False, "no disposition, but five minutes says they were reached"),

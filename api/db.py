@@ -273,7 +273,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
                                  "unreachable", "rnr",
                                  "beep_tone_number_busy_not_reachable_switched_off",
                                  "voicemail", "voicemail_ivr", "telephony_failed",
-                                 "dialer_nc", "new", "fresh", "not_dialed", ""],
+                                 "dialer_nc", "new", "fresh", "not_dialed",
+                                 # Asked to be rung back, so ringing back the same
+                                 # day is the point -- 1,016 dials in the week to
+                                 # 12 Sep 2026 that used to be dropped.
+                                 "redial_required", ""],
     # The fallback for a call that recorded NO disposition — 13,149 dials in the
     # week to 12 Sep 2026, a fifth of everything dialled, where the list above has
     # nothing to say. Under this many seconds nobody was really reached, so chase
