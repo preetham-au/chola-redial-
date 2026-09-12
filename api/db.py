@@ -262,27 +262,24 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # bucket -> slugs that bucket alone may auto-dial. Absent or empty = inherit
     # `auto_dispositions`, so {} is exactly the previous behaviour.
     "bucket_dispositions": {},
-    # Who gets the SECOND call of the day in F5/E0/F6/M0. The client's rule is
-    # "2nd call only if the 1st was not answered", so this is the no-contact set:
-    # a lead who picked up this morning is not called again this afternoon.
-    # Empty would mean everyone, which is the historic (wrong) behaviour.
+    # Which dispositions earn the SECOND call of the day in F5/E0/F6/M0, when the
+    # first call recorded one. This list IS the decision in that case; duration
+    # never overrides it. EMPTY MEANS EVERY DISPOSITION.
     #
-    # This list IS the decision whenever the first call recorded a disposition.
-    # Duration never overrides it — to stop chasing a slug, take it off the list.
-    "second_call_dispositions": ["did_not_pick", "hung_up", "hung_up_no_contact",
-                                 "unreachable", "rnr",
-                                 "beep_tone_number_busy_not_reachable_switched_off",
-                                 "voicemail", "voicemail_ivr", "telephony_failed",
-                                 "dialer_nc", "new", "fresh", "not_dialed",
-                                 # Both mean the customer wants another call, so
-                                 # making it the same day is the point rather than
-                                 # a mistake -- 1,016 `redial_required` dials in
-                                 # the week to 12 Sep 2026 used to be dropped.
-                                 # Note these two DID reach somebody, unlike every
-                                 # other slug here; they are on the list because
-                                 # the operator asked for them on 12 Sep 2026, not
-                                 # because the call went unanswered.
-                                 "redial_required", "follow_up_required", ""],
+    # Empty is the operator's choice of 12 Sep 2026, reached by elimination: they
+    # added `redial_required`, then `follow_up_required`, which left
+    # `potentially_interested` as the single slug of 52 that both reached this
+    # gate and was refused by it. Naming 17 slugs to exclude one is a list that
+    # says nothing, so it is empty and the rule is stated once, here.
+    #
+    # This does NOT re-dial DND, renewed, wrong-number or terminal leads. Only 18
+    # of the 52 slugs reach this gate; `decide` refuses the rest on class, well
+    # before it. `never_dial` below is the list that protects those, not this one.
+    # `test_emptying_the_list_does_not_reach_the_protected_dispositions` pins it.
+    #
+    # So the only thing that now refuses a same-day second call is the fallback
+    # underneath: a call that recorded NO disposition and ran 15s or longer.
+    "second_call_dispositions": [],
     # The fallback for a call that recorded NO disposition — 13,149 dials in the
     # week to 12 Sep 2026, a fifth of everything dialled, where the list above has
     # nothing to say. Under this many seconds nobody was really reached, so chase

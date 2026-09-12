@@ -721,8 +721,10 @@ def test_a_paused_campaign_is_neither_planned_nor_approved(client, armed):
 # runs -- and every lead then arrives with duration=None, which reads as "the
 # call never connected" and re-dials everybody who was already reached.
 #
-# Checked, not assumed: neutering the SKIP_REACHED gate in red_engine turns
-# exactly the two `False` cases below red.
+# Checked, not assumed: neutering the SKIP_REACHED gate in red_engine turns the
+# single `False` case below red. There is only one left because the operator
+# emptied `second_call_dispositions` on 12 Sep 2026 -- an undispositioned call
+# that ran long is now the only thing that refuses a second call.
 # ---------------------------------------------------------------------------
 
 def _dialled_this_morning(campaign_id: int, stage: str, duration) -> str:
@@ -770,7 +772,7 @@ def _planned_pm(campaign_id: int) -> set[str]:
     ("hung_up", 40.0, True, "still on it -- the length of the call is not a vote"),
     ("redial_required", 600.0, True, "they asked to be rung back; ring them back"),
     ("follow_up_required", 600.0, True, "same -- another call is what was agreed"),
-    ("potentially_interested", 2.0, False, "reached, and not on the list, however brief"),
+    ("potentially_interested", 2.0, True, "the shipped list is empty: every slug qualifies"),
     # No disposition, so the duration is the only evidence there is.
     ("", 4.0, True, "no disposition recorded, and the call was too short to be one"),
     ("", 300.0, False, "no disposition, but five minutes says they were reached"),

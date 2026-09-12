@@ -665,31 +665,48 @@ def test_an_operator_added_exclusion_is_not_undone_by_a_mandatory_day():
 # 13,149 dials of the 62,423 in the seven days to 12 Sep 2026 for outlet 1497.
 # The numbers below are that week's, because the rule is only worth what the data
 # says it separates. See `wants_second_call`.
+#
+# The operator emptied `second_call_dispositions` on 12 Sep 2026, having added
+# slugs to it twice that day. Empty means every disposition earns the second
+# call, so arm 1 now says yes to everything that reaches it -- and the only thing
+# that can still refuse a second call is arm 2: a call that recorded NO
+# disposition and ran 15s or longer.
+#
+# That is a much narrower gate than it looks, because it is not the only one. Of
+# 52 known slugs only 18 reach `wants_second_call` at all; the other 34 -- DND,
+# renewed, wrong_number, terminal and callback outcomes -- are refused earlier by
+# `decide`, and emptying this list does not reach them. `test_emptying_the_list`
+# below pins exactly that.
 # ---------------------------------------------------------------------------
 
 SHIPPED = red_config_from_body(API_DEFAULTS)
+# The same config with a list, to keep the list MECHANISM pinned now that the
+# shipped one is empty. Without this, nothing would test that a slug off the list
+# is refused -- and the day the operator puts a slug back, that has to still work.
+LISTED = red_config_from_body({**API_DEFAULTS,
+                               "second_call_dispositions": ["did_not_pick", "hung_up"]})
 AFTERNOON = datetime(2026, 8, 28, 14, 0)
 
 
 @pytest.mark.parametrize("stage, duration, again, why", [
-    # --- arm 1: a disposition is present, so it alone decides ---------------
-    ("did_not_pick", None, True, "28,186 dnp dials, on the re-dial list"),
-    ("telephony_failed", None, True, "3,015 dials, on the list"),
+    # --- arm 1: a disposition is present, and the empty list says yes to all -
+    ("did_not_pick", None, True, "28,186 dnp dials"),
+    ("telephony_failed", None, True, "3,015 dials"),
     ("voicemail_ivr", 30, True, "a recording answering for 30s is still no contact"),
-    # The duration is deliberately ignored on these two. `hung_up` is on the
-    # list, so a 40-second hang-up is chased exactly like a 6-second one: to stop
-    # chasing it the operator takes `hung_up` off the list, which is the knob.
+    # The duration is deliberately ignored on all three: a 600-second call and a
+    # 6-second one carry the same slug and get the same answer.
     ("hung_up", 6, True, "4,582 of 8,912 hung_up dials ran under 15s"),
     ("hung_up", 40, True, "and the other 4,330 ran longer -- the slug still decides"),
-    ("hung_up", 600, True, "no length of call overrides a slug on the list"),
-    # Not on the list, so no duration saves them either. Symmetry is the point:
-    # the slug is the whole answer in both directions.
-    ("wrong_number", 3, False, "a wrong number stays wrong however brief"),
-    ("contacted", 2, False, "a terminal outcome is not chased on a technicality"),
+    ("hung_up", 600, True, "no length of call overrides a disposition"),
     ("redial_required", 600, True, "they asked to be rung back; ring them back"),
     ("follow_up_required", 600, True, "same -- another call is what was agreed"),
-    ("potentially_interested", 4, False, "reached and warm; chasing again today is pestering"),
+    ("potentially_interested", 4, True, "reached and warm, and now chased anyway"),
+    # These two never get this far in `decide` -- see test_emptying_the_list --
+    # but if they did, an empty list would say yes, and that is worth seeing.
+    ("wrong_number", 3, True, "an empty list does not discriminate"),
+    ("contacted", 2, True, "nor here; the protection is upstream, not this list"),
     # --- arm 2: no disposition at all, so duration is the only evidence -----
+    # The one arm that can still say no, and therefore the whole of the gate.
     ("", None, True, "8,545 dnp rows carry no disposition; null = never connected"),
     ("", 4, True, "4,515 of 4,604 completed/(none) dials ran under 15s"),
     ("", 120, False, "1,911 complete/(none) dials were real conversations"),
@@ -699,6 +716,16 @@ def test_who_has_earned_a_second_call_today(stage, duration, again, why):
     assert SHIPPED.wants_second_call(stage, duration) is again, why
 
 
+def test_a_populated_list_still_filters():
+    """The mechanism has to survive the shipped config not using it.
+
+    `second_call_dispositions` is empty today by choice, not because it stopped
+    working. Putting a slug back must still refuse everything else.
+    """
+    assert LISTED.wants_second_call("hung_up", 600) is True
+    assert LISTED.wants_second_call("voicemail_ivr", 1) is False
+
+
 def test_the_duration_fallback_never_overrules_a_disposition():
     """The arms do not overlap, whatever `short_call_seconds` is set to.
 
@@ -706,9 +733,10 @@ def test_the_duration_fallback_never_overrules_a_disposition():
     changing the threshold must move only the undispositioned calls.
     """
     for seconds in (0, 15, 900):
-        cfg = red_config_from_body({**API_DEFAULTS, "short_call_seconds": seconds})
-        assert cfg.wants_second_call("hung_up", 600) is True
-        assert cfg.wants_second_call("wrong_number", 1) is False
+        listed = red_config_from_body({**API_DEFAULTS, "short_call_seconds": seconds,
+                                       "second_call_dispositions": ["did_not_pick", "hung_up"]})
+        assert listed.wants_second_call("hung_up", 600) is True
+        assert listed.wants_second_call("voicemail_ivr", 1) is False
 
 
 def test_an_unreadable_duration_is_treated_as_no_call_rather_than_a_long_one():
@@ -768,17 +796,33 @@ def test_a_morning_conversation_with_no_disposition_does_not():
 
 
 def test_a_disposition_off_the_list_is_refused_whatever_the_duration():
-    """`potentially_interested` reaches this gate and is turned away by it.
+    """A populated list still rules a lead out end to end, not just in isolation.
 
-    Of the 52 known slugs only three ever got this far and were refused by their
-    slug alone, all three meaning somebody was actually reached. The operator put
-    the other two -- `redial_required` and `follow_up_required` -- on the list on
-    12 Sep 2026, so this is the last one, and the only remaining proof that a
-    short duration does not rescue a lead the list has ruled out.
+    Uses LISTED rather than the shipped config, which is empty by choice since
+    12 Sep 2026. `voicemail_ivr` reaches this gate and is not on LISTED's two
+    slugs, so a 2-second call does not rescue it.
     """
-    decision = decide(_afternoon(stage="potentially_interested", last_call_duration_sec=2),
-                      AFTERNOON, SHIPPED)
+    decision = decide(_afternoon(stage="voicemail_ivr", last_call_duration_sec=2),
+                      AFTERNOON, LISTED)
     assert decision.action == SKIP_REACHED
+
+
+def test_emptying_the_list_does_not_reach_the_protected_dispositions():
+    """The empty list is safe because it is not the only gate, and this is why.
+
+    Emptying `second_call_dispositions` says "every disposition earns a second
+    call", which read alone sounds like it would start re-dialling DND and
+    renewed customers. It does not: `decide` refuses those long before the
+    second-call gate, on class rather than on this list. Pinned because the
+    whole safety of an empty list rests on it.
+    """
+    for stage in ("do_not_call", "already_paid_to_chola", "renewed", "wrong_number",
+                  "not_interested", "call_back"):
+        decision = decide(_afternoon(stage=stage, last_call_duration_sec=2),
+                          AFTERNOON, SHIPPED)
+        assert decision.schedule is False, f"{stage} must not be dialled again"
+        assert decision.action != SKIP_REACHED, \
+            f"{stage} should be refused upstream of the second-call gate"
 
 
 def test_a_morning_that_nobody_answered_earns_it_with_no_duration_at_all():
