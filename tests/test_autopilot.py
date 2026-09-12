@@ -271,29 +271,69 @@ def _resumed_in_formi(monkeypatch, agent: int, campaign_id: int) -> None:
                              "campaign_name": "back", "campaign_status": "active"}])
 
 
-def test_a_resume_in_formi_does_not_restart_calls_here(client, armed, monkeypatch):
-    """paused -> active in the warehouse never re-arms the autopilot.
+def test_a_resume_in_formi_puts_back_the_autopilot_the_pause_took(
+        client, armed, monkeypatch):
+    """A Formi pause and resume is a round trip: the campaign comes back running.
 
-    The campaign comes back off pause -- see the test below -- but dialling is
-    this console's decision and stays off until someone makes it here. Under live
-    dialling the alternative is a wave of real calls nobody asked for.
+    Asked for on 13 Sep 2026 -- "it should be automatic when i resync it should
+    automatically update". It was not: the earlier version of this branch
+    un-paused the campaign and set `autopilot_latched=0`, which threw away the
+    only record that it had been on autopilot before the pause. That record is
+    what `resume_campaign` reads, so clearing it broke the operator's resume
+    BUTTON too -- re-arming became a click with nothing behind it.
+
+    `stop_campaign` latches a running autopilot on the way down for exactly this
+    reason. Spending the latch is what makes the round trip lossless.
     """
     from engine.sync import PLATFORM_PAUSE, refresh_campaign_status
 
     conn = _db()
     agent = conn.execute("SELECT agent_id FROM campaigns WHERE id=?", (armed,)).fetchone()[0]
+    # What stop_campaign leaves behind when Formi pauses a RUNNING campaign.
     conn.execute("UPDATE campaigns SET platform_status='paused', paused=1, autopilot=0, "
                  "autopilot_latched=1, stopped_reason=? WHERE id=?", (PLATFORM_PAUSE, armed))
     conn.commit()
     _resumed_in_formi(monkeypatch, agent, armed)
 
     assert refresh_campaign_status(_db(), [agent], None, None, TODAY) == []
-    row = conn.execute("SELECT autopilot, autopilot_latched FROM campaigns WHERE id=?",
-                       (armed,)).fetchone()
-    assert row["autopilot"] == 0, "Formi resumed it and calls restarted"
-    # The latch is dropped with the pause it belonged to. Left set it outlives its
-    # owner, and the NEXT resume in this console re-arms a campaign nobody armed.
+    row = conn.execute("SELECT paused, autopilot, autopilot_latched, autopilot_note "
+                       "FROM campaigns WHERE id=?", (armed,)).fetchone()
+    assert row["paused"] == 0
+    assert row["autopilot"] == 1, "resumed in Formi and came back disarmed anyway"
+    # Spent, not merely cleared. Left set it outlives the pause it belonged to and
+    # the NEXT resume here re-arms a campaign nobody armed.
     assert row["autopilot_latched"] == 0
+    assert "as it was before the pause" in row["autopilot_note"]
+    conn.close()
+
+
+def test_a_resume_in_formi_cannot_arm_what_the_pause_did_not_find_running(
+        client, armed, monkeypatch):
+    """Restoring is not arming. No latch, no autopilot -- however Formi flips.
+
+    This is the half of the old doctrine that survives, and it is what keeps the
+    round trip from becoming "active in Formi means dialling here". A campaign
+    that was off when Formi paused it -- never armed, or deliberately switched
+    off by the operator -- has nothing latched, so it comes back un-paused and
+    still off. Under live dialling the alternative is a wave of real calls nobody
+    asked for.
+    """
+    from engine.sync import PLATFORM_PAUSE, refresh_campaign_status
+
+    conn = _db()
+    agent = conn.execute("SELECT agent_id FROM campaigns WHERE id=?", (armed,)).fetchone()[0]
+    conn.execute("UPDATE campaigns SET platform_status='paused', paused=1, autopilot=0, "
+                 "autopilot_latched=0, stopped_reason=? WHERE id=?", (PLATFORM_PAUSE, armed))
+    conn.commit()
+    _resumed_in_formi(monkeypatch, agent, armed)
+
+    refresh_campaign_status(_db(), [agent], None, None, TODAY)
+    row = conn.execute("SELECT paused, autopilot, autopilot_note FROM campaigns WHERE id=?",
+                       (armed,)).fetchone()
+    assert row["paused"] == 0, "resumed in Formi, still stopped here"
+    assert row["autopilot"] == 0, "Formi resumed it and calls started on their own"
+    # The operator has to arm it, so the console says so where they are looking.
+    assert "switch the autopilot on here" in row["autopilot_note"]
     conn.close()
 
 

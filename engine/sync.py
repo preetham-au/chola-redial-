@@ -368,20 +368,43 @@ def upsert_campaign(conn: sqlite3.Connection, row: dict[str, Any]) -> bool:
         # forever. Being idempotent is what makes it self-healing -- the UPDATE
         # matches nothing on every later sync, once the reason has been cleared.
         #
-        # Only that one pause, though: `stopped_reason` is matched so an
-        # operator's own pause here is never undone by a warehouse flag.
+        # And it SPENDS the latch rather than clearing it, which is the whole of
+        # "when I resync it should automatically update". `stop_campaign` records
+        # a running autopilot in `autopilot_latched` on the way down
+        # (api/routes_core.py) precisely so the way back up can restore it; the
+        # first version of this branch set that latch to 0, so a Formi pause and
+        # resume left the campaign un-paused, disarmed, and with the only record
+        # that it HAD been armed destroyed -- and destroyed for the operator's
+        # resume button too, which reads the same latch. Re-arming was then a
+        # click that no longer had anything to go on.
         #
-        # The autopilot stays OFF -- a resume in Formi still must not start
-        # dialling, which is the rule the old no-op was protecting. The latch
-        # goes with the pause it belonged to: it means "this console's stop took
-        # your autopilot, this console's resume gives it back", so once that stop
-        # is lifted by another route a stale latch would let the NEXT console
-        # resume re-arm a campaign nobody armed. Re-arming is a click, on purpose,
-        # and the note says so where the operator is already looking.
-        conn.execute(
-            "UPDATE campaigns SET paused=0, stopped_reason='', autopilot_latched=0, "
-            "autopilot_note='resumed in Formi: switch the autopilot back on here to dial' "
-            "WHERE id=? AND paused=1 AND stopped_reason=?", (campaign_id, PLATFORM_PAUSE))
+        # `resume_campaign` is that button. Calling it is the point: one way back
+        # for both routes, so a campaign Formi pauses and un-pauses comes back
+        # exactly as it was running, with no click and no second implementation
+        # to drift.
+        #
+        # It still cannot arm anything on its own. A campaign that was NOT on
+        # autopilot when Formi paused it has `autopilot_latched=0` -- including
+        # one the operator deliberately switched off here -- and comes back
+        # un-paused and disarmed, same as before.
+        #
+        # Only this console's own platform pause, though: `stopped_reason` is
+        # matched first so an operator's own pause here is never undone by a
+        # warehouse flag, and the SELECT matching nothing is what keeps a later
+        # sync idempotent.
+        from api.routes_core import resume_campaign      # noqa: PLC0415 — import cycle
+
+        stuck = conn.execute(
+            "SELECT autopilot_latched FROM campaigns "
+            "WHERE id=? AND paused=1 AND stopped_reason=?",
+            (campaign_id, PLATFORM_PAUSE)).fetchone()
+        if stuck is not None:
+            resume_campaign(conn, campaign_id)
+            conn.execute(
+                "UPDATE campaigns SET autopilot_note=? WHERE id=?",
+                ("resumed in Formi: back on autopilot, as it was before the pause"
+                 if stuck["autopilot_latched"]
+                 else "resumed in Formi: switch the autopilot on here to dial", campaign_id))
     # First sight of an already-paused campaign counts as the edge: it arrives
     # stopped, which is what the INSERT above wrote.
     return bool(paused) and (was is None or seen != "paused")
