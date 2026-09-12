@@ -176,6 +176,32 @@ def test_a_deployment_with_no_env_file_still_flips_but_says_it_did_not_persist(c
         os.environ["DRY_RUN"] = "1"
 
 
+def test_the_console_pull_carries_no_campaign_ceiling_of_its_own(monkeypatch):
+    """`/api/sync` must inherit engine.sync's bound, not hold a second copy.
+
+    It passed a hand-set 90 while the warehouse held 98 eligible campaigns, so
+    from 05:15 on 12 Sep 2026 every run printed "8 eligible campaign(s) NOT
+    synced" and those eight showed stale counts in the console. The number was
+    not wrong when it was written -- it went stale, silently, because the
+    warehouse grows and a literal at a call site does not. So what is asserted
+    here is that there is one definition of it, not that it equals any value.
+    """
+    import engine.sync
+    from api.main import _run_sync
+
+    seen = {}
+    monkeypatch.setattr(engine.sync, "sync",
+                        lambda *a, **kw: seen.update(args=a, kwargs=kw) or
+                        {"campaigns": 0, "leads": 0})
+    _run_sync()
+
+    passed = seen["args"][1:] + tuple(v for k, v in seen["kwargs"].items()
+                                      if k == "max_campaigns")
+    assert not any(isinstance(v, int) for v in passed), (
+        f"the console pull set its own campaign ceiling ({passed}); it belongs to "
+        "engine.sync.DEFAULT_MAX_CAMPAIGNS, which is the copy that gets revisited")
+
+
 def test_sync_endpoint_does_not_start_a_second_pull(client):
     """Pressing the button twice must not run two syncs against the warehouse.
 

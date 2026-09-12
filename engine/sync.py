@@ -9,7 +9,8 @@ Bounds, because "every campaign x every lead" is ~30k rows of warehouse traffic
 per run and the console does not need it:
 
   * only campaigns with leads AND at least one parseable RED, newest first,
-  * --campaigns (default 20) of them, --leads (default 5000) leads each,
+  * --campaigns of them (default 250 — a ceiling, not a working limit; see
+    DEFAULT_MAX_CAMPAIGNS), --leads (default 5000) leads each,
   * plus, always, the newest campaign per agent that holds a test number, so
     /api/test-call keeps resolving even though those campaigns are tiny.
   * only leads TODAY is about: inside the campaign's own RED window (what the
@@ -35,7 +36,19 @@ from .red_engine import config_from_settings
 from .stage_ops import apply_red_overrides
 from .seed import AGENTS, TEST_NUMBERS
 
-DEFAULT_MAX_CAMPAIGNS = 20
+# A ceiling against a warehouse that has grown without anyone noticing, NOT a
+# working limit: in normal operation every eligible campaign is synced and this
+# never binds. It was 20, and both callers overrode it with a hand-set 90 --
+# which the warehouse quietly outgrew. From 05:15 on 12 Sep 2026 every hourly
+# run printed "8 eligible campaign(s) NOT synced": eight campaigns that have
+# leads with a RED went unrefreshed run after run, so the console showed
+# whatever their counts were the last time they made the cut.
+#
+# The number lives here and nowhere else now. Two hand-set copies of a bound
+# that has to track the warehouse is one copy too many -- the copies do not get
+# revisited when it grows, and the growth is silent by definition. Callers take
+# the default; the CAP line at the end of `sync` still shouts if this ever binds.
+DEFAULT_MAX_CAMPAIGNS = 250
 DEFAULT_MAX_LEADS = 5_000
 
 # Campaigns whose name says they are not production.

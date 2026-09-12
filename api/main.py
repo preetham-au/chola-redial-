@@ -155,7 +155,11 @@ def _run_sync() -> None:
     try:
         # Mirrors chola-redial-sync.service. keep_local matters: this pull must
         # not delete campaigns it happens not to reach.
-        result = sync(list(AGENTS), 90, 5000, keep_local=True)
+        #
+        # No campaign ceiling of its own: it used to pass a hand-set 90, the
+        # warehouse grew past it, and eight eligible campaigns stopped being
+        # refreshed. That bound belongs to engine.sync and is defined once there.
+        result = sync(list(AGENTS), max_leads=5000, keep_local=True)
         _sync_state.update(ok=True, error="",
                            campaigns=result["campaigns"], leads=result["leads"])
     except Exception as exc:  # noqa: BLE001 -- a failed pull is a status, not a crash
