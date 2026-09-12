@@ -153,6 +153,11 @@ CREATE TABLE IF NOT EXISTS leads (
   -- somebody scheduled in Formi directly. The engine skips these so this console
   -- never double-books a lead the main system is about to dial.
   queued_today          INTEGER NOT NULL DEFAULT 0,
+  -- Billed seconds of the most recent dial. NULL is meaningful and is the reason
+  -- this column has no default: the warehouse leaves it empty for `dnp` and
+  -- `telephony_failed` rows and fills it for every connected one, so NULL means
+  -- "that call never connected". The second-call rule reads it that way.
+  last_call_duration_sec REAL,
   callback_date         TEXT,
   appointment_date      TEXT
 );

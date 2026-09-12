@@ -27,7 +27,7 @@ import sqlite3
 import sys
 import time
 from datetime import date
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Optional, Sequence
 
 from api.db import init_db, load_env, purge_campaigns, current_config
 
@@ -376,6 +376,22 @@ def apply_platform_pause(conn: sqlite3.Connection, campaign_id: int) -> dict[str
     return out
 
 
+def _duration(value: Any) -> Optional[float]:
+    """Seconds of the last dial, keeping NULL distinct from zero.
+
+    The warehouse hands this back as a Decimal, which sqlite3 will not bind, so
+    it has to become a float on the way through. Anything unparseable is stored
+    as NULL -- the same as "no call connected", which is the reading that leads
+    to one extra dial rather than to a lead in the critical window being dropped.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _red(lead: dict[str, Any]) -> Any:
     """The RED to store: the warehouse's own reading when it managed one.
 
@@ -418,6 +434,9 @@ def store_leads(conn: sqlite3.Connection, campaign_id: int, leads: Iterable[dict
             # Calls somebody put on today's clock in Formi itself. Dropping this
             # is how the console double-books a lead the main system already has.
             "queued_today": int(lead.get("queued_today") or 0),
+            # `or 0` would be wrong here: the warehouse's NULL is the signal that
+            # the last dial never connected, and 0 would read as a call that did.
+            "last_call_duration_sec": _duration(lead.get("last_call_duration_sec")),
             # Neither is a column of the warehouse lead view; the engine treats
             # NULL as "no customer-named date", which is the truth here.
             "callback_date": None,
@@ -427,10 +446,11 @@ def store_leads(conn: sqlite3.Connection, campaign_id: int, leads: Iterable[dict
     conn.executemany(
         "INSERT OR REPLACE INTO leads (id, campaign_id, lead_uuid, policy_no, contact_id, "
         "lead_name, phone, stage, red, last_interaction_time, total_interactions, "
-        "calls_today, calls_last_7d, queued_today, callback_date, appointment_date) VALUES "
+        "calls_today, calls_last_7d, queued_today, last_call_duration_sec, "
+        "callback_date, appointment_date) VALUES "
         "(:id,:campaign_id,:lead_uuid,:policy_no,:contact_id,:lead_name,:phone,:stage,:red,"
         ":last_interaction_time,:total_interactions,:calls_today,:calls_last_7d,:queued_today,"
-        ":callback_date,:appointment_date)", rows)
+        ":last_call_duration_sec,:callback_date,:appointment_date)", rows)
     conn.commit()
     # The DELETE above takes a renewal date corrected in the console with it, so
     # it is put back here. Overrides the warehouse has since moved past are

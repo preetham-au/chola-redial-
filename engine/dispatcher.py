@@ -11,10 +11,9 @@ Four rules, in the order they are applied:
                   are placed first. When `max_per_run` bites it is the
                   far-from-expiry leads that get shed, never the ones about to
                   lapse. The shed count is returned, not swallowed.
-  2. TWO SLOTS  — F5/E0/F6 (`calls_per_day == 2`) get slot_no 1 and 2, with slot 2
-                  at least `same_day_gap_hours` later. If that does not fit
-                  inside the window we emit slot 1 only; a call outside the
-                  window is worse than a call not made.
+  2. ONE SLOT   — one call per lead per wave. F5/E0/F6 allow two a day, but the
+                  second is the afternoon wave's, not this one's: see the note
+                  where it used to be booked, below.
   3. ROTATION   — a lead dialled yesterday at 09:00 is not dialled at 09:00
                   today. Ported from schedule_redials.py: today's minute-of-day
                   is (last call's minute + shift_from_last_hours) wrapped into
@@ -234,16 +233,6 @@ def _lead_key(lead: dict[str, Any]) -> str:
     return ""
 
 
-def _slots_for(bucket: str, config: RedConfig) -> int:
-    """How many calls this bucket wants today (1, or 2 for the intensive windows)."""
-    for window in config.frequency_table:
-        if window.bucket == bucket:
-            if window.intensive:
-                return max(1, min(window.calls_per_day, config.calls_per_day_cap))
-            return 1
-    return 1
-
-
 def dispatch(
     pairs: Sequence[tuple[dict[str, Any], Decision]],
     day: date,
@@ -286,40 +275,37 @@ def dispatch(
     for k, index in enumerate(blank):
         desired[index] = start if len(blank) < 2 else start + int(round(k * span / (len(blank) - 1)))
 
-    # --- rules 1 + 4: place slot 1 in priority order, staggered -------------
+    # --- rules 1 + 4: place the wave's call in priority order, staggered -----
     load: dict[int, int] = {}
     result = DispatchResult(slots=[])
-    firsts: list[tuple[int, Slot]] = []
     for index, (lead, dec) in enumerate(ordered):
         minute = _free_minute(desired[index] or start, load, dcfg, start)
         if minute is None:
             result.unplaceable += 1
             continue
         load[minute] = load.get(minute, 0) + 1
-        slot = Slot(lead=lead, decision=dec, slot_no=1,
-                    priority=config.priority_of(dec.bucket), minute=minute, day=day)
-        result.slots.append(slot)
-        firsts.append((index, slot))
+        result.slots.append(Slot(lead=lead, decision=dec, slot_no=1,
+                                 priority=config.priority_of(dec.bucket),
+                                 minute=minute, day=day))
 
-    # --- rule 2: the second daily slot for F5/E0/F6 ----------------------------
-    gap = int(round(dcfg.same_day_gap_hours * 60))
-    for _index, first in firsts:
-        if _slots_for(first.decision.bucket, config) < 2:
-            continue
-        # An intensive bucket says "up to two a day"; the disposition says whether
-        # THIS lead has earned the second one. A lead already reached does not
-        # need chasing again the same afternoon.
-        if not config.wants_second_call(first.lead.get("stage")):
-            continue
-        wanted = first.minute + gap
-        if wanted > dcfg.end_min:
-            continue                      # will not fit today: slot 1 only
-        minute = _free_minute(wanted, load, dcfg, start)
-        if minute is None:
-            continue
-        load[minute] = load.get(minute, 0) + 1
-        result.slots.append(Slot(lead=first.lead, decision=first.decision, slot_no=2,
-                                 priority=first.priority, minute=minute, day=day))
+    # --- the second daily slot for F5/E0/F6 ------------------------------------
+    # Not booked here, on purpose. This loop used to place slot 2 at slot 1 +
+    # `same_day_gap_hours` at the moment the morning plan was built, gated on
+    # `wants_second_call(lead["stage"])` -- and at that moment `stage` is still
+    # the outcome of YESTERDAY's call. The afternoon was committed before the
+    # morning had happened.
+    #
+    # It also silently made itself the only answer. A pre-booked slot 2 sits on
+    # Formi's clock, so it counts in `queued_today`, and `evaluate` skips any
+    # lead with a queued interaction (ALREADY_SCHEDULED_TODAY) rather than
+    # double-book them. The afternoon wave therefore found nothing to do for
+    # exactly the leads it existed to reconsider.
+    #
+    # So the second call is now the AFTERNOON wave's first call: prepare
+    # `auto_pm` with resync=True and `evaluate` judges it on this morning's real
+    # disposition and call duration. The spacing that used to be this loop's
+    # `first.minute + gap` is enforced there by the same_day_gap_hours cadence
+    # check, and the count by the per-window daily cap.
 
     result.dropped = dropped
     result.slots.sort(key=lambda s: (s.minute, s.priority, _lead_key(s.lead), s.slot_no))

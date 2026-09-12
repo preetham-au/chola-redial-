@@ -10,8 +10,14 @@ from engine.dispatcher import (
     DispatchConfig, dispatch, manual_pairs, red_config_from_body, validate_dial_window,
 )
 from engine.red_engine import (
-    DEFAULT_CONFIG, SCHEDULE, SKIP_MANUAL_ONLY, Decision, decide,
+    DEFAULT_CONFIG, SCHEDULE, SKIP_CADENCE, SKIP_DAILY_CAP, SKIP_MANUAL_ONLY,
+    SKIP_REACHED, Decision, decide,
 )
+
+# The config the live console actually ships, as opposed to the engine's bare
+# fallback: the second-call rule is meaningless without a populated
+# `second_call_dispositions`, and an empty one means "chase everybody".
+from api.db import DEFAULT_CONFIG as API_DEFAULTS
 
 TODAY = date(2026, 8, 28)
 NOW = datetime(2026, 8, 28, 9, 30)
@@ -223,20 +229,18 @@ def test_f5_is_placed_before_f1():
     assert first.priority < max(s.priority for s in result.slots)
 
 
-def test_f5_gets_two_slots_with_the_gap_respected():
+def test_f5_gets_one_slot_per_wave_not_two():
+    """The second F5 call of the day is not booked while the first is unmade.
+
+    `dispatch` used to emit slot 1 and slot 2 together, gap apart, deciding the
+    afternoon from a disposition that was still the PREVIOUS day's. Worse, the
+    pre-booked slot 2 landed on Formi's clock, so `queued_today` made the
+    afternoon wave skip the very leads it existed to reconsider. The second call
+    is now that wave's own slot 1, judged on the morning's real outcome.
+    """
     result = dispatch([_pair("F5", "f5")], TODAY, DEFAULT_CONFIG, WIDE)
-    assert [s.slot_no for s in result.slots] == [1, 2]
-    minutes = sorted(s.minute for s in result.slots)
-    assert minutes[1] - minutes[0] >= WIDE.same_day_gap_hours * 60
-    assert all(WIDE.start_min <= s.minute <= WIDE.end_min for s in result.slots)
-
-
-def test_second_slot_is_dropped_rather_than_placed_outside_the_window():
-    """Slot 1 at 17:00 + a 3h gap is 20:00, so only slot 1 is emitted."""
-    late = _pair("F5", "f5", last_interaction_time="2026-08-27 15:00:00")
-    result = dispatch([late], TODAY, DEFAULT_CONFIG, WIDE)
-    assert [s.minute for s in result.slots] == [17 * 60]
     assert [s.slot_no for s in result.slots] == [1]
+    assert all(WIDE.start_min <= s.minute <= WIDE.end_min for s in result.slots)
 
 
 def test_f1_gets_one_slot_only():
@@ -276,7 +280,7 @@ def test_stagger_never_exceeds_max_per_minute():
     result = dispatch(pairs, TODAY, DEFAULT_CONFIG, dcfg)
     load = Counter(s.minute for s in result.slots)
     assert max(load.values()) <= 4
-    assert len(result.slots) == 120             # two slots each, all placed
+    assert len(result.slots) == 60              # one slot each, all placed
 
 
 def test_no_slot_lands_outside_the_dial_window():
@@ -646,3 +650,109 @@ def test_an_operator_added_exclusion_is_not_undone_by_a_mandatory_day():
     decision = decide(lead(stage="positive_followup", red=(TODAY + timedelta(days=1)).isoformat()),
                       NOW, config)
     assert decision.action != SCHEDULE, decision.reason
+
+
+# ---------------------------------------------------------------------------
+# The second call of the day
+#
+# The operator's rule: "monitor for red 0-7 and -1 to -3 -- if they have not
+# picked or hung up or call duration is less than 15s, call them again the same
+# day". The numbers in these tests are the live ones, counted over the seven days
+# to 12 Sep 2026 for outlet 1497, because the rule is only worth what the data
+# says it separates. See `wants_second_call`.
+# ---------------------------------------------------------------------------
+
+SHIPPED = red_config_from_body(API_DEFAULTS)
+AFTERNOON = datetime(2026, 8, 28, 14, 0)
+
+
+@pytest.mark.parametrize("stage, duration, again, why", [
+    # Never connected. Duration is null for practically every row of these two
+    # stages, and that null IS the evidence -- nothing picked up.
+    ("did_not_pick", None, True, "28,186 dnp dials, 28,184 with no duration"),
+    ("telephony_failed", None, True, "3,015 dials, 3,014 with no duration"),
+    ("", None, True, "8,545 dnp rows carry no disposition at all"),
+    # Connected, and the length is what separates them. `hung_up` alone is not
+    # enough: it covers both a 6-second hang-up and a finished conversation.
+    ("hung_up", 6, True, "4,582 of 8,912 hung_up dials ran under 15s"),
+    ("hung_up", 40, False, "the other 4,330 ran 15s or longer"),
+    ("hung_up", 15, False, "the threshold itself counts as reached"),
+    ("", 4, True, "4,515 of 4,604 completed/(none) dials ran under 15s"),
+    ("", 120, False, "1,911 complete/(none) dials were real conversations"),
+    # A recording answered. 720 of 725 voicemail_ivr dials ran past 15s and
+    # reached nobody, so duration must not be allowed to speak for them.
+    ("voicemail_ivr", 30, True, "an IVR talking for 30s is not a contact"),
+    # Not on the re-dial list at all, so the duration never gets a vote.
+    ("wrong_number", 3, False, "a wrong number stays wrong however brief"),
+    ("contacted", 2, False, "a terminal outcome is not chased on a technicality"),
+])
+def test_who_has_earned_a_second_call_today(stage, duration, again, why):
+    assert SHIPPED.wants_second_call(stage, duration) is again, why
+
+
+def test_an_unreadable_duration_is_treated_as_no_call_rather_than_a_long_one():
+    """One extra dial costs less than dropping a lead days from expiry."""
+    assert SHIPPED.wants_second_call("hung_up", "not-a-number") is True
+
+
+def test_the_duration_test_can_be_switched_off():
+    """0 restores "the disposition decides", which is how this shipped before."""
+    off = red_config_from_body({**API_DEFAULTS, "short_call_seconds": 0})
+    assert off.wants_second_call("hung_up", 600) is True
+
+
+def _afternoon(**over):
+    """A lead in F5 that was already dialled once this morning."""
+    return lead(**{"red": (TODAY + timedelta(days=3)).isoformat(), "calls_today": 1,
+                   "last_interaction_time": "2026-08-28 09:30:00", **over})
+
+
+def test_the_first_call_of_the_day_is_never_judged_by_a_previous_outcome():
+    """`calls_today == 0`, so there is no call today for the gate to read.
+
+    Without this the morning wave would inherit yesterday's 40-second hang-up as
+    a reason not to dial at all, which is the opposite of the rule -- that lead
+    is exactly who the critical window exists for.
+    """
+    decision = decide(lead(red=(TODAY + timedelta(days=3)).isoformat(),
+                           stage="hung_up", calls_today=0,
+                           last_call_duration_sec=40), NOW, SHIPPED)
+    assert decision.action == SCHEDULE and decision.bucket == "F5"
+
+
+def test_a_short_morning_call_earns_the_afternoon_one():
+    decision = decide(_afternoon(stage="hung_up", last_call_duration_sec=6),
+                      AFTERNOON, SHIPPED)
+    assert decision.action == SCHEDULE and decision.bucket == "F5"
+
+
+def test_a_real_morning_conversation_does_not():
+    decision = decide(_afternoon(stage="hung_up", last_call_duration_sec=40),
+                      AFTERNOON, SHIPPED)
+    assert decision.action == SKIP_REACHED
+    assert decision.schedule is False
+    assert "40" in decision.reason                  # the operator can see why
+
+
+def test_a_morning_that_nobody_answered_earns_it_with_no_duration_at_all():
+    decision = decide(_afternoon(stage="did_not_pick", last_call_duration_sec=None),
+                      AFTERNOON, SHIPPED)
+    assert decision.action == SCHEDULE
+
+
+def test_the_afternoon_call_still_has_to_wait_out_the_gap():
+    """The re-dial is spaced, not immediate: `same_day_gap_hours` still rules.
+
+    10:15 against a 09:30 call is 45 minutes. Whatever the disposition says, a
+    customer is not rung twice inside the hour.
+    """
+    decision = decide(_afternoon(stage="did_not_pick"),
+                      datetime(2026, 8, 28, 10, 15), SHIPPED)
+    assert decision.action == SKIP_CADENCE
+
+
+def test_a_third_call_is_refused_by_the_daily_cap():
+    """The gate says "worth calling"; the cap says "allowed to". Both apply."""
+    decision = decide(_afternoon(stage="did_not_pick", calls_today=2),
+                      AFTERNOON, SHIPPED)
+    assert decision.action == SKIP_DAILY_CAP

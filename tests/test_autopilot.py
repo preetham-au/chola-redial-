@@ -705,3 +705,83 @@ def test_a_paused_campaign_is_neither_planned_nor_approved(client, armed):
 
     result = client.post("/api/day/approve", json={"date": TODAY.isoformat()}).json()
     assert result["approved"] == 0 and result["posted"] == 0
+
+
+# ---------------------------------------------------------------------------
+# The second call of the day, end to end
+#
+# The unit tests in test_engine pin the RULE -- `wants_second_call` in isolation.
+# These pin the SEAM: that a duration written into the leads table survives
+# `load_leads` and reaches `decide`, and that the afternoon wave then places, or
+# refuses, a real call for a lead the morning already dialled.
+#
+# That is a genuinely separate failure mode from the rule being wrong. The rule
+# can be perfect while the lead never carries a duration this far -- a column
+# left out of a SELECT, or a wave that filters the lead out before `decide` ever
+# runs -- and every lead then arrives with duration=None, which reads as "the
+# call never connected" and re-dials everybody who was already reached.
+#
+# Checked, not assumed: neutering the SKIP_REACHED gate in red_engine turns
+# exactly the two `False` cases below red.
+# ---------------------------------------------------------------------------
+
+def _dialled_this_morning(campaign_id: int, stage: str, duration) -> str:
+    """Put one F5 lead into the state the morning wave leaves behind.
+
+    RED three days out puts it in the critical window the operator named
+    ("red 0-7"), and the call is logged four hours back so the same-day gap is
+    already satisfied -- these tests are about the disposition, and a cadence
+    wait would mask it.
+    """
+    conn = _db()
+    lead = conn.execute("SELECT id, lead_uuid FROM leads WHERE campaign_id=? ORDER BY id LIMIT 1",
+                        (campaign_id,)).fetchone()
+    four_hours_ago = (now_ist() - datetime.timedelta(hours=4)).strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute("UPDATE leads SET stage=?, last_call_duration_sec=?, calls_today=1, "
+                 "queued_today=0, red=?, last_interaction_time=? WHERE id=?",
+                 (stage, duration, (TODAY + datetime.timedelta(days=3)).isoformat(),
+                  four_hours_ago, lead["id"]))
+    # Every other lead of the campaign is taken out of the window, so the
+    # afternoon plan is about this one lead and nothing else can explain it.
+    conn.execute("UPDATE leads SET red=NULL WHERE campaign_id=? AND id<>?",
+                 (campaign_id, lead["id"]))
+    conn.commit()
+    conn.close()
+    return lead["lead_uuid"]
+
+
+def _planned_pm(campaign_id: int) -> set[str]:
+    """The leads the afternoon wave put in a plan. `plan_items` keys by uuid."""
+    from api.autopilot import PM
+
+    conn = _db()
+    rows = conn.execute(
+        "SELECT p.lead_uuid FROM plan_items p JOIN runs r ON r.id=p.run_id "
+        "WHERE r.campaign_id=? AND r.kind=? AND r.run_date=?",
+        (campaign_id, PM, TODAY.isoformat())).fetchall()
+    conn.close()
+    return {r["lead_uuid"] for r in rows}
+
+
+@pytest.mark.parametrize("stage, duration, again, why", [
+    ("did_not_pick", None, True, "nobody picked up this morning"),
+    ("hung_up", 6.0, True, "six seconds is not a conversation"),
+    ("hung_up", 40.0, False, "forty seconds is, so stop calling them"),
+    ("", 4.0, True, "no disposition recorded, and the call was too short to be one"),
+    ("", 300.0, False, "no disposition, but five minutes says they were reached"),
+])
+def test_the_afternoon_wave_reconsiders_this_mornings_outcome(
+        armed, stage, duration, again, why):
+    """`armed` stubs `_resync`, so the outcome written above is what gets read.
+
+    In production that re-sync is exactly what puts the morning's disposition and
+    duration into these columns; here they are placed by hand and the warehouse
+    is never reached.
+    """
+    from api.autopilot import PM, run_pass
+
+    uuid = _dialled_this_morning(armed, stage, duration)
+    _skip_if_shut(_first(run_pass(PM, TODAY)))
+
+    planned = _planned_pm(armed)
+    assert (uuid in planned) is again, f"{why} (planned={planned})"

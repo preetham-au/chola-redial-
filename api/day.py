@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from dataclasses import replace
 from datetime import date
 from typing import Any, Optional
 
@@ -47,6 +46,14 @@ log = logging.getLogger("redial.day")
 # call only if the first is not answered": the afternoon plan is built AFTER a
 # re-sync, so it only reaches leads whose disposition still says nobody picked up.
 # Both are prepared, neither dials — each needs its own approval.
+#
+# There is no per-wave call cap any more. A `_evaluate_wave` wrapper used to pin
+# `calls_per_day_cap=1` on its way out of `_evaluate` — but `_evaluate` has
+# already run `decide` by then, so the engine never saw it; the only thing it
+# reached was the dispatcher's habit of pre-booking the day's second slot, and
+# that is gone (see the note where it used to be booked, in dispatcher.py). One
+# call per lead per wave is now structural, so the operator's `calls_per_day_cap`
+# is left alone and means what it says: calls per lead per DAY.
 MORNING, AFTERNOON = "auto", "auto_pm"
 KINDS = (MORNING, AFTERNOON)
 
@@ -81,20 +88,6 @@ class ApproveBody(BaseModel):
 # ---------------------------------------------------------------------------
 # RED bands
 # ---------------------------------------------------------------------------
-
-def _evaluate_wave(conn: sqlite3.Connection, campaign: sqlite3.Row, day: date):
-    """`_evaluate`, capped at one call per lead per wave.
-
-    "2nd call only if the 1st is not answered" — so no wave may book both calls
-    of the day up front. One slot per lead; the afternoon call is earned in the
-    afternoon, by a lead whose re-synced disposition still says nobody picked up.
-    A connected lead is CALLBACK class by then and `decide` drops it before it
-    ever reaches the dispatcher. Prepare AND approve both go through here, so an
-    approval cannot re-introduce the second slot the plan deliberately left out.
-    """
-    cfg, red, dcfg, now, leads, pairs = _evaluate(conn, campaign, day)
-    return cfg, replace(red, calls_per_day_cap=1), dcfg, now, leads, pairs
-
 
 def _bands(config: dict[str, Any]) -> tuple[tuple[int, int], ...]:
     raw = config.get("red_priority") or DEFAULT_RED_PRIORITY
@@ -450,7 +443,7 @@ def _prepare_one(campaign_id: int, day: date, kind: str, resync: bool) -> dict[s
             return {**out, "status": "finished"}
 
         try:
-            cfg, red, dcfg, _now, leads, pairs = _evaluate_wave(conn, campaign, day)
+            cfg, red, dcfg, _now, leads, pairs = _evaluate(conn, campaign, day)
             floor = _floor_min(now_ist(), day, dcfg)
             if floor is not None and floor >= dcfg.end_min:
                 return {**out, "status": "window_closed",
@@ -531,7 +524,7 @@ def _approve_one(conn: sqlite3.Connection, campaign: sqlite3.Row, day: date, kin
         return {**out, "status": "already_" + run["status"], "run_id": run["id"]}
 
     try:
-        cfg, red, dcfg, now, leads, pairs = _evaluate_wave(conn, campaign, day)
+        cfg, red, dcfg, now, leads, pairs = _evaluate(conn, campaign, day)
         floor = _floor_min(now, day, dcfg)
         if floor is not None and floor >= dcfg.end_min:
             return {**out, "status": "window_closed", "run_id": run["id"],

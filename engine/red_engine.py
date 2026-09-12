@@ -116,13 +116,18 @@ SKIP_MANUAL_ONLY = "MANUAL_ONLY"
 # disposition everywhere, this one is a per-bucket choice the operator made --
 # e.g. chase voicemail in the critical window but not 40 days out.
 SKIP_BUCKET_DISPOSITION = "BUCKET_DISPOSITION_OFF"
+# The lead was already called today and that call reached somebody. Only ever
+# returned on a second pass over the same day -- the first call of a day is never
+# judged by this. Distinct from DAILY_CAP_MET: the cap says "no more calls are
+# allowed", this says "no more calls are warranted".
+SKIP_REACHED = "REACHED_TODAY"
 
 ACTIONS = (
     SCHEDULE, SKIP_EXCLUDED, SKIP_HOLD, SKIP_REASSIGN, SKIP_UNKNOWN,
     SKIP_NO_RED, SKIP_OUTSIDE, SKIP_CADENCE, SKIP_WEEKLY_BUDGET,
     SKIP_DAILY_CAP, SKIP_MAX_ATTEMPTS, SKIP_CALLBACK_PENDING,
     SKIP_NOT_TODAYS_SLOT, SKIP_ALREADY_SCHEDULED, SKIP_MANUAL_ONLY,
-    SKIP_BUCKET_DISPOSITION,
+    SKIP_BUCKET_DISPOSITION, SKIP_REACHED,
 )
 
 # Deliberately ASCII. Bucket labels reach Windows consoles (this runs under Task
@@ -443,13 +448,62 @@ class RedConfig:
     # the outcome of the previous call, not of this morning's. To gate on
     # today's first call, sync the dispositions after the morning wave and plan
     # the afternoon as a separate run -- by then the slug is today's answer.
+    # That is now how the second call is produced: `dispatch` no longer
+    # pre-schedules one, and `evaluate` applies this gate when `calls_today`
+    # says the lead has already been dialled since midnight.
     second_call_dispositions: frozenset[str] = frozenset()
 
-    def wants_second_call(self, stage: Any) -> bool:
-        """Does `stage` qualify for the second daily slot? True when unset."""
-        if not self.second_call_dispositions:
+    # How short a connected call has to be before it does not count as having
+    # reached anybody. The disposition alone is not enough: over the seven days
+    # to 12 Sep 2026 this outlet logged 8,912 `hung_up` dials, and 4,330 of them
+    # -- 49% -- ran 15s or longer. Those are conversations that happened and
+    # ended, not calls that need chasing the same afternoon.
+    short_call_seconds: int = 15
+
+    # Dispositions where duration proves nothing, because the seconds were spent
+    # talking to a machine. `voicemail_ivr` is the case that forces this to exist:
+    # 720 of its 725 dials in that week ran past 15s, so a plain duration test
+    # would rule that a recorded greeting had been successfully reached.
+    #
+    # Only consulted for slugs already on `second_call_dispositions` -- this
+    # exempts from the duration test, it never adds anyone to the re-dial set.
+    no_contact_dispositions: frozenset[str] = frozenset(
+        {"voicemail", "voicemail_ivr", "dialer_nc",
+         "beep_tone_number_busy_not_reachable_switched_off"})
+
+    def wants_second_call(self, stage: Any, duration_sec: Any = None) -> bool:
+        """Has today's first call left this lead still worth calling again?
+
+        `duration_sec` is the length of that call, or None when the warehouse has
+        none -- which in this data is not missing information but its own answer:
+        duration is populated for every `complete`/`completed` row and null for
+        essentially every `dnp`/`telephony_failed` one, so a null means the call
+        never connected at all.
+        """
+        stage = str(stage or "").strip().lower()
+        # A blank disposition is a MISSING outcome, not a terminal one, so the
+        # allow-list has no opinion to offer and the duration below decides. It
+        # gets its own branch because the list cannot hold it: every list in this
+        # config is parsed with `discard("")`, so the `""` that `db.DEFAULT_CONFIG`
+        # writes into `second_call_dispositions` never survives into the frozenset
+        # -- which silently excluded the 13,149 dials of the week to 12 Sep 2026
+        # that carried no disposition, a fifth of everything dialled.
+        if stage and self.second_call_dispositions \
+                and stage not in self.second_call_dispositions:
+            return False                    # a terminal outcome: nothing to chase
+        if not self.short_call_seconds:
+            return True                     # duration test switched off
+        if stage in self.no_contact_dispositions:
+            return True                     # a machine answered; its seconds mean nothing
+        if duration_sec is None:
+            return True                     # never connected
+        try:
+            return float(duration_sec) < self.short_call_seconds
+        except (TypeError, ValueError):
+            # Unparseable duration is treated as absent rather than as a long
+            # call: the cost of one extra dial is smaller than dropping a lead
+            # in the critical window over a malformed field.
             return True
-        return str(stage or "").strip().lower() in self.second_call_dispositions
 
     def window_for(self, dte: int) -> Optional[RedWindow]:
         return find_window(dte, self.frequency_table)
@@ -922,6 +976,10 @@ def decide(lead: dict[str, Any], now: datetime, config: RedConfig = DEFAULT_CONF
     calls_today = int(_lead_get(lead, "calls_today", default=0) or 0)
     calls_last_7d = int(_lead_get(lead, "calls_last_7d", "calls_in_week", default=0) or 0)
     queued_today = int(_lead_get(lead, "queued_today", default=0) or 0)
+    # Deliberately not coerced to a number here. None and 0 mean different things
+    # -- "the call never connected" vs "it connected for under a second" -- and
+    # both have to survive as far as `wants_second_call`.
+    duration_sec = _lead_get(lead, "last_call_duration_sec", "call_duration", "duration_sec")
     spread_key = str(_lead_get(lead, "lead_uuid", "id", "policy_no", "contact_id", default=stage))
 
     hours_since = None
@@ -935,6 +993,7 @@ def decide(lead: dict[str, Any], now: datetime, config: RedConfig = DEFAULT_CONF
         "calls_today": calls_today,
         "calls_last_7d": calls_last_7d,
         "queued_today": queued_today,
+        "last_call_duration_sec": duration_sec,
         "hours_since_last": None if hours_since is None else round(hours_since, 1),
         "last_interaction_time": last_called.isoformat(sep=" ") if last_called else None,
     }
@@ -1058,13 +1117,25 @@ def decide(lead: dict[str, Any], now: datetime, config: RedConfig = DEFAULT_CONF
     meta["calls_per_day"] = window.calls_per_day
 
     if window.intensive:
-        # F5 / E0 / F6: one call per cron pass. The 2nd call of the day is reactive —
-        # the DNP handler fires it, so we never pre-schedule it here.
+        # F5 / E0 / F6: one call per wave, never two pre-booked at once. The
+        # second call of the day is the AFTERNOON wave's first call -- prepared
+        # with `resync=True`, so by the time this runs again `stage`,
+        # `calls_today` and `last_call_duration_sec` are this morning's real
+        # outcome rather than yesterday's guess at it.
         cap = min(window.calls_per_day, config.calls_per_day_cap) or 1
         if calls_today >= cap and not config.allow_second_daily_slot:
             return out(SKIP_DAILY_CAP,
                        f"{SKIP_DAILY_CAP} bucket={window.bucket} calls_today={calls_today} cap={cap}",
                        **base)
+        # Having been called today is what makes this the second call, and only a
+        # second call has a first one to be judged by. `evaluate` is the only
+        # place this gate belongs: the caller that used to own it could see the
+        # bucket but not whether the day had already spent a call on this lead.
+        if calls_today and not config.wants_second_call(stage, duration_sec):
+            return out(SKIP_REACHED,
+                       f"{SKIP_REACHED} bucket={window.bucket} disposition={stage or '(none)'} "
+                       f"duration={'none' if duration_sec is None else f'{duration_sec}s'} "
+                       f"— this morning's call reached them", **base)
         if (hours_since is not None and hours_since < config.same_day_gap_hours
                 and not config.skip_cadence):
             return out(SKIP_CADENCE,
@@ -1233,12 +1304,25 @@ def config_from_settings(settings: dict[str, Any] | None) -> RedConfig:
         cleaned.discard("")
         config = replace(config, second_call_dispositions=frozenset(cleaned))
 
+    raw_no_contact = settings.get("no_contact_dispositions")
+    if raw_no_contact is not None:
+        if not isinstance(raw_no_contact, (list, tuple, set, frozenset)):
+            raise ValueError("no_contact_dispositions must be a list of slugs")
+        # An empty list is honoured here, unlike bucket_dispositions: clearing it
+        # means "judge every slug by its duration", which is a real choice.
+        cleaned = {str(s).strip().lower() for s in raw_no_contact}
+        cleaned.discard("")
+        config = replace(config, no_contact_dispositions=frozenset(cleaned))
+
     numeric: dict[str, Any] = {}
     for key, caster, minimum in (
         ("calls_per_day_cap", int, 1),
         ("same_day_gap_hours", float, 0.0),
         ("spread_tolerance", float, 0.1),
         ("max_attempts", int, 0),
+        # 0 disables the duration arm: every slug on second_call_dispositions
+        # earns its second call however long the first one ran.
+        ("short_call_seconds", int, 0),
     ):
         if settings.get(key) not in (None, ""):
             try:

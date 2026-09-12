@@ -1227,7 +1227,13 @@ WITH scoped AS (
     i.lead_id,
     i.campaign_id,
     i.call_stage,
-    i.scheduled_time
+    i.scheduled_time,
+    -- Billed seconds, NOT coalesced to 0. Null and zero say different things and
+    -- the engine reads both: this column is null for practically every `dnp` and
+    -- `telephony_failed` row and populated for every `complete`/`completed` one,
+    -- so a null here means the call never connected rather than that nobody
+    -- recorded how long it was.
+    (i.interaction_metadata->>'call_duration')::numeric AS duration_sec
   FROM public.interactions i
   WHERE i.campaign_id IN ({ids})
     {outlet_filter}
@@ -1248,7 +1254,13 @@ history AS (
                             AT TIME ZONE 'Asia/Kolkata')::date
                            > {today_sql} - INTERVAL '7 days')
                                                             AS calls_last_7d,
-{queued_select}                                             AS queued_today
+{queued_select}                                             AS queued_today,
+    -- How long the MOST RECENT dial ran. ARRAY_AGG rather than a MAX because the
+    -- wanted value is the one belonging to `last_interaction_utc`, not the
+    -- largest -- a 90s call at 09:00 must not mask a 4s one at 14:00. Ordering
+    -- inside the aggregate is what pairs them; [1] is the latest.
+    (ARRAY_AGG(s.duration_sec ORDER BY s.scheduled_time DESC)
+       FILTER (WHERE s.call_stage IN ({dial_stages})))[1]   AS last_call_duration_sec
   FROM scoped s
   GROUP BY s.lead_id
 ){campaign_order_cte}
@@ -1263,6 +1275,7 @@ SELECT
     COALESCE(h.calls_today, 0)                  AS calls_today,
     COALESCE(h.calls_last_7d, 0)                AS calls_last_7d,
     COALESCE(h.queued_today, 0)                 AS queued_today,
+    h.last_call_duration_sec                    AS last_call_duration_sec,
     -- The convention this campaign was PROVEN to use, so Python resolves any
     -- re-parse the same way the warehouse did. NULL = nothing to learn from.
     co.month_first                              AS campaign_month_first,
