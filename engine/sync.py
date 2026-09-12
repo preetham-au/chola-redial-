@@ -243,6 +243,9 @@ LIMIT {ms.ROW_CAP}
 # Local store
 # ---------------------------------------------------------------------------
 
+PLATFORM_PAUSE = "paused in the Formi platform"
+
+
 def upsert_campaign(conn: sqlite3.Connection, row: dict[str, Any]) -> bool:
     """The warehouse campaign id IS the local id — one less mapping to get wrong.
 
@@ -255,8 +258,9 @@ def upsert_campaign(conn: sqlite3.Connection, row: dict[str, Any]) -> bool:
 
         active -> paused   stop it here, and disarm the autopilot
         paused -> paused   do nothing; the operator may have resumed it here
-        paused -> active   do nothing; a resume in Formi must NOT restart calls
-                           in this console, only a resume in this console does
+        paused -> active   lift the pause THIS console applied on the platform's
+                           behalf, and nothing else. A resume in Formi must NOT
+                           restart calls here -- only arming it here does.
 
     Copying the value on every sync was the old behaviour and it could not hold
     a decision in either direction: an operator who paused a campaign here found
@@ -272,6 +276,7 @@ def upsert_campaign(conn: sqlite3.Connection, row: dict[str, Any]) -> bool:
     campaign_id = int(row["campaign_id"])
     was = conn.execute("SELECT platform_status FROM campaigns WHERE id=?",
                        (campaign_id,)).fetchone()
+    seen = str(was["platform_status"] or "") if was else ""
     conn.execute(
         "INSERT INTO campaigns (id, agent_id, warehouse_id, name, enabled, paused, "
         "                       platform_status) "
@@ -285,9 +290,31 @@ def upsert_campaign(conn: sqlite3.Connection, row: dict[str, Any]) -> bool:
         (campaign_id, int(row["agent_id"]), campaign_id,
          str(row.get("campaign_name") or f"campaign {campaign_id}"), enabled, paused,
          status))
+    if seen == "paused" and status != "paused" and enabled:
+        # The other edge. "Do nothing" was right about the calls and wrong about
+        # the pause: on 12 Sep 2026 the operator resumed a campaign in Formi and
+        # the console went on showing it stopped, with the reason "paused in the
+        # Formi platform" -- no longer true, and a one-way door, because nothing
+        # in Formi could clear a flag only this console writes.
+        #
+        # So the pause this console applied ON THE PLATFORM'S BEHALF is lifted,
+        # and only that one: `stopped_reason` is matched so an operator's own
+        # pause here is never undone by a warehouse flag flipping back.
+        #
+        # The autopilot stays OFF -- a resume in Formi still must not start
+        # dialling, which is the rule the old no-op was protecting. The latch
+        # goes with the pause it belonged to: it means "this console's stop took
+        # your autopilot, this console's resume gives it back", so once that stop
+        # is lifted by another route a stale latch would let the NEXT console
+        # resume re-arm a campaign nobody armed. Re-arming is a click, on purpose,
+        # and the note says so where the operator is already looking.
+        conn.execute(
+            "UPDATE campaigns SET paused=0, stopped_reason='', autopilot_latched=0, "
+            "autopilot_note='resumed in Formi: switch the autopilot back on here to dial' "
+            "WHERE id=? AND paused=1 AND stopped_reason=?", (campaign_id, PLATFORM_PAUSE))
     # First sight of an already-paused campaign counts as the edge: it arrives
     # stopped, which is what the INSERT above wrote.
-    return bool(paused) and (was is None or str(was["platform_status"] or "") != "paused")
+    return bool(paused) and (was is None or seen != "paused")
 
 
 def refresh_campaign_status(conn: sqlite3.Connection, agents: Sequence[int],
@@ -317,9 +344,6 @@ def refresh_campaign_status(conn: sqlite3.Connection, agents: Sequence[int],
     for campaign_id in stopped:
         apply_platform_pause(conn, campaign_id)
     return stopped
-
-
-PLATFORM_PAUSE = "paused in the Formi platform"
 
 
 def apply_platform_pause(conn: sqlite3.Connection, campaign_id: int) -> dict[str, Any]:

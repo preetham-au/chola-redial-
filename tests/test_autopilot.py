@@ -261,24 +261,90 @@ def test_a_pause_in_formi_is_seen_before_the_next_wave_is_planned(client, armed,
     conn.close()
 
 
-def test_a_resume_in_formi_does_not_restart_calls_here(client, armed, monkeypatch):
-    """paused -> active in the warehouse is deliberately not copied back."""
+def _resumed_in_formi(monkeypatch, agent: int, campaign_id: int) -> None:
+    """Point the warehouse at one campaign that has just gone paused -> active."""
     from engine import sync
+
+    monkeypatch.setattr(sync.ms, "fetch_agent_campaigns",
+                        lambda agent_id, config=None, schema=None, today=None: [
+                            {"campaign_id": campaign_id, "agent_id": agent,
+                             "campaign_name": "back", "campaign_status": "active"}])
+
+
+def test_a_resume_in_formi_does_not_restart_calls_here(client, armed, monkeypatch):
+    """paused -> active in the warehouse never re-arms the autopilot.
+
+    The campaign comes back off pause -- see the test below -- but dialling is
+    this console's decision and stays off until someone makes it here. Under live
+    dialling the alternative is a wave of real calls nobody asked for.
+    """
+    from engine.sync import PLATFORM_PAUSE, refresh_campaign_status
+
+    conn = _db()
+    agent = conn.execute("SELECT agent_id FROM campaigns WHERE id=?", (armed,)).fetchone()[0]
+    conn.execute("UPDATE campaigns SET platform_status='paused', paused=1, autopilot=0, "
+                 "autopilot_latched=1, stopped_reason=? WHERE id=?", (PLATFORM_PAUSE, armed))
+    conn.commit()
+    _resumed_in_formi(monkeypatch, agent, armed)
+
+    assert refresh_campaign_status(_db(), [agent], None, None, TODAY) == []
+    row = conn.execute("SELECT autopilot, autopilot_latched FROM campaigns WHERE id=?",
+                       (armed,)).fetchone()
+    assert row["autopilot"] == 0, "Formi resumed it and calls restarted"
+    # The latch is dropped with the pause it belonged to. Left set it outlives its
+    # owner, and the NEXT resume in this console re-arms a campaign nobody armed.
+    assert row["autopilot_latched"] == 0
+    conn.close()
+
+
+def test_a_resume_in_formi_lifts_the_pause_formi_itself_caused(client, armed, monkeypatch):
+    """The campaign the platform stopped must be able to come back from there.
+
+    Reported on 12 Sep 2026: the operator resumed a campaign in Formi and the
+    console went on showing it stopped, reason "paused in the Formi platform".
+    That reason was no longer true and nothing in Formi could clear it -- the
+    flag is only ever written here, so the edge that set it had to be the edge
+    that cleared it. Un-paused, still not dialling: that is the next test.
+    """
+    from engine.sync import PLATFORM_PAUSE, refresh_campaign_status
+
+    conn = _db()
+    agent = conn.execute("SELECT agent_id FROM campaigns WHERE id=?", (armed,)).fetchone()[0]
+    conn.execute("UPDATE campaigns SET platform_status='paused', paused=1, autopilot=0, "
+                 "stopped_reason=? WHERE id=?", (PLATFORM_PAUSE, armed))
+    conn.commit()
+    _resumed_in_formi(monkeypatch, agent, armed)
+
+    refresh_campaign_status(_db(), [agent], None, None, TODAY)
+    row = conn.execute("SELECT paused, stopped_reason, autopilot_note FROM campaigns "
+                       "WHERE id=?", (armed,)).fetchone()
+    assert row["paused"] == 0, "resumed in Formi, still stopped here"
+    assert row["stopped_reason"] == ""
+    # The operator has to re-arm it, so the console says so where they are looking.
+    assert "autopilot" in row["autopilot_note"]
+    conn.close()
+
+
+def test_a_resume_in_formi_does_not_undo_a_pause_made_here(client, armed, monkeypatch):
+    """An operator's own pause outranks the platform flag flipping back.
+
+    The pause above is lifted because this console applied it on the platform's
+    behalf and owns no opinion of its own. A pause somebody made HERE is a
+    decision, and a campaign going active in Formi is not an answer to it.
+    """
     from engine.sync import refresh_campaign_status
 
     conn = _db()
     agent = conn.execute("SELECT agent_id FROM campaigns WHERE id=?", (armed,)).fetchone()[0]
-    conn.execute("UPDATE campaigns SET platform_status='paused', paused=1, autopilot=0 "
-                 "WHERE id=?", (armed,))
+    conn.execute("UPDATE campaigns SET platform_status='paused', paused=1, autopilot=0, "
+                 "stopped_reason='stopped here' WHERE id=?", (armed,))
     conn.commit()
-    monkeypatch.setattr(sync.ms, "fetch_agent_campaigns",
-                        lambda agent_id, config=None, schema=None, today=None: [
-                            {"campaign_id": armed, "agent_id": agent, "campaign_name": "back",
-                             "campaign_status": "active"}])
+    _resumed_in_formi(monkeypatch, agent, armed)
 
-    assert refresh_campaign_status(_db(), [agent], None, None, TODAY) == []
-    row = conn.execute("SELECT paused, autopilot FROM campaigns WHERE id=?", (armed,)).fetchone()
-    assert row["paused"] == 1 and row["autopilot"] == 0, "Formi resumed it and calls restarted"
+    refresh_campaign_status(_db(), [agent], None, None, TODAY)
+    row = conn.execute("SELECT paused, stopped_reason FROM campaigns WHERE id=?",
+                       (armed,)).fetchone()
+    assert row["paused"] == 1 and row["stopped_reason"] == "stopped here"
     conn.close()
 
 
