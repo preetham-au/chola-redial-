@@ -2,10 +2,16 @@
 -- Nothing here is a Formi mirror: `leads` exists only so the app is explorable
 -- offline (LEADS_SOURCE=seed). With LEADS_SOURCE=metabase it stays empty.
 
--- `autopilot` is the console's own switch and is NEVER written by a sync: the
--- operator turns it on here and only this app, or a killed campaign, turns it
--- off. It ends by itself when every lead is past the grace floor or in a
--- terminal stage (api/autopilot.py).
+-- `autopilot` is the console's own switch. A sync writes it in exactly two
+-- places: a campaign seen for the FIRST time and active in Formi arrives armed,
+-- and a campaign killed in Formi is disarmed (both in sync.upsert_campaign).
+-- Between those, it is the operator's alone -- disarming a campaign here keeps
+-- it disarmed through every later sync. It ends by itself when every lead is
+-- past the grace floor or in a terminal stage (api/autopilot.py).
+--
+-- Armed on arrival because the alternative was worse: the default below is 0 and
+-- nothing raised it, so a campaign created in Formi synced, showed its leads,
+-- and never dialled until somebody found the switch.
 --
 -- It means "include this campaign in the daily plan", not "dial this campaign".
 -- Nothing in this console dials without an operator approving the day — see

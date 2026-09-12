@@ -174,6 +174,16 @@ def fetch_fresh_leads(campaign_id: int, config: ms.MetabaseConfig,
     `queued_today` is counted here with the same definition
     `metabase_source.candidate_sql` uses — a campaign uploaded this morning and
     part-scheduled by hand is exactly the case that would otherwise double-dial.
+
+    Pages on `v.id`, for the reason `fetch_redial_leads` does: Metabase's
+    /api/dataset stops at `ms.ROW_CAP` rows whatever the SQL says, and a short
+    page is the only signal that the last one has arrived. One statement was
+    enough until a campaign got bigger than the cap, and then it went wrong in
+    the worst available way — silently, and only on NEW campaigns. This is the
+    whole of a never-dialled campaign's lead list (the history path returns
+    nothing for one), so campaign 1818 "CIFCO SEP" synced 2,000 of its 2,530
+    leads on 12 Sep 2026 and the missing 530 were never dialled by anybody. No
+    log line said so either: `sync` only cries CAPPED at `--leads` (5,000).
     """
     red_expr = ms.red_parse_expression("v.red")
     # Same "today only" scope as the history path: leads the engine could put on
@@ -183,7 +193,10 @@ def fetch_fresh_leads(campaign_id: int, config: ms.MetabaseConfig,
         today_sql = f"DATE '{(today or ms.ist_today()).isoformat()}'"
         window = (f"  AND ((red.d - {today_sql}) BETWEEN {int(dte_min)} AND {int(dte_max)}\n"
                   f"       OR COALESCE(q.queued_today, 0) > 0)\n")
-    rows = retry(f"fresh leads {campaign_id}", ms.run_sql, f"""
+    rows: list[dict[str, Any]] = []
+    after_id = 0
+    for _ in range(ms.MAX_PAGES):
+        page = retry(f"fresh leads {campaign_id}", ms.run_sql, f"""
 SELECT v.id AS warehouse_lead_id, v.uuid AS lead_uuid, v.lead_name,
        LOWER(COALESCE(v.stage, '')) AS stage,
        v.red AS red_raw, red.d AS red, v.policy_no,
@@ -202,7 +215,22 @@ LEFT JOIN (
   GROUP BY i.lead_id
 ) q ON q.lead_id = v.id
 WHERE l.campaign_id = {int(campaign_id)}
-{window}""".strip(), config, timeout=120)
+  AND v.id > {int(after_id)}
+{window}ORDER BY v.id
+LIMIT {int(ms.ROW_CAP)}""".strip(), config, timeout=120)
+        rows.extend(page)
+        # A short page is the last page. Asking for ROW_CAP and getting ROW_CAP
+        # means the cap may have cut it, so there is another page to ask for.
+        if len(page) < ms.ROW_CAP:
+            break
+        last = page[-1].get("warehouse_lead_id")
+        if last is None or int(last) <= after_id:
+            break               # no cursor, or it stalled -- stop rather than loop
+        after_id = int(last)
+    else:
+        raise ms.MetabaseError(
+            f"fresh leads {campaign_id}: paging exceeded {ms.MAX_PAGES} pages "
+            f"({len(rows):,} rows)")
     for r in rows:
         red = r.get("red")
         if red is not None and not isinstance(red, str):
@@ -270,6 +298,27 @@ def upsert_campaign(conn: sqlite3.Connection, row: dict[str, Any]) -> bool:
 
     `enabled` IS still copied every time: a campaign killed in Formi must leave
     the roster, and killing it also switches the autopilot off.
+
+    A campaign SEEN FOR THE FIRST TIME and active in Formi arrives ARMED. That is
+    the one place a sync writes `autopilot`, and only on the INSERT — the UPDATE
+    below still never touches it except to switch it off on a kill, so an
+    operator who disarms a campaign keeps it disarmed through every later sync.
+
+    Without this, `autopilot` took its schema default of 0 and nothing ever
+    raised it: a new campaign synced, appeared in the console with its leads, and
+    then sat there. On 12 Sep 2026 campaigns 1818 and 1819 ("CIFCO SEP") were the
+    only two of 101 still at 0 — created after the others were armed by hand, and
+    never dialled. From the operator's seat that is "new campaigns never sync
+    properly", and it is what the standing rule against campaign filters asks for:
+    a campaign created in Formi is picked up and runs without anyone finding a
+    switch for it.
+
+    Arming is not dialling. An armed campaign is PLANNED by the daily passes and
+    the plan still waits for a human to approve it (`api/day.py:approve_day`,
+    which nothing calls automatically), so this puts a new campaign in front of
+    the operator rather than on the phone. The loud test/dev name warning `sync`
+    prints is what stands between an approval and a rehearsal campaign; there is
+    deliberately no name filter here.
     """
     enabled, paused = campaign_status_flags(row.get("campaign_status"))
     status = str(row.get("campaign_status") or "").strip().lower()
@@ -277,10 +326,13 @@ def upsert_campaign(conn: sqlite3.Connection, row: dict[str, Any]) -> bool:
     was = conn.execute("SELECT platform_status FROM campaigns WHERE id=?",
                        (campaign_id,)).fetchone()
     seen = str(was["platform_status"] or "") if was else ""
+    # Armed on arrival, and only on arrival -- see the docstring. Paused or
+    # killed in Formi means it arrives disarmed and the operator switches it on.
+    arm = int(bool(enabled) and not paused)
     conn.execute(
         "INSERT INTO campaigns (id, agent_id, warehouse_id, name, enabled, paused, "
-        "                       platform_status) "
-        "VALUES (?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
+        "                       platform_status, autopilot, autopilot_note) "
+        "VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
         "agent_id=excluded.agent_id, warehouse_id=excluded.warehouse_id, "
         "name=excluded.name, enabled=excluded.enabled, "
         "platform_status=excluded.platform_status, "
@@ -289,7 +341,8 @@ def upsert_campaign(conn: sqlite3.Connection, row: dict[str, Any]) -> bool:
         "  THEN 'stopped: campaign killed in Formi' ELSE campaigns.autopilot_note END",
         (campaign_id, int(row["agent_id"]), campaign_id,
          str(row.get("campaign_name") or f"campaign {campaign_id}"), enabled, paused,
-         status))
+         status, arm,
+         "armed on arrival: new campaign, active in Formi" if arm else ""))
     if seen == "paused" and status != "paused" and enabled:
         # The other edge. "Do nothing" was right about the calls and wrong about
         # the pause: on 12 Sep 2026 the operator resumed a campaign in Formi and

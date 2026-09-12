@@ -145,3 +145,154 @@ def test_a_store_that_lost_its_leads_re_pulls(conn):
         conn.execute(f"INSERT INTO leads ({cols}) VALUES ({','.join('?' * len(cols.split(',')))})",
                      tuple(removed))
         conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# The two ways a NEW campaign used to arrive broken
+#
+# Both bite only a campaign nobody has dialled yet, which is why they read as
+# one complaint -- "new campaigns never sync properly" -- and needed two fixes.
+# ---------------------------------------------------------------------------
+
+def _warehouse_row(**over):
+    return {**ROW, "campaign_id": 9500, "campaign_name": "brand new", **over}
+
+
+def _campaign(conn, campaign_id):
+    return conn.execute("SELECT * FROM campaigns WHERE id=?", (campaign_id,)).fetchone()
+
+
+@pytest.fixture()
+def fresh_campaign(conn):
+    """An id no fixture owns, removed again afterwards.
+
+    `conn` comes from the session-scoped `client`, so a row left behind here is
+    a row every later test sees.
+    """
+    ids = (9500, 9501)
+    yield ids
+    for campaign_id in ids:
+        conn.execute("DELETE FROM campaigns WHERE id=?", (campaign_id,))
+    conn.commit()
+
+
+def test_a_new_active_campaign_arrives_armed(conn, fresh_campaign):
+    """Created in Formi, dialling here, with nobody having to find a switch.
+
+    This is the whole of the operator's complaint: before it, `autopilot` took
+    its schema default of 0 and no sync ever raised it, so a new campaign synced
+    with all its leads and then sat there. On 12 Sep 2026 campaigns 1818 and
+    1819 were the only two of 101 still at 0.
+    """
+    from engine.sync import upsert_campaign
+
+    upsert_campaign(conn, _warehouse_row(campaign_status="active"))
+    conn.commit()
+    row = _campaign(conn, 9500)
+    assert row["autopilot"] == 1
+    assert "armed on arrival" in row["autopilot_note"], "the operator is told why"
+
+
+@pytest.mark.parametrize("status", ["paused", "killed"])
+def test_a_new_campaign_that_is_not_running_in_formi_does_not_arm_itself(
+        conn, fresh_campaign, status):
+    """Arriving armed is for campaigns Formi says are live. Nothing else."""
+    from engine.sync import upsert_campaign
+
+    upsert_campaign(conn, _warehouse_row(campaign_status=status))
+    conn.commit()
+    assert _campaign(conn, 9500)["autopilot"] == 0
+
+
+def test_a_later_sync_never_re_arms_a_campaign_the_operator_switched_off(
+        conn, fresh_campaign):
+    """The reason this is an INSERT-only write, and the test that keeps it one.
+
+    Arming on every sync would take the switch away from the operator entirely:
+    disarm a campaign at 11:00 and the 11:05 sync starts planning it again. The
+    old rule -- a sync never writes `autopilot` -- was protecting exactly this,
+    and it still holds for every sync after the first.
+    """
+    from engine.sync import upsert_campaign
+
+    row = _warehouse_row(campaign_status="active")
+    upsert_campaign(conn, row)
+    conn.commit()
+    conn.execute("UPDATE campaigns SET autopilot=0, autopilot_note='operator stopped it' "
+                 "WHERE id=9500")
+    conn.commit()
+
+    upsert_campaign(conn, row)              # the next sync, same active campaign
+    conn.commit()
+    assert _campaign(conn, 9500)["autopilot"] == 0, "a sync re-armed a disarmed campaign"
+
+
+def test_a_campaign_killed_in_formi_is_still_disarmed_by_a_sync(conn, fresh_campaign):
+    """The other direction, which was already true and must stay true."""
+    from engine.sync import upsert_campaign
+
+    upsert_campaign(conn, _warehouse_row(campaign_status="active"))
+    conn.commit()
+    assert _campaign(conn, 9500)["autopilot"] == 1
+
+    upsert_campaign(conn, _warehouse_row(campaign_status="killed"))
+    conn.commit()
+    row = _campaign(conn, 9500)
+    assert row["autopilot"] == 0 and row["enabled"] == 0
+
+
+def test_fresh_leads_pages_past_the_metabase_row_cap(monkeypatch):
+    """The silent half: a never-dialled campaign bigger than the cap lost leads.
+
+    Metabase's /api/dataset stops at `ROW_CAP` rows whatever the SQL asks for,
+    and `fetch_fresh_leads` asked once. For a campaign with dial history that
+    barely showed -- most of its leads come from the paging `fetch_redial_leads`
+    -- but a NEW campaign has no history at all, so this query is its entire
+    lead list. Campaign 1818 stored 2,000 of its 2,530 leads and said nothing:
+    `sync` only warns at `--leads` (5,000), so 530 customers were never dialled
+    and no log line existed to notice it.
+    """
+    import re
+
+    import engine.metabase_source as ms
+    from engine.sync import fetch_fresh_leads
+
+    monkeypatch.setattr(ms, "ROW_CAP", 10)
+    warehouse = [{"warehouse_lead_id": i, "lead_uuid": f"u{i}"} for i in range(1, 26)]
+    pages: list[int] = []
+
+    def fake_run_sql(sql, config=None, **kwargs):
+        after = int(re.search(r"v\.id > (\d+)", sql).group(1))
+        limit = int(re.search(r"LIMIT (\d+)", sql).group(1))
+        assert "ORDER BY v.id" in sql, "a keyset cursor without an order is not a cursor"
+        page = [r for r in warehouse if r["warehouse_lead_id"] > after][:limit]
+        pages.append(len(page))
+        return page
+
+    monkeypatch.setattr(ms, "run_sql", fake_run_sql)
+    rows = fetch_fresh_leads(9500, None)
+
+    assert [r["warehouse_lead_id"] for r in rows] == list(range(1, 26)), \
+        "every lead in the campaign, not just the first page"
+    assert pages == [10, 10, 5], f"expected three pages ending short, got {pages}"
+
+
+def test_fresh_leads_stops_asking_once_a_page_comes_back_short(monkeypatch):
+    """The cheap case must stay cheap: one page when one page is the whole thing.
+
+    Paging that always asks twice would double the cost of every small campaign,
+    and most of them are small.
+    """
+    import engine.metabase_source as ms
+    from engine.sync import fetch_fresh_leads
+
+    monkeypatch.setattr(ms, "ROW_CAP", 10)
+    calls = []
+
+    def fake_run_sql(sql, config=None, **kwargs):
+        calls.append(sql)
+        return [{"warehouse_lead_id": i} for i in range(1, 4)]
+
+    monkeypatch.setattr(ms, "run_sql", fake_run_sql)
+    assert len(fetch_fresh_leads(9500, None)) == 3
+    assert len(calls) == 1, "a short first page is the last page"
