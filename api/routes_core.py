@@ -942,12 +942,62 @@ def _formi_post(agent_id: Any, lead_uuid: Any, scheduled_time: Any) -> tuple[Any
     return None, POST_ATTEMPTS
 
 
+def post_rate_per_sec() -> float:
+    """POSTs per second `_dial_live` will send. 0 disables the pacing entirely.
+
+    Read from the environment at call time, like `dry_run()`, so the rate can be
+    turned down on a live box without a deploy -- which is the state you are in
+    when you find out it was too high.
+    """
+    import os                                          # noqa: PLC0415 — see _formi_post
+    try:
+        return max(0.0, float(os.environ.get("FORMI_POST_RATE_PER_SEC", DEFAULT_POST_RATE)))
+    except ValueError:
+        return DEFAULT_POST_RATE
+
+
+# Approving a day hands Formi every slot in the run at once, and a run can hold a
+# few thousand. This loop used to send them as fast as the socket allowed, which
+# the operator asked us to stop doing on 12 Sep 2026: Formi's scheduler is the
+# same system their agents work in, and a burst that size is indistinguishable
+# from an attack at the receiving end.
+#
+# The console gains nothing by the hurry. Every slot in the run is scheduled for
+# minutes or hours later -- filing them over a minute instead of two seconds
+# changes no call's time by one second. 5/s is slow enough to be invisible to
+# Formi and fast enough that 3000 slots take ten minutes rather than all day.
+DEFAULT_POST_RATE = 5.0
+# Rows per commit. The whole run used to land in one transaction written after
+# the last POST, so a timeout or a restart half way through lost every plan_items
+# row for calls that had ALREADY been placed -- and a re-approve then posted them
+# a second time. Committing as we go means the worst case is one batch re-sent.
+POST_BATCH = 50
+
+
 def _dial_live(conn: sqlite3.Connection, campaign: sqlite3.Row, items,
                source: str) -> tuple[int, int]:
-    """POST each slot to Formi. Unreachable while DRY_RUN is set."""
+    """POST each slot to Formi, paced. Unreachable while DRY_RUN is set."""
+    import time                                        # noqa: PLC0415 — see _formi_post
+
     posted = failed = 0
-    logged = []
+    logged: list = []
+    gap = 1.0 / rate if (rate := post_rate_per_sec()) else 0.0
+    due = time.monotonic()
+
+    def flush() -> None:
+        dial_log.write(conn, logged)
+        logged.clear()
+        conn.commit()
+
     for item in items:
+        if gap:
+            if (wait := due - time.monotonic()) > 0:
+                time.sleep(wait)
+            # Clamped to now rather than `due + gap` alone: after a slow patch --
+            # a 45s timeout, three retries -- a pure schedule would be far in the
+            # past and the loop would sprint to catch up, producing exactly the
+            # burst the pacing exists to prevent.
+            due = max(due + gap, time.monotonic())
         response, attempts = _formi_post(campaign["agent_id"], item["lead_uuid"],
                                          item["scheduled_time"])
         ok = response is not None and 200 <= response.status_code < 300
@@ -964,7 +1014,9 @@ def _dial_live(conn: sqlite3.Connection, campaign: sqlite3.Row, items,
             body={"scheduled_time": item["scheduled_time"]}, dry=False,
             outcome="placed" if ok else ("error" if response is None else "rejected"),
             http_status=status, response=body, attempts=attempts))
-    dial_log.write(conn, logged)
+        if len(logged) >= POST_BATCH:
+            flush()
+    flush()
     return posted, failed
 
 

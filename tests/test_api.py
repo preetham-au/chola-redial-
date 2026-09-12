@@ -1176,3 +1176,101 @@ class TestStoredConfigsTrackTheDefaults:
         mine = [dict(r) for r in DEFAULT_CONFIG["frequency_table"]]
         mine[0]["calls_per_week"] = 4
         assert with_defaults({**DEFAULT_CONFIG, "frequency_table": mine})["frequency_table"] == mine
+
+
+# ---------------------------------------------------------------------------
+# Pacing the posts to Formi
+# ---------------------------------------------------------------------------
+
+class _Ok:
+    status_code = 200
+    text = '{"scheduled": true}'
+
+
+def _dial_live_with(monkeypatch, item_count, rate, post_cost=0.0):
+    """Run `_dial_live` over `item_count` fake slots on a fake clock.
+
+    The clock is fake so the suite does not spend the seconds the pacing is
+    spending, and `sleep` advances it -- a stub that only records would leave
+    `monotonic` frozen, the loop would fall further behind schedule on every
+    lap, and the requested waits would grow 0.2, 0.4, 0.6 without anything being
+    wrong with the code under test.
+
+    `post_cost` is how long a POST itself 'takes', for the case that matters:
+    one slow call must not be repaid by a sprint through the next ten.
+    """
+    import sqlite3
+
+    from api import routes_core
+    from api.db import db_path
+
+    posts, slept, clock = [], [], [1000.0]
+
+    def _post(*args):
+        posts.append(args)
+        clock[0] += post_cost
+        return _Ok(), 1
+
+    def _sleep(seconds):
+        slept.append(seconds)
+        clock[0] += seconds
+
+    monkeypatch.setenv("FORMI_POST_RATE_PER_SEC", str(rate))
+    monkeypatch.setenv("DRY_RUN", "0")
+    monkeypatch.setattr(routes_core, "_formi_post", _post)
+    monkeypatch.setattr("time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("time.sleep", _sleep)
+
+    conn = sqlite3.connect(db_path())
+    conn.row_factory = sqlite3.Row
+    campaign = conn.execute("SELECT * FROM campaigns LIMIT 1").fetchone()
+    # plan_items ids that do not exist: the UPDATE matches nothing, which is all
+    # this test needs. It is the posting loop under test, not the bookkeeping.
+    items = [{"id": -1 - i, "lead_uuid": f"uuid-{i}", "lead_name": "x", "phone": "9000000000",
+              "scheduled_time": "2026-09-13T10:00:00", "slot_no": 1, "bucket": "F5",
+              "campaign_id": campaign["id"]} for i in range(item_count)]
+    try:
+        posted, failed = routes_core._dial_live(conn, campaign, items, "test")
+    finally:
+        conn.close()
+    return posts, slept, posted, failed
+
+
+def test_approving_a_big_run_paces_its_posts_instead_of_bursting(client, monkeypatch):
+    """3000 slots used to go out as fast as the socket allowed.
+
+    Formi's scheduler is the same system the agents work in, and the operator
+    asked on 12 Sep 2026 for the console to stop handing it a whole day in one
+    burst. Nothing is lost by the wait: every slot is scheduled for minutes or
+    hours later, so filing them over a minute moves no call by one second.
+    """
+    posts, slept, posted, failed = _dial_live_with(monkeypatch, 10, rate=5)
+
+    assert (posted, failed) == (10, 0), "pacing must not drop or fail a call"
+    assert len(posts) == 10
+    # Nine gaps between ten posts. The first goes immediately -- a single-slot
+    # manual redial must not sit waiting for a rate limiter.
+    assert len(slept) == 9, f"expected nine paced gaps, got {slept}"
+    assert all(s == pytest.approx(1 / 5) for s in slept), f"gaps are not 1/rate: {slept}"
+
+
+def test_one_slow_post_is_not_repaid_by_a_sprint(client, monkeypatch):
+    """The clamp. A 45s timeout with three retries can put the loop a minute
+    behind its own schedule, and a pure `due += gap` would then fire the whole
+    backlog with no wait at all -- the exact burst the pacing exists to prevent,
+    arriving right after Formi has shown it is already struggling.
+    """
+    _, slept, posted, _ = _dial_live_with(monkeypatch, 6, rate=5, post_cost=30.0)
+
+    assert posted == 6
+    assert slept == [], "the loop tried to catch up after a slow post"
+
+
+def test_the_pacing_can_be_switched_off(client, monkeypatch):
+    """Rate 0 means no pacing at all -- the way back if it is ever too slow.
+
+    It is read from the environment on every call, so turning it off or down is
+    something that can be done to a live box, which is when you find out.
+    """
+    _, slept, posted, _ = _dial_live_with(monkeypatch, 5, rate=0)
+    assert slept == [] and posted == 5
