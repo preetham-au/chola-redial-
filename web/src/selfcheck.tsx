@@ -12,7 +12,7 @@ import { TestCallResultView, TestNumberTable, TriggerConfirm } from './screens/T
 import { ApproveDay, Headline, autopilotDiff, closesAt, wireBuckets } from './screens/Today';
 import { Row as LogRow } from './screens/CallLog';
 import { selectionSplit } from './screens/CampaignVisibility';
-import { api } from './lib/api';
+import { ApiError, api, isOffline, retryLive } from './lib/api';
 import {
   mockBuckets,
   mockCampaigns,
@@ -456,6 +456,32 @@ ok(
   );
   const derived = await api.agents();
   ok('the agent list survives a backend without /api/agents', derived.length === agents.length);
+
+  // --- a 500 is not "unreachable" --------------------------------------------
+  // One crashing endpoint must not blank the console into fixtures. fetch is
+  // stubbed rather than trusted: everything above runs with no fetch at all, so
+  // the sticky offline flag is already set and has to be cleared first.
+  const stub = (status: number) => {
+    (globalThis as { fetch?: unknown }).fetch = async () => ({
+      ok: false, status, statusText: 'error',
+      json: async () => ({ error: `boom ${status}` }),
+    });
+  };
+
+  retryLive();
+  stub(500);
+  let raised: unknown = null;
+  try { await api.health(); } catch (e) { raised = e; }
+  ok('a 500 is surfaced as an error, not swallowed into mock data',
+     raised instanceof ApiError && raised.status === 500);
+  ok('and the console stays live — one broken endpoint is not an unreachable backend',
+     !isOffline());
+
+  stub(503);
+  await api.health();
+  ok('a 502/503/504 IS the proxy speaking for a dead backend, so that still goes offline',
+     isOffline());
+  retryLive();
 
   console.log('\nall checks passed');
 })();

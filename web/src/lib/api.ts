@@ -106,7 +106,13 @@ async function req<T>(path: string, init: RequestInit | undefined, fallback: () 
       } catch {
         /* non-JSON error body */
       }
-      if (res.status >= 500) {
+      // 502/503/504 are the proxy speaking for a backend that is not answering,
+      // which is a real "unreachable". A 500 is the app ITSELF answering: it is
+      // up, it failed on this one call, and swapping the whole console to mock
+      // data over one broken endpoint replaces every real number on screen with
+      // a fixture — and the flag is sticky, so it stays that way until reload.
+      // On 12 Sep 2026 a crash in /api/test-call/trigger did exactly that.
+      if (res.status === 502 || res.status === 503 || res.status === 504) {
         setOffline(true);
         return fallback();
       }
