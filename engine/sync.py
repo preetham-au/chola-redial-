@@ -343,16 +343,33 @@ def upsert_campaign(conn: sqlite3.Connection, row: dict[str, Any]) -> bool:
          str(row.get("campaign_name") or f"campaign {campaign_id}"), enabled, paused,
          status, arm,
          "armed on arrival: new campaign, active in Formi" if arm else ""))
-    if seen == "paused" and status != "paused" and enabled:
-        # The other edge. "Do nothing" was right about the calls and wrong about
-        # the pause: on 12 Sep 2026 the operator resumed a campaign in Formi and
-        # the console went on showing it stopped, with the reason "paused in the
-        # Formi platform" -- no longer true, and a one-way door, because nothing
-        # in Formi could clear a flag only this console writes.
+    if status != "paused" and enabled:
+        # NOT an edge, and that is the point. "Do nothing" was right about the
+        # calls and wrong about the pause: on 12 Sep 2026 the operator resumed a
+        # campaign in Formi and the console went on showing it stopped, with the
+        # reason "paused in the Formi platform" -- no longer true, and a one-way
+        # door, because nothing in Formi could clear a flag only this console
+        # writes.
         #
-        # So the pause this console applied ON THE PLATFORM'S BEHALF is lifted,
-        # and only that one: `stopped_reason` is matched so an operator's own
-        # pause here is never undone by a warehouse flag flipping back.
+        # The first go at that was edge-triggered too (`seen == "paused"`), which
+        # left the door shut for every campaign that had already walked through
+        # it. `platform_status` is copied on EVERY sync and always has been, so a
+        # resume that happened before this code existed was consumed by a sync
+        # that did nothing with it: `seen` reads "active" forever after, the edge
+        # can never fire again, and the campaign is stopped for good. That is
+        # exactly what 1744, 1745 and 1746 ("05 sep redial") did -- resumed in
+        # Formi at 11:15 and 12:06, four minutes before the edge fix shipped at
+        # 12:10, and still showing "paused" the next day with `platform_status`
+        # already reading `active`.
+        #
+        # So this reconciles STATE rather than a transition: whenever Formi says
+        # a campaign is not paused, any pause THIS CONSOLE applied on the
+        # platform's behalf is lifted. Missing an edge costs a sync now, not
+        # forever. Being idempotent is what makes it self-healing -- the UPDATE
+        # matches nothing on every later sync, once the reason has been cleared.
+        #
+        # Only that one pause, though: `stopped_reason` is matched so an
+        # operator's own pause here is never undone by a warehouse flag.
         #
         # The autopilot stays OFF -- a resume in Formi still must not start
         # dialling, which is the rule the old no-op was protecting. The latch

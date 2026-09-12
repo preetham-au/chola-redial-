@@ -325,6 +325,71 @@ def test_a_resume_in_formi_lifts_the_pause_formi_itself_caused(client, armed, mo
     conn.close()
 
 
+def test_a_campaign_whose_resume_was_already_missed_still_comes_back(
+        client, armed, monkeypatch):
+    """The stuck state, which the edge-triggered version could never leave.
+
+    `platform_status` is copied on EVERY sync and always has been, so a resume
+    that happened before the repair existed was consumed by a sync that did
+    nothing with it. The column then reads `active` for good, `seen` is never
+    `paused` again, and an edge-triggered repair has nothing left to fire on --
+    the campaign is stopped forever, for a reason that stopped being true.
+
+    Reported 13 Sep 2026: campaigns 1744, 1745 and 1746 ("05 sep redial"),
+    resumed in Formi at 11:15 and 12:06 the day before, four minutes either side
+    of the edge fix shipping at 12:10. Every one of them still read
+    `paused=1, stopped_reason='paused in the Formi platform'` with
+    `platform_status='active'` sitting right beside it.
+
+    So the state below is the bug: the warehouse and the console already agree
+    that the campaign is active, and it is still stopped.
+    """
+    from engine.sync import PLATFORM_PAUSE, refresh_campaign_status
+
+    conn = _db()
+    agent = conn.execute("SELECT agent_id FROM campaigns WHERE id=?", (armed,)).fetchone()[0]
+    # platform_status='active' -- the transition has ALREADY been consumed.
+    conn.execute("UPDATE campaigns SET platform_status='active', paused=1, autopilot=0, "
+                 "stopped_reason=? WHERE id=?", (PLATFORM_PAUSE, armed))
+    conn.commit()
+    _resumed_in_formi(monkeypatch, agent, armed)
+
+    refresh_campaign_status(_db(), [agent], None, None, TODAY)
+    row = conn.execute("SELECT paused, stopped_reason FROM campaigns WHERE id=?",
+                       (armed,)).fetchone()
+    assert row["paused"] == 0, "no edge left to fire on, so it stayed stopped forever"
+    assert row["stopped_reason"] == ""
+    conn.close()
+
+
+def test_lifting_a_platform_pause_is_idempotent(client, armed, monkeypatch):
+    """Reconciling state on every sync must not become a write on every sync.
+
+    This is what makes it safe to drop the edge: once the reason is cleared the
+    UPDATE matches nothing, so an operator who pauses the campaign here a minute
+    later is not un-paused again by the next sync.
+    """
+    from engine.sync import PLATFORM_PAUSE, refresh_campaign_status
+
+    conn = _db()
+    agent = conn.execute("SELECT agent_id FROM campaigns WHERE id=?", (armed,)).fetchone()[0]
+    conn.execute("UPDATE campaigns SET platform_status='active', paused=1, autopilot=0, "
+                 "stopped_reason=? WHERE id=?", (PLATFORM_PAUSE, armed))
+    conn.commit()
+    _resumed_in_formi(monkeypatch, agent, armed)
+    refresh_campaign_status(_db(), [agent], None, None, TODAY)
+
+    # The operator stops it HERE, after the repair. Formi still says active.
+    conn.execute("UPDATE campaigns SET paused=1, stopped_reason='stopped here' WHERE id=?",
+                 (armed,))
+    conn.commit()
+    refresh_campaign_status(_db(), [agent], None, None, TODAY)
+    row = conn.execute("SELECT paused, stopped_reason FROM campaigns WHERE id=?",
+                       (armed,)).fetchone()
+    assert row["paused"] == 1 and row["stopped_reason"] == "stopped here"
+    conn.close()
+
+
 def test_a_resume_in_formi_does_not_undo_a_pause_made_here(client, armed, monkeypatch):
     """An operator's own pause outranks the platform flag flipping back.
 
