@@ -251,8 +251,31 @@ that is no longer `planned` answers `already_committed`.
   "approved": 4, "posted": 461, "failed": 0, "not_dialled": 172,
   "campaigns": [ { "campaign_id": 1650, "name": "…", "status": "approved",
                    "run_id": 913, "posted": 210, "failed": 0, "dropped": 0,
-                   "expired": 0, "simulated": 210 } ] }
+                   "expired": 0, "simulated": 210 },
+                 // Did not dial, and says why. `detail` is present for
+                 // window_closed / not_dialled / error; `run_id` for every
+                 // outcome except not_prepared, where there is no run to act on.
+                 { "campaign_id": 1651, "name": "…", "status": "window_closed",
+                   "run_id": 914,
+                   "detail": "the 10:00-19:00 window has closed (it is 19:24)" } ] }
 ```
+
+A per-campaign `status` is one of `approved` · `not_prepared` ·
+`already_committed` · `already_paused` · `nothing_to_dial` · `window_closed` ·
+`not_dialled` · `error`.
+
+**Every outcome that is not a clean dial is also written to that campaign's
+`autopilot_note`** (`"2026-09-13 auto: NOT dialled — window_closed: …"`), and a
+partial records the split (`"dialled 210, 12 refused by Formi"`). The response is
+the only copy otherwise, and for `window_closed` and `error` there is no run row
+either — so a campaign that failed to start would leave nothing behind once the
+caller dropped the response. `already_committed` is the exception: that campaign
+*did* dial, on an earlier approve, and keeps the note saying how that went.
+
+`failed` and `not_dialled` are not the same kind of thing. `failed` is Formi
+refusing a call — a fault, and what `POST /api/runs/{id}/retry` sends again.
+`not_dialled` is a slot that no longer fitted before the window shut; it returns
+in the next plan on its own, and retrying it would only expire it again.
 
 ### Call log
 
@@ -287,7 +310,30 @@ moment it is sent — never from an inference afterwards. Rows are pruned after
 | `POST` | `/api/runs/{id}/approve` | **dials** — one campaign's run, the per-campaign twin of `POST /api/day/approve`. 409 if the campaign is paused or the run is not `planned`. Under DRY_RUN marks items `simulated`. |
 | `POST` | `/api/runs/{id}/pause` | takes a `committed` run's un-dialled calls back off Formi's clock and marks it `paused`. Already-dialled calls stay in history. 409 if not `committed`. |
 | `POST` | `/api/runs/{id}/resume` | puts a `paused` run's remainder back on Formi's clock, edits included. 409 if not `paused`, or if the campaign is paused. **Dials.** |
+| `POST` | `/api/runs/{id}/retry` | sends the slots Formi refused a second time. 409 if the run is not `committed`, if the campaign is paused, or if nothing in the run is `failed`. **Dials.** |
 | `DELETE` | `/api/runs/{id}` | discard a plan. 409 for anything not `planned` — a committed run is dial history and is kept. |
+
+`retry` is an approve over a smaller set, not a second dial path: it puts the
+`failed` items back to `planned` and calls the same commit every other dial goes
+through. Three consequences worth knowing before you call it:
+
+- **Only the refused slots go.** Anything already on Formi's clock is untouched —
+  a retry that re-posted those would dial the customer twice.
+- **A refused slot whose time has passed does not dial late.** It is retired as
+  `expired`, exactly as an unapproved plan's stale slots are, and the lead comes
+  back in the next plan. So `retried` can exceed the number actually posted.
+- **`runs.failed` is corrected, not added to.** The old tally is taken off before
+  the re-post, so a run that retries clean reads `failed: 0` rather than carrying
+  a rejection it has already cleared.
+
+```jsonc
+// 200 — the run, plus what this call did
+{ "id": 41, "status": "committed", "counts": { "posted": 308, "failed": 0 },
+  "retried": 12,        // how many refused slots were sent again
+  "expired": 0,         // of those, how many had run out of clock
+  "simulated": 12,      // non-zero only under DRY_RUN
+  "dry_run": true }
+```
 
 `GET /api/campaigns/{id}/buckets` returns both dimensions plus the crosstab:
 

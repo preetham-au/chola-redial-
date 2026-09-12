@@ -9,7 +9,7 @@ import { AgentChip, AgentPauseConfirm, AgentSwitcher } from './components/AgentB
 import { CampaignPicker } from './App';
 import { BucketOffWhy } from './screens/Dashboard';
 import { TestCallResultView, TestNumberTable, TriggerConfirm } from './screens/TestCall';
-import { ApproveDay, Headline, autopilotDiff, closesAt, wireBuckets } from './screens/Today';
+import { ApproveDay, DialResult, Headline, autopilotDiff, closesAt, wireBuckets } from './screens/Today';
 import { Row as LogRow } from './screens/CallLog';
 import { selectionSplit } from './screens/CampaignVisibility';
 import { ApiError, api, isOffline, retryLive } from './lib/api';
@@ -32,7 +32,7 @@ import {
   narrowedBuckets,
   passState,
 } from './lib/domain';
-import type { Campaign, Config, TestCallResult } from './lib/types';
+import type { ApproveResult, Campaign, Config, TestCallResult } from './lib/types';
 
 const ROWS = configurableBuckets(mockConfig.frequency_table);
 let cfg: Config = structuredClone(mockConfig);
@@ -356,6 +356,62 @@ ok(
   const none = modal({}, [], []);
   ok('unticking every bucket blocks the approve button rather than dialling all of them',
      has(none, 'disabled=""') && has(none, 'nothing to dial'));
+}
+
+// --- the dial result: what went out, and what did not -----------------------
+//
+// Asked for on 13 Sep 2026. The numbers were always in the approve response and
+// were summed into a single toast line, then dropped when the modal closed --
+// so a campaign the operator ticked could fail to start and leave nothing on
+// screen. `not_dialled` and `failed` are the two halves of "not scheduled" and
+// only one of them is a fault, which is the distinction under test here.
+{
+  const result = (over: Partial<ApproveResult> = {}): ApproveResult => ({
+    date: '2026-09-13', kind: 'auto', wave: 'Morning', dry_run: false, buckets: 'all',
+    approved: 2, posted: 300, failed: 0, not_dialled: 0,
+    campaigns: [
+      { campaign_id: 1, name: 'Clean campaign', status: 'approved', posted: 300, failed: 0 },
+    ],
+    ...over,
+  });
+  const dialres = (over: Partial<ApproveResult> = {}) =>
+    renderToStaticMarkup(<DialResult res={result(over)} buckets={[]} onChange={() => {}} />);
+
+  const clean = dialres();
+  ok('a clean day reads as everything scheduled and offers no retry',
+     has(clean, '300 scheduled') && has(clean, '0 not scheduled')
+     && !has(clean, 'Retry'));
+
+  const split = dialres({ posted: 300, failed: 12, not_dialled: 340 });
+  ok('the bar splits scheduled from not scheduled',
+     has(split, '300 scheduled') && has(split, '352 not scheduled'));
+  ok('and splits that second number again, because only one half is a fault',
+     has(split, '12 refused by Formi') && has(split, '340 did not fit'));
+
+  const shut = dialres({
+    approved: 0, posted: 0,
+    campaigns: [{
+      campaign_id: 1, name: 'Late campaign', status: 'window_closed', run_id: 7,
+      detail: 'the 10:00-19:00 window has closed (it is 19:24)',
+    }],
+  });
+  ok('a campaign that never started says why, on its own row',
+     has(shut, 'Late campaign') && has(shut, 'window has closed (it is 19:24)'));
+  ok('and can be re-run, since it never dialled',
+     has(shut, 'Retry 1 campaign'));
+
+  const refused = dialres({
+    failed: 12,
+    campaigns: [{
+      campaign_id: 1, name: 'Refused campaign', status: 'approved',
+      posted: 288, failed: 12, run_id: 7,
+    }],
+  });
+  ok('a campaign Formi refused calls for offers to send exactly those again',
+     has(refused, 'Retry 12 calls'));
+  // Re-approving it would be a no-op -- `_approve_one` answers already_committed
+  // -- and would read as an offer to dial the other 288 a second time.
+  ok('but is not offered as a whole-campaign re-run', !has(refused, 'Retry 1 campaign'));
 }
 
 // --- the call log: proof, not paperwork -------------------------------------

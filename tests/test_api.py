@@ -663,6 +663,245 @@ def test_paused_campaign_cannot_be_approved(client):
 
 
 # ---------------------------------------------------------------------------
+# Retrying the calls Formi refused
+#
+# Asked for on 13 Sep 2026: "what if it failed -- you should log it so i can
+# trigger those again". The rejection was always recorded; nothing could act on
+# it, so a lead Formi refused was simply not called that day.
+#
+# The suite runs under DRY_RUN, where a post can never fail, so every test here
+# marks the items `failed` directly -- which is exactly the row `_dial_live`
+# leaves behind on a 4xx.
+# ---------------------------------------------------------------------------
+
+def _fresh_plan(client, campaign_id: int = 5):
+    """Today's plan for one campaign, with any earlier run of it cleared first.
+
+    `client` is session-scoped, so one database is shared by the whole file and
+    a committed run makes every later `plan` for that campaign a 409 -- each
+    test here needs its own run to wreck.
+    """
+    wipe = _db()
+    wipe.execute("DELETE FROM plan_items WHERE run_id IN "
+                 "(SELECT id FROM runs WHERE campaign_id=? AND run_date=?)",
+                 (campaign_id, TODAY))
+    wipe.execute("DELETE FROM runs WHERE campaign_id=? AND run_date=?", (campaign_id, TODAY))
+    wipe.commit()
+    wipe.close()
+    return _plan_today(client, campaign_id)
+
+
+def _committed_with_failures(client, campaign_id: int = 5, n: int = 2):
+    """A committed run holding `n` refused slots. Returns (run_id, failed ids)."""
+    run = _fresh_plan(client, campaign_id)
+    assert client.post(f"/api/runs/{run['id']}/approve").status_code == 200
+    conn = _db()
+    # Only slots still in the future: a retry of a slot whose time has passed is
+    # its own case, tested below, and would otherwise make these tests depend on
+    # the clock.
+    cutoff = now_ist().strftime("%Y-%m-%dT%H:%M:00")
+    ids = [r["id"] for r in conn.execute(
+        "SELECT id FROM plan_items WHERE run_id=? AND status='simulated' "
+        "AND scheduled_time > ? ORDER BY id LIMIT ?", (run["id"], cutoff, n)).fetchall()]
+    if len(ids) < n:
+        conn.close()
+        pytest.skip("not enough future slots left on today's clock")
+    conn.executemany("UPDATE plan_items SET status='failed', http_status=400, "
+                     "response='rejected' WHERE id=?", [(i,) for i in ids])
+    conn.execute("UPDATE runs SET failed=? WHERE id=?", (n, run["id"]))
+    conn.commit()
+    conn.close()
+    return run["id"], ids
+
+
+def test_retry_sends_only_the_slots_that_failed(client):
+    """The refused slots go again; everything already on the clock is untouched."""
+    run_id, ids = _committed_with_failures(client)
+    conn = _db()
+    before = {r["id"]: r["status"] for r in conn.execute(
+        "SELECT id, status FROM plan_items WHERE run_id=?", (run_id,))}
+    was_posted = conn.execute("SELECT posted FROM runs WHERE id=?", (run_id,)).fetchone()["posted"]
+
+    out = client.post(f"/api/runs/{run_id}/retry")
+    assert out.status_code == 200, out.text
+    assert out.json()["retried"] == len(ids)
+    # How far `posted` moved, not what the statuses read: re-posting a slot that
+    # is already `simulated` leaves it `simulated`, so a retry that swept up the
+    # whole run would look identical below and differ only in having dialled
+    # every one of those customers a second time. `runs.posted` is cumulative
+    # across pause/resume, so the growth is this retry's own count.
+    assert out.json()["counts"]["posted"] - was_posted == len(ids), \
+        "the retry re-sent slots that were already on Formi's clock"
+
+    after = {r["id"]: r["status"] for r in conn.execute(
+        "SELECT id, status FROM plan_items WHERE run_id=?", (run_id,))}
+    assert all(after[i] == "simulated" for i in ids), "the refused slots were not re-sent"
+    # Every other slot is exactly as it was. A retry that re-posts a call already
+    # on Formi's clock dials that customer twice.
+    untouched = {i: s for i, s in before.items() if i not in ids}
+    assert {i: after[i] for i in untouched} == untouched
+    conn.close()
+
+
+def test_retry_does_not_count_the_same_rejection_twice(client):
+    """`_commit` adds to `runs.failed`, so a retry has to take the old tally off.
+
+    Without the decrement a run that retried clean still reads as failing, and
+    the operator is chasing a number that can only go up.
+    """
+    run_id, ids = _committed_with_failures(client)
+    assert client.post(f"/api/runs/{run_id}/retry").status_code == 200
+    conn = _db()
+    row = conn.execute("SELECT posted, failed FROM runs WHERE id=?", (run_id,)).fetchone()
+    assert row["failed"] == 0, "the retry re-charged a rejection it had just cleared"
+    conn.close()
+
+
+def test_retry_refuses_when_there_is_nothing_to_retry(client):
+    run_id, ids = _committed_with_failures(client)
+    conn = _db()
+    conn.execute("UPDATE plan_items SET status='simulated' WHERE run_id=? AND status='failed'",
+                 (run_id,))
+    conn.execute("UPDATE runs SET failed=0 WHERE id=?", (run_id,))
+    conn.commit()
+    conn.close()
+    # Nothing failed, so there is nothing to send again.
+    r = client.post(f"/api/runs/{run_id}/retry")
+    assert r.status_code == 409
+    assert "nothing failed" in r.json()["error"]
+    assert client.post("/api/runs/999999/retry").status_code == 404
+
+
+def test_retry_refuses_a_paused_run_and_a_paused_campaign(client):
+    """A stopped campaign does not dial, and a paused run's slots belong to resume."""
+    run_id, _ = _committed_with_failures(client)
+    campaign = _db().execute("SELECT campaign_id FROM runs WHERE id=?",
+                             (run_id,)).fetchone()["campaign_id"]
+    client.post(f"/api/campaigns/{campaign}/pause")
+    try:
+        r = client.post(f"/api/runs/{run_id}/retry")
+        assert r.status_code == 409
+        assert "paused" in r.json()["error"]
+    finally:
+        client.post(f"/api/campaigns/{campaign}/resume")
+
+    # Stopping the campaign also paused its run, and resuming the campaign does
+    # not put the run back -- `resume_run` is a separate act. So the run is still
+    # paused here, which is the second case: its un-dialled slots belong to that
+    # pause now, and `resume` is what sends them.
+    assert _db().execute("SELECT status FROM runs WHERE id=?",
+                         (run_id,)).fetchone()["status"] == "paused"
+    r = client.post(f"/api/runs/{run_id}/retry")
+    assert r.status_code == 409
+    assert "not committed" in r.json()["error"]
+
+
+def test_a_failed_slot_whose_time_has_passed_expires_rather_than_dialling_late(client):
+    """The fork, decided by `_commit` and not re-decided here.
+
+    A rejection read an hour later is a slot in the past. Asking Formi for a call
+    at a time that has gone is a 400 at best; re-timing it silently would place a
+    call the operator never planned. It expires and returns in the next plan.
+    """
+    run_id, ids = _committed_with_failures(client)
+    conn = _db()
+    # One of the two failures is now stale, the other still ahead.
+    stale = ids[0]
+    conn.execute("UPDATE plan_items SET scheduled_time=? WHERE id=?",
+                 (f"{TODAY}T00:01:00", stale))
+    conn.commit()
+
+    assert client.post(f"/api/runs/{run_id}/retry").status_code == 200
+    rows = {r["id"]: r["status"] for r in conn.execute(
+        "SELECT id, status FROM plan_items WHERE id IN (?,?)", (stale, ids[1]))}
+    assert rows[stale] == "expired", "a call was scheduled into the past"
+    assert rows[ids[1]] == "simulated"
+    conn.close()
+
+
+def test_retry_under_dry_run_simulates_and_never_dials(client, no_network):
+    """The DRY_RUN guarantee covers the new path too, or it is not a guarantee."""
+    run_id, ids = _committed_with_failures(client)
+    out = client.post(f"/api/runs/{run_id}/retry")
+    assert out.status_code == 200, out.text
+    assert out.json()["dry_run"] is True
+    conn = _db()
+    assert [r["status"] for r in conn.execute(
+        "SELECT status FROM plan_items WHERE id IN (?,?)", tuple(ids))] == \
+        ["simulated", "simulated"]
+    conn.close()
+
+
+def test_a_campaign_that_cannot_start_says_so_on_the_campaign(client):
+    """The failure outlives the modal it was reported in.
+
+    The reason used to exist only in the approve response: summed into a toast,
+    then dropped when the dialog closed. For `window_closed` and `error` there is
+    no run row either, so nothing was left to find afterwards.
+    """
+    cid = 5
+    conn = _db()
+    was = conn.execute("SELECT autopilot FROM campaigns WHERE id=?", (cid,)).fetchone()[0]
+    # `ARMED` is what approve scans, and the seed arms nothing.
+    conn.execute("UPDATE campaigns SET autopilot=1, autopilot_note='' WHERE id=?", (cid,))
+    conn.commit()
+    try:
+        # Approve a day nothing was ever prepared for: the campaign cannot start.
+        r = client.post("/api/day/approve",
+                        json={"date": "2026-01-02", "kind": "auto", "campaign_ids": [cid]})
+        assert r.status_code == 200, r.text
+        assert [c["status"] for c in r.json()["campaigns"]] == ["not_prepared"]
+        note = conn.execute("SELECT autopilot_note FROM campaigns WHERE id=?",
+                            (cid,)).fetchone()[0]
+        assert "NOT dialled" in note and "not_prepared" in note
+    finally:
+        # Session-scoped client: leave the switch as it was found.
+        conn.execute("UPDATE campaigns SET autopilot=? WHERE id=?", (was, cid))
+        conn.commit()
+        conn.close()
+
+
+def test_a_campaign_that_ran_out_of_window_says_which_window(client, monkeypatch):
+    """`window_closed` is the reason with something to say, so it has to say it.
+
+    `not_prepared` above proves the note is written at all; this one proves the
+    `detail` reaches it. It is also the outcome with no `runs` row of its own --
+    the plan is abandoned unapproved -- so the note is the only record that the
+    operator ticked this campaign and it did not dial.
+
+    The window is forced rather than waited for: `_floor_min` is the clock's one
+    way into this branch, so returning `end_min` from it is a day that has run
+    out, at any hour the suite happens to run.
+    """
+    cid = 5
+    run = _fresh_plan(client, cid)
+    monkeypatch.setattr("api.day._floor_min", lambda now, day, dcfg: dcfg.end_min)
+    conn = _db()
+    was = conn.execute("SELECT autopilot FROM campaigns WHERE id=?", (cid,)).fetchone()[0]
+    conn.execute("UPDATE campaigns SET autopilot=1, autopilot_note='' WHERE id=?", (cid,))
+    # `/plan` writes kind='manual'; the day's approve looks up 'auto'. The kind
+    # only decides which run is found, so re-labelling it is enough to get a
+    # planned run in front of the branch under test -- the alternative,
+    # `prepare_day`, has no campaign filter and would re-plan all of them.
+    conn.execute("UPDATE runs SET kind='auto' WHERE id=?", (run["id"],))
+    conn.commit()
+    try:
+        r = client.post("/api/day/approve",
+                        json={"date": TODAY, "kind": "auto", "campaign_ids": [cid]})
+        assert r.status_code == 200, r.text
+        entry = r.json()["campaigns"][0]
+        assert entry["status"] == "window_closed"
+        assert entry["run_id"] == run["id"], "no run_id, so the UI cannot offer the retry"
+        note = conn.execute("SELECT autopilot_note FROM campaigns WHERE id=?",
+                            (cid,)).fetchone()[0]
+        assert "window_closed" in note and "window has closed" in note, note
+    finally:
+        conn.execute("UPDATE campaigns SET autopilot=? WHERE id=?", (was, cid))
+        conn.commit()
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # DRY_RUN: no network, ever
 # ---------------------------------------------------------------------------
 

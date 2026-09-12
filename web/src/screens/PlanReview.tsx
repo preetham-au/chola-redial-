@@ -117,6 +117,23 @@ export function PlanReview({ runId }: { runId: number | null }) {
     }
   };
 
+  /** Send the calls Formi refused a second time. Only the refused ones go. */
+  const retryRun = async () => {
+    if (!resolved) return;
+    try {
+      const out = await api.retryRun(resolved);
+      toast(out.counts.failed ? 'bad' : 'ok',
+        out.dry_run
+          ? `Retried ${n(out.retried)} refused call(s) (dry run) — nothing dialled.`
+          : out.counts.failed
+            ? `Retried ${n(out.retried)}; ${n(out.counts.failed)} were refused again.`
+            : `Retried ${n(out.retried)} — all back on the clock.`);
+      run.reload(); items.reload(); all.reload(); runs.reload();
+    } catch (e) {
+      toast('bad', (e as Error).message);
+    }
+  };
+
   const rescheduleItem = async (itemId: number, newTime: string) => {
     if (!resolved || !newTime) return;
     try {
@@ -323,12 +340,21 @@ export function PlanReview({ runId }: { runId: number | null }) {
           <span className="eyebrow">Status</span>
           <select className="select" value={status} onChange={(e) => setStatus(e.target.value)}>
             <option value="">all</option>
-            {['planned', 'simulated', 'posted', 'failed', 'skipped'].map((s) => (
+            {['planned', 'simulated', 'posted', 'failed', 'expired', 'skipped'].map((s) => (
               <option key={s} value={s}>
                 {s}
               </option>
             ))}
           </select>
+
+          {/* Only where it can act: a paused run's failures belong to the pause,
+              and Resume is the button for those. */}
+          {status === 'failed' && r.status === 'committed' && r.counts.failed > 0 && (
+            <button className="btn btn-sm btn-primary" onClick={retryRun}>
+              <RefreshCw />
+              Retry these {n(r.counts.failed)}
+            </button>
+          )}
 
           <span style={{ flex: 1 }} />
           {(bucket || disposition || status) && (

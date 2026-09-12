@@ -395,6 +395,20 @@ export const api = {
       return { ...r, status: 'committed' as const, dry_run: true };
     }),
 
+  /** Send the calls Formi refused a second time. Only the `failed` slots go
+   *  again; anything already on the clock is left alone, and a refused slot
+   *  whose time has since passed expires into the next plan rather than being
+   *  dialled late. */
+  retryRun: (runId: number) =>
+    req<Run & { dry_run: boolean; retried: number }>(`/api/runs/${runId}/retry`, { method: 'POST' }, () => {
+      const r = mockRuns.find((x) => x.id === runId) ?? mockRuns[0];
+      const refused = mockItems(runId).filter((i) => i.status === 'failed');
+      refused.forEach((i) => { i.status = 'simulated'; });
+      // Mock is always a clean retry: `failed` clears and those calls become posted.
+      r.counts = { ...r.counts, failed: 0, posted: r.counts.posted + refused.length };
+      return { ...r, dry_run: true, retried: refused.length };
+    }),
+
   manualPreview: (body: { campaign_id: number; dispositions: string[]; buckets: string[]; date?: string }) =>
     req<ManualPreview>('/api/manual/preview', json(body), () =>
       mockManualPreview(body.dispositions, body.buckets),

@@ -2321,6 +2321,80 @@ button.bd-colhead:hover b {
   padding: 16px;
 }
 
+/* Dial result -- scheduled vs not scheduled after approving a day.
+   A meter, not the .seg segmented control above: widths carry the number. */
+
+.dialbar {
+  display: flex;
+  height: 10px;
+  border-radius: var(--radius-pill);
+  overflow: hidden;
+  background: var(--bg-deep);
+  border: 1px solid var(--line);
+}
+
+.dialbar-seg {
+  min-width: 2px; /* a single failure still has to be visible */
+}
+
+.dialbar-seg.is-scheduled {
+  background: var(--ok);
+}
+
+.dialbar-seg.is-not {
+  background: var(--warn);
+}
+
+.dialbar-seg.is-refused {
+  background: var(--bad);
+}
+
+.dialbar-keys {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin-top: 8px;
+}
+
+.dialbar-key {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+.dialbar-key::before {
+  content: '';
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  background: currentColor;
+}
+
+.dialbar-key b {
+  color: var(--text);
+}
+
+.dialrow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.dialrow:last-child {
+  border-bottom: 0;
+}
+
+.dialrow-why {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

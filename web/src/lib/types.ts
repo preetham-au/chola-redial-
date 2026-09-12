@@ -74,7 +74,11 @@ export interface ConfigVersion {
   created_at: string;
 }
 
-export type PlanItemStatus = 'planned' | 'simulated' | 'posted' | 'failed' | 'skipped';
+/** `expired` is a slot whose time passed before it could be dialled. `_commit`
+ *  retires it rather than asking Formi for a call at a time that has gone, and
+ *  the lead comes back in the next plan — so it is not a failure. */
+export type PlanItemStatus =
+  'planned' | 'simulated' | 'posted' | 'failed' | 'skipped' | 'expired';
 
 export interface PlanItem {
   id: number;
@@ -267,6 +271,9 @@ export interface ApproveResult {
     detail?: string;
     posted?: number;
     failed?: number;
+    /** Present whenever a run exists to act on — which is every outcome except
+     *  `not_prepared`, where there is nothing to retry. */
+    run_id?: number;
   }>;
 }
 

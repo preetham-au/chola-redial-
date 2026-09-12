@@ -512,24 +512,50 @@ def approve_day(body: ApproveBody = Body(default_factory=ApproveBody)) -> dict[s
 
 def _approve_one(conn: sqlite3.Connection, campaign: sqlite3.Row, day: date, kind: str,
                  buckets: list[str]) -> dict[str, Any]:
-    """One campaign: re-plan from now with the ticked buckets, then commit."""
+    """One campaign: re-plan from now with the ticked buckets, then commit.
+
+    Every outcome that is not a clean dial leaves a note on the campaign. The
+    operator reported on 13 Sep 2026 that a campaign they had ticked could fail
+    to start and say nothing: the reason was returned to the browser, shown in a
+    toast that summed the whole day into one line, and then dropped when the
+    modal closed. For `window_closed` and `error` there is no `runs` row either,
+    so at that point the reason was gone for good. `autopilot_note` is where the
+    console already explains itself, so it is where this belongs too.
+    """
+    from .autopilot import _note                          # noqa: PLC0415 — import cycle
+
     out: dict[str, Any] = {"campaign_id": campaign["id"], "name": campaign["name"]}
+
+    def failing(status: str, detail: str = "", **extra: Any) -> dict[str, Any]:
+        """Record why this campaign did not dial, then report it.
+
+        `already_committed` is the exception: that campaign DID dial, on an
+        earlier approve, and it already has the note saying how it went. Marking
+        it "NOT dialled" would overwrite a true record with a false one.
+        """
+        if status != "already_committed":
+            _note(conn, campaign["id"],
+                  f"{day} {kind}: NOT dialled — {status}" + (f": {detail}" if detail else ""))
+        return {**out, "status": status, **({"detail": detail} if detail else {}), **extra}
+
     run = conn.execute(
         "SELECT * FROM runs WHERE campaign_id=? AND run_date=? AND kind=? ORDER BY id DESC",
         (campaign["id"], day.isoformat(), kind)).fetchone()
     if run is None:
-        return {**out, "status": "not_prepared"}
+        return failing("not_prepared")
     if run["status"] != "planned":
         # Already committed or paused. Approving twice must not dial twice.
-        return {**out, "status": "already_" + run["status"], "run_id": run["id"]}
+        # `run_id` goes back so the caller can still retry the calls that this
+        # run had refused, which is a different act from approving it again.
+        return failing("already_" + run["status"], run_id=run["id"])
 
     try:
         cfg, red, dcfg, now, leads, pairs = _evaluate(conn, campaign, day)
         floor = _floor_min(now, day, dcfg)
         if floor is not None and floor >= dcfg.end_min:
-            return {**out, "status": "window_closed", "run_id": run["id"],
-                    "detail": f"the {hhmm(dcfg.start_min)}-{hhmm(dcfg.end_min)} window has "
-                              f"closed (it is {now_ist().strftime('%H:%M')})"}
+            return failing("window_closed", run_id=run["id"],
+                           detail=f"the {hhmm(dcfg.start_min)}-{hhmm(dcfg.end_min)} window has "
+                                  f"closed (it is {now_ist().strftime('%H:%M')})")
         note = f"approved {now_ist().strftime('%H:%M')}"
         if buckets:
             note += " buckets=" + ",".join(buckets)
@@ -539,15 +565,21 @@ def _approve_one(conn: sqlite3.Connection, campaign: sqlite3.Row, day: date, kin
                             evaluated=len(leads), note=note, floor_min=floor, buckets=buckets)
         fresh = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
         if not fresh["slots"]:
-            return {**out, "status": "nothing_to_dial", "run_id": run_id, "posted": 0}
+            return failing("nothing_to_dial", run_id=run_id, posted=0)
         result = _commit(conn, fresh, campaign, "approving", source="approve")
     except HTTPException as exc:
-        return {**out, "status": "not_dialled", "detail": str(exc.detail)}
+        return failing("not_dialled", detail=str(exc.detail))
     except Exception as exc:                     # noqa: BLE001 — one campaign, not the day
-        return {**out, "status": "error", "detail": f"{type(exc).__name__}: {exc}"[:200]}
+        return failing("error", detail=f"{type(exc).__name__}: {exc}"[:200])
 
+    posted, failed = result["counts"]["posted"], result["counts"]["failed"]
+    # A partial is not a failure, but it is not silence either: those leads were
+    # refused by Formi and will not be called unless somebody sends them again.
+    _note(conn, campaign["id"],
+          f"{day} {kind}: dialled {posted}, {failed} refused by Formi" if failed
+          else f"{day} {kind}: dialled {posted}")
     return {**out, "status": "approved", "run_id": result["id"],
-            "posted": result["counts"]["posted"], "failed": result["counts"]["failed"],
+            "posted": posted, "failed": failed,
             "dropped": result["counts"]["dropped"], "expired": result["expired"],
             "simulated": result["simulated"], "run": _run_json(
                 conn.execute("SELECT * FROM runs WHERE id=?", (result["id"],)).fetchone())}

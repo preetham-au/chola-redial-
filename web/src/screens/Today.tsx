@@ -29,7 +29,7 @@ import { api } from '../lib/api';
 import { bandRange, bucketColor, friendlyBucket, n } from '../lib/domain';
 import { navigate, useAsync, useStore } from '../lib/store';
 import { Card, Empty, Fact, Modal, TypeToConfirm } from '../components/ui';
-import type { Campaign, DayBucket, DayCampaign, DayView } from '../lib/types';
+import type { ApproveResult, Campaign, DayBucket, DayCampaign, DayView } from '../lib/types';
 
 const WAVES = [
   { kind: 'auto', label: 'Morning' },
@@ -885,6 +885,11 @@ export function ApproveDay({
   const live = !day.dry_run;
   const [typed, setTyped] = useState('');
   const [busy, setBusy] = useState(false);
+  // The result STAYS on screen. It used to be summed into one toast line and
+  // dropped when the modal closed -- and for `window_closed` and `error` there
+  // is no run row either, so a campaign the operator ticked could fail to start
+  // and leave nothing at all to look at.
+  const [res, setRes] = useState<ApproveResult>();
 
   const ready = day.buckets
     .filter((b) => shown.includes(b.bucket))
@@ -895,22 +900,30 @@ export function ApproveDay({
   const submit = async () => {
     setBusy(true);
     try {
-      const res = await api.approveDay(day.date, day.kind, buckets);
-      toast(
-        res.failed > 0 ? 'bad' : 'ok',
-        res.dry_run
-          ? `Simulated ${n(res.posted)} calls across ${res.approved} campaigns. Nothing was sent to Formi.`
-          : `${n(res.posted)} calls are on Formi's clock across ${res.approved} campaigns.` +
-            (res.not_dialled ? ` ${n(res.not_dialled)} did not fit today.` : ''),
-      );
-      onDone();
-      onClose();
+      setRes(await api.approveDay(day.date, day.kind, buckets));
     } catch (e) {
       toast('bad', (e as Error).message);
     } finally {
       setBusy(false);
     }
   };
+
+  const done = () => {
+    onDone();
+    onClose();
+  };
+
+  if (res) {
+    return (
+      <Modal
+        title={res.dry_run ? 'Simulated the day' : 'What went out'}
+        onClose={done}
+        footer={<button className="btn btn-primary" onClick={done}>Done</button>}
+      >
+        <DialResult res={res} buckets={buckets} onChange={setRes} />
+      </Modal>
+    );
+  }
 
   return (
     <Modal
@@ -985,5 +998,184 @@ export function ApproveDay({
         />
       )}
     </Modal>
+  );
+}
+
+/** Why a campaign did not dial, for the outcomes the server has no detail for. */
+const WHY: Record<string, string> = {
+  not_prepared: 'no plan was prepared for this campaign',
+  already_committed: 'already dialled earlier today',
+  already_paused: 'the run is paused — resume it to send the rest',
+  nothing_to_dial: 'nothing left that fits before the window shuts',
+};
+
+/** What actually happened, kept on screen instead of summed into a toast.
+ *
+ *  The bar splits scheduled from not scheduled, which is what was asked for.
+ *  The line under it splits that second number again, because its two halves
+ *  are not the same thing and only one is a fault: `failed` is Formi refusing a
+ *  call, and `not_dialled` is a slot that no longer fitted before the window
+ *  shut, which returns in the next plan by itself. Retrying the second would
+ *  only expire it again, so only the refused count turns red and drives Retry.
+ */
+export function DialResult({
+  res,
+  buckets,
+  onChange,
+}: {
+  res: ApproveResult;
+  buckets: string[];
+  onChange: (next: ApproveResult) => void;
+}) {
+  const toast = useStore((s) => s.toast);
+  const [busy, setBusy] = useState<number | 'day' | null>(null);
+
+  const notScheduled = res.failed + res.not_dialled;
+  const total = res.posted + notScheduled;
+  const pct = (x: number) => (total ? `${(x / total) * 100}%` : '0%');
+
+  const problems = res.campaigns.filter((c) => c.status !== 'approved' || (c.failed ?? 0) > 0);
+  const clean = res.campaigns.length - problems.length;
+  // `already_committed` DID dial, on an earlier approve, and approving it again
+  // is a deliberate no-op — re-running it would say the same thing twice. Its
+  // refused calls are a separate act, and that is the per-row button.
+  const restartable = res.campaigns
+    .filter((c) => c.status !== 'approved' && c.status !== 'already_committed')
+    .map((c) => c.campaign_id);
+
+  const retryCampaigns = async () => {
+    setBusy('day');
+    try {
+      const again = await api.approveDay(res.date, res.kind, buckets, restartable);
+      // Every campaign being re-run returned before `_commit`, so it contributed
+      // nothing to these totals the first time: the merge is pure addition.
+      const byId = new Map(again.campaigns.map((c) => [c.campaign_id, c]));
+      onChange({
+        ...res,
+        approved: res.approved + again.approved,
+        posted: res.posted + again.posted,
+        failed: res.failed + again.failed,
+        not_dialled: res.not_dialled + again.not_dialled,
+        campaigns: res.campaigns.map((c) => byId.get(c.campaign_id) ?? c),
+      });
+    } catch (e) {
+      toast('bad', (e as Error).message);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const retryCalls = async (campaignId: number, runId: number, refused: number) => {
+    setBusy(campaignId);
+    try {
+      const run = await api.retryRun(runId);
+      const after = run.counts.failed; // refused again on the second attempt
+      const won = refused - after;
+      onChange({
+        ...res,
+        posted: res.posted + won,
+        failed: Math.max(res.failed - won, 0),
+        campaigns: res.campaigns.map((c) =>
+          c.campaign_id === campaignId
+            ? { ...c, failed: after, posted: (c.posted ?? 0) + won }
+            : c,
+        ),
+      });
+      toast(
+        after ? 'bad' : 'ok',
+        after
+          ? `${n(after)} of ${n(refused)} were refused again.`
+          : `${n(won)} went back out.`,
+      );
+    } catch (e) {
+      toast('bad', (e as Error).message);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <>
+      <div className="dialbar">
+        <div className="dialbar-seg is-scheduled" style={{ width: pct(res.posted) }} />
+        <div className="dialbar-seg is-refused" style={{ width: pct(res.failed) }} />
+        <div className="dialbar-seg is-not" style={{ width: pct(res.not_dialled) }} />
+      </div>
+      <div className="dialbar-keys">
+        <span className="dialbar-key" style={{ color: 'var(--ok)' }}>
+          <b>{n(res.posted)} scheduled</b>
+        </span>
+        <span
+          className="dialbar-key"
+          style={{ color: res.failed ? 'var(--bad)' : 'var(--warn)' }}
+        >
+          <b>{n(notScheduled)} not scheduled</b>
+        </span>
+      </div>
+
+      <p className="hero-sub">
+        {res.failed > 0 && (
+          <>
+            <b style={{ color: 'var(--bad)' }}>{n(res.failed)} refused by Formi</b>
+            {res.not_dialled > 0 && ' · '}
+          </>
+        )}
+        {res.not_dialled > 0 && (
+          <>{n(res.not_dialled)} did not fit before the window shut — back in the next plan</>
+        )}
+        {notScheduled === 0 && 'Every selected lead is on the clock.'}
+        {res.dry_run && ' Nothing reached Formi: the server is in dry run.'}
+      </p>
+
+      {problems.length > 0 && (
+        <div className="grid" style={{ gap: 0, marginTop: 4 }}>
+          {problems.map((c) => {
+            const refused = c.failed ?? 0;
+            return (
+              <div className="dialrow" key={c.campaign_id}>
+                <AlertTriangle
+                  size={14}
+                  style={{ color: refused ? 'var(--bad)' : 'var(--warn)', flex: '0 0 auto' }}
+                />
+                <b className="trunc">{c.name}</b>
+                <span className="dialrow-why">
+                  {refused > 0
+                    ? `${n(refused)} refused by Formi`
+                    : c.detail || WHY[c.status] || c.status}
+                </span>
+                {refused > 0 && c.run_id != null && (
+                  <button
+                    className="btn btn-ghost btn-sm"
+                    disabled={busy !== null}
+                    onClick={() => retryCalls(c.campaign_id, c.run_id!, refused)}
+                  >
+                    {busy === c.campaign_id ? <Loader2 className="spin" /> : <RefreshCw />}
+                    Retry {n(refused)} calls
+                  </button>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {clean > 0 && problems.length > 0 && (
+        <p className="hero-sub" style={{ marginBottom: 0 }}>
+          {n(clean)} other {clean === 1 ? 'campaign' : 'campaigns'} dialled cleanly.
+        </p>
+      )}
+
+      {restartable.length > 0 && (
+        <button
+          className="btn btn-primary"
+          style={{ marginTop: 10 }}
+          disabled={busy !== null}
+          onClick={retryCampaigns}
+        >
+          {busy === 'day' ? <Loader2 className="spin" /> : <RefreshCw />}
+          Retry {n(restartable.length)} {restartable.length === 1 ? 'campaign' : 'campaigns'}
+        </button>
+      )}
+    </>
   );
 }

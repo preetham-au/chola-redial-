@@ -781,6 +781,49 @@ def resume_run(run_id: int) -> dict[str, Any]:
         return _commit(conn, run, campaign, "resuming", source="resume")
 
 
+@router.post("/api/runs/{run_id}/retry")
+def retry_run(run_id: int) -> dict[str, Any]:
+    """Send the calls Formi refused a second time. Nothing else is touched.
+
+    Asked for on 13 Sep 2026: a lead Formi rejected was simply not called that
+    day. The rejection was already recorded — `_dial_live` writes the status,
+    the HTTP code and the body — but nothing could act on it, so the only way
+    back was to re-plan the whole campaign and dial everyone again.
+
+    No new dialling code: putting the failed slots back to `planned` makes them
+    exactly what `_commit` already posts, so a retry is an approve over a
+    smaller set. That matters for the slots whose time has passed while the
+    operator was reading the failure — `_commit` retires those as `expired`
+    rather than asking Formi for a call at a time that has gone, and the lead
+    returns in the next plan. A retry must not invent a second answer to that.
+    """
+    with session() as conn:
+        run = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+        if run is None:
+            raise HTTPException(404, f"run {run_id} not found")
+        if run["status"] != "committed":
+            # A paused run's failures belong to the pause; `resume` posts them.
+            raise HTTPException(409, f"run {run_id} is {run['status']}, not committed")
+        campaign = _campaign(conn, run["campaign_id"])
+        if campaign["paused"]:
+            raise HTTPException(409, f"campaign {campaign['id']} is paused")
+        failed = conn.execute(
+            "SELECT COUNT(*) c FROM plan_items WHERE run_id=? AND status='failed'",
+            (run_id,)).fetchone()["c"]
+        if not failed:
+            raise HTTPException(409, f"nothing failed in run {run_id}")
+        conn.execute("UPDATE plan_items SET status='planned', http_status=NULL, response=NULL "
+                     "WHERE run_id=? AND status='failed'", (run_id,))
+        # Un-count them before re-posting. `_commit` ends with `failed=failed+?`,
+        # so leaving the old tally in place would charge the same rejection twice
+        # and a run that retried clean would still read as failing. Same reason
+        # `_pause_run` does `posted=MAX(posted-?, 0)` for the calls it takes back.
+        conn.execute("UPDATE runs SET failed=MAX(failed-?, 0) WHERE id=?", (failed, run_id))
+        out = _commit(conn, run, campaign, "retrying", source="retry")
+        out["retried"] = failed
+        return out
+
+
 @router.post("/api/runs/{run_id}/pause")
 def pause_run(run_id: int) -> dict[str, Any]:
     """Take a committed run's un-dialled calls back off Formi's clock.
