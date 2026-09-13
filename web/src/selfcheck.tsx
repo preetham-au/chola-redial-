@@ -21,6 +21,7 @@ import {
   Today,
   approveArgs,
   approveModal,
+  alreadyBooked,
   autopilotDiff,
   closesAt,
   dialQueue,
@@ -29,8 +30,8 @@ import {
   panelDay,
   panelPrepare,
   panelsFor,
-  pickerPrepare,
   lastDialled,
+  pickerPrepare,
   planAge,
   recheckMessage,
   retryArgs,
@@ -543,6 +544,26 @@ ok(
 
   ok('nothing already booked says nothing, rather than "0 leads were"',
      !has(modal(every({ already_booked: 0 })), 'already on Formi'));
+
+  // A server one deploy behind sends the campaign rows without the field at
+  // all. It was typed as always present and summed with `+`, so `0 + undefined`
+  // gave `NaN`, `NaN > 0` was false, and the ONE fact on this modal that can
+  // talk an operator out of dialling disappeared — not degraded, not zeroed,
+  // gone, leaving a modal that reads exactly like a day with no double-booking.
+  const silent = every({});
+  silent.campaigns.forEach((c) => { delete (c as { already_booked?: number }).already_booked; });
+  const unknown = modal(silent);
+  ok('a server that never sent the booked count produces no NaN in the modal',
+     !has(unknown, 'NaN'));
+  ok('and the missing count is said out loud, not passed off as none',
+     has(unknown, 'did not say how many'));
+  ok('while a server that DID answer none is not accused of silence',
+     !has(modal(every({ already_booked: 0 })), 'did not say how many'));
+  // The arithmetic under both, where the NaN was made.
+  ok('a missing count sums to a number and marks itself unknown',
+     alreadyBooked([{ already_booked: 4 }, {}]).count === 4
+     && !alreadyBooked([{ already_booked: 4 }, {}]).known
+     && alreadyBooked([{ already_booked: 4 }, { already_booked: 0 }]).known);
   ok('a campaign that has never dialled reads as never, not as a blank',
      has(modal(every({ last_dialled: null })), 'never'));
 }

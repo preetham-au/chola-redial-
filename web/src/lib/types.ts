@@ -224,8 +224,14 @@ export interface DayCampaign extends Campaign {
   /** The most recent date this campaign actually posted calls. */
   last_dialled: string | null;
   /** Leads Formi had already queued when the plan was built, which the engine
-   *  skipped. */
-  already_booked: number;
+   *  skipped.
+   *
+   *  OPTIONAL, because a server one deploy behind does not send it and the type
+   *  saying otherwise is what hid that: summing a missing field gave `NaN`,
+   *  `NaN > 0` is false, and the whole "already on Formi's clock" warning
+   *  disappeared without a word. Read it through `alreadyBooked` in
+   *  screens/Today.tsx, which separates "none" from "the server did not say". */
+  already_booked?: number;
 }
 
 export interface StrandedRun {

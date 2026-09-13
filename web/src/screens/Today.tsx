@@ -285,6 +285,25 @@ export const closesAt = (day: DayView) =>
  *  outside the few minutes between a prepare pass and a prompt approval. */
 export const STALE_MIN = 90;
 
+/** How many of these leads Formi had already queued when the plan was built.
+ *
+ *  `already_booked` is the one fact on the approve modal that can talk the
+ *  operator out of dialling, and it was summed with `+` off a field typed as
+ *  always present. A server one deploy behind sends the campaign rows without
+ *  it: `0 + undefined` is `NaN`, `NaN > 0` is false, and the entire warning
+ *  vanished — not degraded, not zeroed, gone, with the modal reading exactly as
+ *  it does on a day when nothing was double-booked.
+ *
+ *  So the absence is carried out separately rather than folded into a zero. A
+ *  count of 0 means the engine found none; `known: false` means nobody asked,
+ *  and those two must not print the same sentence. */
+export function alreadyBooked(campaigns: { already_booked?: number }[]) {
+  return {
+    count: campaigns.reduce((s, c) => s + (c.already_booked ?? 0), 0),
+    known: campaigns.every((c) => typeof c.already_booked === 'number'),
+  };
+}
+
 /** When these campaigns were last dialled — as a range when they disagree.
  *
  *  A panel holds many campaigns and one line to say this in, so the line is a
@@ -1545,7 +1564,7 @@ export function ApproveDay({
   // Has a call already been placed for these leads? The engine answered that at
   // PLAN time; these two say how long ago that was and how many it caught.
   const { builtAt, minutes: ageMin, stale } = planAge(day.campaigns, Date.now());
-  const booked = day.campaigns.reduce((s, c) => s + c.already_booked, 0);
+  const booked = alreadyBooked(day.campaigns);
   const [rechecking, setRechecking] = useState(false);
 
   /** Re-read Formi and rebuild the plan, so leads booked since it was built drop
@@ -1714,12 +1733,26 @@ export function ApproveDay({
         <Fact k="Last dialled" v={lastDialled(day.campaigns)} />
       </div>
 
-      {booked > 0 && (
+      {/* Not the same thing as none. A silent zero here reads as "nobody was
+          double-booked", which is the claim this server did not make. */}
+      {!booked.known && (
+        <div className="warnbox">
+          <AlertTriangle />
+          <span>
+            This server did not say how many of these leads Formi had already queued when the plan
+            was built. Treat the counts above as a ceiling — some of these calls may be second
+            calls.
+          </span>
+        </div>
+      )}
+
+      {booked.count > 0 && (
         <p className="hero-sub">
-          {n(booked)} {booked === 1 ? 'lead was' : 'leads were'} already on Formi’s clock when
-          this plan was built and {booked === 1 ? 'was' : 'were'} left out of it.
+          {n(booked.count)} {booked.count === 1 ? 'lead was' : 'leads were'} already on Formi’s
+          clock when this plan was built and {booked.count === 1 ? 'was' : 'were'} left out of it.
         </p>
       )}
+
 
       {stale && (
         <div className="warnbox">
