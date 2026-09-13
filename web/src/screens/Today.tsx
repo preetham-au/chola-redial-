@@ -340,7 +340,12 @@ export function alreadyBooked(campaigns: { already_booked?: number }[]) {
 }
 
 /** Calls the dial path refused for having left this wave's band — leads that
- *  were not called, and will not be until the day is re-planned.
+ *  were not called, and will not be until this campaign is planned again.
+ *
+ *  Not by re-planning THIS wave: a run only reaches `_commit` on its way to
+ *  `committed`, and `_write_run` refuses to rewrite a run that has been acted
+ *  on (409 → `already_ran`). The lead is still unbooked in the warehouse, so
+ *  it returns in the next plan that covers it — the other wave's, or tomorrow's.
  *
  *  Only campaigns that reached `_commit` can have strays, so only `approved`
  *  rows are asked; a campaign that never started has nothing to be outside the
@@ -2176,7 +2181,8 @@ export function DialResult({
           <span>
             This server does not report calls refused for leaving the wave’s band, so some of
             those {n(res.not_dialled)} may have been dropped for that rather than for the window
-            shutting. Re-planning the day puts them back on the clock either way.
+            shutting. Either way they were not called and this wave cannot be re-planned now that
+            it has dialled — they come back in the next wave’s plan.
           </span>
         </div>
       )}
@@ -2200,7 +2206,8 @@ export function DialResult({
                       back by re-planning the day, not by sending it again. */}
                   {strays > 0
                     && `${n(strays)} ${strays === 1 ? 'call' : 'calls'} outside the band — `
-                       + 're-plan the day to put them back on the clock'}
+                       + 'this wave has already dialled, so they come back in the next wave’s '
+                       + 'plan, not by re-planning this one'}
                   {refused === 0 && strays === 0 && (c.detail || WHY[c.status] || c.status)}
                 </span>
                 {refused > 0 && c.run_id != null && (

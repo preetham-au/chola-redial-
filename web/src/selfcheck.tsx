@@ -970,9 +970,15 @@ ok(
   ok('and never reads as a day where every selected lead is on the clock',
      has(clean, 'Every selected lead is on the clock')
      && !has(strayed, 'Every selected lead is on the clock'));
+  // The advice has to be one the operator can carry out. Strays are only ever
+  // reported for a run that reached `_commit`, and `_commit` ends by setting it
+  // `committed` — which is exactly what `_write_run` refuses to re-plan (409,
+  // surfaced as `already_ran`). "Re-plan the day" sent the operator to a Build
+  // that answers nothing changed, and the leads sat there until the next wave.
   ok('and names the campaign, and what actually puts those leads back',
      has(strayed, 'Strayed campaign') && has(strayed, '4 calls outside the band')
-     && has(strayed, 're-plan the day'));
+     && has(strayed, 'come back in the next wave')
+     && !has(strayed, 're-plan the day to put them back'));
   // Formi never saw these, so there is nothing to send again — the lead comes
   // back by re-planning, and an offer to retry would dial nothing.
   ok('and offers no retry for calls that were never posted', !has(strayed, 'Retry'));
@@ -985,6 +991,10 @@ ok(
   });
   ok('a server too old to report strays is said to be too old, not taken as reporting none',
      has(older, 'does not report calls refused for leaving'));
+  // Same correction on the hedge: whichever of the two it was, the wave it came
+  // from has dialled and will not take a re-plan.
+  ok('and points that day at the next wave too, not at a re-plan that would 409',
+     has(older, 'cannot be re-planned now that it has dialled'));
   ok('and a server that does report them adds no such hedge',
      !has(strayed, 'does not report calls refused for leaving'));
 
