@@ -33,6 +33,7 @@ import {
   retryArgs,
   runQueue,
   scopeMismatch,
+  stoppedShort,
   STALE_MIN,
   wireBuckets,
 } from './screens/Today';
@@ -817,6 +818,34 @@ ok(
   // Re-approving it would be a no-op -- `_approve_one` answers already_committed
   // -- and would read as an offer to dial the other 288 a second time.
   ok('but is not offered as a whole-campaign re-run', !has(refused, 'Retry 1 campaign'));
+
+  // --- Stop leaves campaigns behind, and has to say so ------------------------
+  //
+  // Stopping breaks the queue mid-walk and the result modal then replaces the
+  // one holding the progress list, so a Stop at campaign 5 of 12 used to leave a
+  // result for five campaigns and nothing at all about the other seven. Those
+  // seven were never posted: their items are still `planned` and approving the
+  // day again sends exactly them, which is the only thing that makes a Stop
+  // safe to press — and it was on screen nowhere.
+  ok('a queue that ran to the end says nothing about stopping',
+     stoppedShort(12, 12) === null && stoppedShort(1, 1) === null);
+  const cut = stoppedShort(12, 5);
+  ok('a Stop counts the campaigns it never reached, and says they can still be sent',
+     cut !== null && has(cut, '7 of 12') && has(cut, 'still planned')
+     && has(cut, 'approving the day again'));
+
+  const partial = renderToStaticMarkup(
+    <DialResult res={result()} args={['2026-09-13', 'auto', [], [], undefined]}
+                short={cut} onChange={() => {}} />,
+  );
+  ok('and that sentence survives into the result modal, which is all the operator sees',
+     has(partial, '7 of 12') && has(partial, 'still planned'));
+  // The five that DID dial were clean, so every count here is the clean-day
+  // count -- and on those numbers alone the screen used to call twelve campaigns
+  // done. A partial day is not a finished one.
+  ok('and a day cut off part-way never reads as one where every lead is on the clock',
+     has(clean, 'Every selected lead is on the clock')
+     && !has(partial, 'Every selected lead is on the clock'));
 }
 
 // --- the call log: proof, not paperwork -------------------------------------

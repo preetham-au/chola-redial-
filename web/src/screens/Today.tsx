@@ -1366,6 +1366,27 @@ export async function runQueue(
   return merged;
 }
 
+/** What a Stop left behind, in the one place the operator reads afterwards.
+ *
+ *  Stopping breaks `runQueue` mid-walk, and the result modal then REPLACES the
+ *  one holding the progress list — so the campaigns the queue never reached
+ *  vanished with it and the operator was left reading a result for five
+ *  campaigns having ticked twelve, with nothing saying the other seven had not
+ *  been dialled. They are not lost: a campaign never reached was never posted,
+ *  so its plan items are still `planned` and approving the day again sends
+ *  exactly those. That is the sentence.
+ *
+ *  `reached` is how many campaigns the queue actually started — one progress row
+ *  each — so this needs no flag from the Stop button: a run that ended on its
+ *  own reached all of them and says nothing. */
+export function stoppedShort(queued: number, reached: number): string | null {
+  const left = queued - reached;
+  if (left < 1) return null;
+  return `Stopped: ${n(left)} of ${n(queued)} ${left === 1 ? 'campaign was' : 'campaigns were'}`
+    + ' never reached, so nothing was dialled for them. They are still planned and still'
+    + ' approvable — approving the day again sends only those.';
+}
+
 /** Approving is the only thing in this console that reaches Formi. */
 export function ApproveDay({
   agent,
@@ -1477,13 +1498,16 @@ export function ApproveDay({
   };
 
   if (res) {
+    // One progress row per campaign the queue started, so this is the count the
+    // Stop cut off — carried into the modal that replaces the progress list.
+    const short = stoppedShort(queue.length, progress.length);
     return (
       <Modal
-        title={res.dry_run ? 'Simulated the day' : 'What went out'}
+        title={short ? 'Stopped part-way' : res.dry_run ? 'Simulated the day' : 'What went out'}
         onClose={done}
         footer={<button className="btn btn-primary" onClick={done}>Done</button>}
       >
-        <DialResult res={res} args={args} onChange={setRes} />
+        <DialResult res={res} args={args} short={short} onChange={setRes} />
       </Modal>
     );
   }
@@ -1653,6 +1677,7 @@ const WHY: Record<string, string> = {
 export function DialResult({
   res,
   args,
+  short,
   onChange,
 }: {
   res: ApproveResult;
@@ -1660,6 +1685,10 @@ export function DialResult({
    *  panel's agent. The Retry re-sends it narrowed, so it cannot dial wider than
    *  the approve it is retrying and there is no second scope here to get wrong. */
   args: ApproveArgs;
+  /** `stoppedShort(...)` when the queue was cut off part-way: the campaigns
+   *  below are only the ones it reached, and the rest have to be accounted for
+   *  here or they are accounted for nowhere. */
+  short?: string | null;
   onChange: (next: ApproveResult) => void;
 }) {
   const toast = useStore((s) => s.toast);
@@ -1731,6 +1760,12 @@ export function DialResult({
 
   return (
     <>
+      {short && (
+        <div className="warnbox" style={{ marginBottom: 10 }}>
+          <AlertTriangle />
+          <span>{short}</span>
+        </div>
+      )}
       <div className="dialbar">
         <div className="dialbar-seg is-scheduled" style={{ width: pct(res.posted) }} />
         <div className="dialbar-seg is-refused" style={{ width: pct(res.failed) }} />
@@ -1762,7 +1797,8 @@ export function DialResult({
             started contributes nothing to `notScheduled` — the totals of a
             campaign that produced no result are all zero — so the counts alone
             cannot tell a clean day from a day that did nothing. */}
-        {notScheduled === 0 && problems.length === 0 && 'Every selected lead is on the clock.'}
+        {notScheduled === 0 && problems.length === 0 && !short
+          && 'Every selected lead is on the clock.'}
         {res.dry_run && ' Nothing reached Formi: the server is in dry run.'}
       </p>
 
