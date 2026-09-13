@@ -1126,6 +1126,39 @@ export function mergeResults(parts: ApproveResult[], day: DayView): ApproveResul
   );
 }
 
+/** Walk the queue, one request at a time, reporting each campaign as it goes.
+ *
+ *  The loop itself, lifted out of the click handler that used to hold it. A
+ *  click is unreachable from the static check, but an `await` is not: as a
+ *  function the check drives it with a stubbed `fetch` and reads what actually
+ *  went on the wire — which is the deliverable. Written inline, collapsing the
+ *  queue back into one whole-day `api.approveDay(...args)` — the 2,967-calls-in-
+ *  one-request bug — passed the whole gate green, and so did deleting the
+ *  `stopped()` break that makes the Stop button do anything.
+ *
+ *  React stays on the other side of `on`: this function knows nothing about
+ *  `setState` or toasts, which is what lets it run outside a DOM. */
+export async function runQueue(
+  queue: ReturnType<typeof dialQueue>,
+  on: (c: ReturnType<typeof dialQueue>[number], state: ProgressRow['state'], err?: string) => void,
+  stopped: () => boolean,
+): Promise<ApproveResult[]> {
+  const merged: ApproveResult[] = [];
+  for (const c of queue) {
+    if (stopped()) break;
+    on(c, 'running');
+    try {
+      const out = await api.approveDay(...c.args);
+      merged.push(out);
+      on(c, out.campaigns.every((r) => r.status === 'approved' && !r.failed) ? 'done' : 'failed');
+    } catch (e) {
+      // One campaign failing must not end the day for the rest.
+      on(c, 'failed', (e as Error).message);
+    }
+  }
+  return merged;
+}
+
 /** Approving is the only thing in this console that reaches Formi. */
 export function ApproveDay({
   agent,
@@ -1174,34 +1207,29 @@ export function ApproveDay({
   // the progress bar's denominator — so both count the same campaigns.
   const queue = dialQueue(args, day);
 
+  /** Everything the queue reports, turned back into screen. The only part of the
+   *  dial that needs React, and so the only part the static check cannot run. */
+  const onCampaign = (
+    c: (typeof queue)[number],
+    state: ProgressRow['state'],
+    err?: string,
+  ) => {
+    if (state === 'running') {
+      setCurrent(c.name);
+      setProgress((p) => [...p, { campaign_id: c.campaign_id, name: c.name, state }]);
+      return;
+    }
+    if (err !== undefined) toast('bad', `${c.name}: ${err}`);
+    setProgress((p) => p.map((r) => (r.campaign_id === c.campaign_id ? { ...r, state } : r)));
+  };
+
   /** One campaign per request, in order, waiting for each. */
   const submit = async () => {
     if (mismatch) return; // a panel that disagrees with itself dials nothing
     setBusy(true);
     stop.current = false;
-    const merged: ApproveResult[] = [];
     try {
-      for (const c of queue) {
-        if (stop.current) break;
-        setCurrent(c.name);
-        setProgress((p) => [...p, { campaign_id: c.campaign_id, name: c.name, state: 'running' }]);
-        try {
-          const out = await api.approveDay(...c.args);
-          merged.push(out);
-          const ok = out.campaigns.every((r) => r.status === 'approved' && !r.failed);
-          setProgress((p) =>
-            p.map((r) =>
-              r.campaign_id === c.campaign_id ? { ...r, state: ok ? 'done' : 'failed' } : r,
-            ),
-          );
-        } catch (e) {
-          // One campaign failing must not end the day for the rest.
-          toast('bad', `${c.name}: ${(e as Error).message}`);
-          setProgress((p) =>
-            p.map((r) => (r.campaign_id === c.campaign_id ? { ...r, state: 'failed' } : r)),
-          );
-        }
-      }
+      const merged = await runQueue(queue, onCampaign, () => stop.current);
       setRes(mergeResults(merged, day));
     } finally {
       setCurrent(null);

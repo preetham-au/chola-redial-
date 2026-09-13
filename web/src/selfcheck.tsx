@@ -27,6 +27,7 @@ import {
   panelPrepare,
   panelsFor,
   retryArgs,
+  runQueue,
   scopeMismatch,
   wireBuckets,
 } from './screens/Today';
@@ -889,6 +890,42 @@ ok(
      !sent[2].includes('agent_id'));
   await panelPrepare(null, '2026-09-13', 'auto');
   ok('and still builds the whole day’s plan', !sent[3].includes('"agent_id":'));
+  retryLive();
+
+  // --- and the day actually goes out one campaign at a time -------------------
+  //
+  // `dialQueue` proves the QUEUE is one request per campaign; nothing above
+  // proves the dial walks it. That loop used to live in a click handler, where
+  // collapsing it back into a single whole-day `api.approveDay(...args)` — the
+  // 2,967-calls-in-one-request bug of 12 Sep 2026 — passed the whole gate green.
+  // The click is still out of reach, but the `await` is not: `runQueue` is the
+  // loop with React on the far side of a callback, driven here on the same
+  // stubbed fetch and read back off the wire.
+  const tamil = mockDay('2026-09-13', 'auto', 127);
+  const queue = dialQueue(approveArgs(A127, tamil, []), tamil);
+  const bodies = () =>
+    sent.map((s) => JSON.parse(s.slice(s.indexOf(' ') + 1)) as
+      { campaign_ids: number[]; agent_id?: number });
+
+  sent.length = 0;
+  await runQueue(queue, () => {}, () => false);
+  ok('the dial puts each campaign on the wire in its own request, exactly once',
+     queue.length > 1 && bodies().length === queue.length &&
+     bodies().every((b, i) =>
+       b.campaign_ids.length === 1 && b.campaign_ids[0] === queue[i].campaign_id));
+  // Twelve requests where there was one is twelve chances to lose the scope.
+  // A dropped agent dials every armed campaign on every agent — the whole
+  // roster, from a panel headed "Tamil".
+  ok('and every one of them still carries the panel’s agent, unchanged down the queue',
+     bodies().every((b) => b.agent_id === 127));
+
+  // Stopping has to stop the DIALLING, not just the spinner: the campaigns it
+  // never reached stay `planned` and stay approvable, which is only true if the
+  // requests were never sent.
+  sent.length = 0;
+  await runQueue(queue, () => {}, () => sent.length > 0);
+  ok('stopping the queue stops the phones — no request goes out after the stop',
+     queue.length > 1 && sent.length === 1);
   retryLive();
 
   console.log('\nall checks passed');
