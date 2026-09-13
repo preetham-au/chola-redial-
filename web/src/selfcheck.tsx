@@ -29,6 +29,7 @@ import {
   panelDay,
   panelPrepare,
   panelsFor,
+  pickerPrepare,
   planAge,
   recheckMessage,
   retryArgs,
@@ -1127,6 +1128,34 @@ ok(
   await panelPrepare(A127, '2026-09-13', 'auto', true);
   ok('the re-check re-reads Formi for the panel’s own agent alone, never the roster',
      sent[4].includes('"agent_id":127') && sent[4].includes('"resync":true'));
+
+  // The picker's Save has the same wire to get wrong, and got it wrong. It arms
+  // ONE agent's campaigns — it says so twice on screen — and then built the plan
+  // for everybody; `_write_run` clears each campaign's existing `planned` run
+  // before writing, so an unscoped build from a picker scoped to Tamil tore down
+  // the Hindi plan the other operator was mid-way through approving.
+  sent.length = 0;
+  await pickerPrepare(127, '2026-09-13', 'auto');
+  ok('the picker builds the plan for the agent it was arming, and no other',
+     sent[0].includes('"agent_id":127'));
+  // `resync` would re-read Formi for every campaign on Save — the wrong price
+  // for a button pressed while choosing, and `resync_failed` leaves a campaign
+  // the operator JUST ticked in no plan at all.
+  ok('and does not re-read Formi to do it', sent[0].includes('"resync":false'));
+  await pickerPrepare(null, '2026-09-13', 'auto');
+  ok('an unscoped picker still builds the whole day, exactly as before scoping',
+     !sent[1].includes('agent_id'));
+  sent.length = 0;
+  // The wire above is pinned; the CALL SITE is a click the static renderer never
+  // reaches, and dropping `pickerPrepare` for a bare `api.prepareDay(date, kind)`
+  // inside `save()` is exactly how this defect got in — with the whole gate
+  // green. So the source is read, the same way the colour ramp is: every build
+  // in this screen goes through one of the two scoped helpers, and there is no
+  // third caller to forget the agent in. (app.css is read at src/styles; run
+  // from web/ either way.)
+  const src = readFileSync('src/screens/Today.tsx', 'utf8');
+  ok('and nothing in the day screen calls prepare outside those two scoped helpers',
+     src.split('api.prepareDay(').length - 1 === 2);
 
   // …and it has to SAY what the re-read found. Two facts come back that no other
   // call can learn, and the operator cannot see either one: the ready count

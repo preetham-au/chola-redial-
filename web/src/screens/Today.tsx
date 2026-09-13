@@ -77,6 +77,21 @@ export const panelDay = (agent: Agent | null, date: string, kind: string) =>
 export const panelPrepare = (agent: Agent | null, date: string, kind: string, resync = false) =>
   api.prepareDay(date, kind, resync, agent?.agent_id);
 
+/** The picker's own build, scoped to the agent the picker was showing.
+ *
+ *  The picker arms and disarms ONE agent's campaigns — it says so twice on
+ *  screen — and then built the plan for everybody. That is not merely a wider
+ *  read: `_write_run` clears the day's existing `planned` run for each campaign
+ *  it re-plans, so an unscoped build from a panel headed "Tamil" tore down and
+ *  rebuilt the Hindi plan the other operator was mid-way through approving.
+ *
+ *  Takes the id rather than an `Agent` because that is what the picker holds —
+ *  the rail's scope, not a panel's identity — and exported for the same reason
+ *  `panelPrepare` is: `save()` is an async click the static renderer never
+ *  reaches, so un-scoping it inline passed the whole gate green. */
+export const pickerPrepare = (agentId: number | null, date: string, kind: string) =>
+  api.prepareDay(date, kind, false, agentId ?? undefined);
+
 /** Every `_prepare_one` status that means the campaign is in NO plan at all.
  *
  *  `resync_failed` is the warehouse read failing, so it was left out rather than
@@ -996,11 +1011,15 @@ function PickCampaigns({
                 `${elsewhereAgents.join(', ')} are still armed — switch the scope to change those.`,
         );
       } else {
-        const res = await api.prepareDay(date, kind);
+        // Scoped: this picker armed one agent's campaigns, so it builds one
+        // agent's plan. Unscoped, `_write_run` tore down the OTHER agent's
+        // `planned` runs and rebuilt them — from a modal that says twice that it
+        // changes agent {agentId} alone.
+        const res = await pickerPrepare(agentId, date, kind);
         toast(
           'ok',
-          `${n(res.ready)} leads ready across ${res.prepared} campaigns, scheduled by RED. ` +
-            'Nothing has been dialled.',
+          `${n(res.ready)} leads ready across ${res.prepared} campaigns on agent ${agentId}, ` +
+            'scheduled by RED. Nothing has been dialled.',
         );
       }
       onDone();
@@ -1037,8 +1056,9 @@ function PickCampaigns({
       }
     >
       <p style={{ marginTop: 0 }}>
-        <Info className="inline-icon" /> Saving arms these campaigns and builds {date}’s plan from
-        their leads’ RED. It places no call — the day still has to be approved.
+        <Info className="inline-icon" /> Saving arms these campaigns and builds agent{' '}
+        {agentId ?? '—'}’s half of {date}’s plan from their leads’ RED. It places no call — the
+        day still has to be approved, and no other agent’s plan is touched.
       </p>
 
       <p className="cell-dim" style={{ marginTop: 0 }}>
