@@ -28,6 +28,25 @@ def clean_runs():
         conn.commit()
 
 
+@pytest.fixture(autouse=True)
+def restore_campaigns():
+    """Put every campaign's flags back after each test.
+
+    These tests have to arm campaigns to have anything to assert on, and the
+    `client` fixture is session-scoped (tests/conftest.py:21), so one database
+    serves every file. Without this, arming here would leak into whatever runs
+    next -- which is exactly the bug this fixture exists to stop repeating.
+    """
+    cols = "autopilot, enabled, paused, hidden"
+    with session() as conn:
+        before = [tuple(r) for r in conn.execute(f"SELECT {cols}, id FROM campaigns")]
+    yield
+    with session() as conn:
+        conn.executemany("UPDATE campaigns SET autopilot=?, enabled=?, paused=?, "
+                         "hidden=? WHERE id=?", before)
+        conn.commit()
+
+
 def _seed_run(campaign_id: int, run_date: str, kind: str, status: str, slots: int) -> int:
     """A run with `slots` planned items, exactly as _write_run would leave it."""
     with session() as conn:
@@ -47,18 +66,33 @@ def _seed_run(campaign_id: int, run_date: str, kind: str, status: str, slots: in
     return run_id
 
 
-def _armed_campaign_id() -> int:
+def _arm(count: int = 1) -> list[int]:
+    """Arm one campaign on each of `count` distinct agents; return their ids.
+
+    engine/seed.py ships every campaign disarmed and the day endpoints only look
+    at armed ones, so a test that does not arm anything is asserting against an
+    empty roster. One campaign per agent, because the agent-scoping tests need
+    two agents that are genuinely separable.
+    """
     with session() as conn:
-        row = conn.execute(
-            "SELECT id FROM campaigns WHERE autopilot=1 AND enabled=1 AND paused=0 "
-            "AND hidden=0 ORDER BY id").fetchone()
-    assert row is not None, "the fixture DB must have at least one armed campaign"
-    return int(row["id"])
+        rows = conn.execute(
+            "SELECT id, agent_id FROM campaigns ORDER BY agent_id, id").fetchall()
+    first_of_agent: dict[int, int] = {}
+    for row in rows:
+        first_of_agent.setdefault(row["agent_id"], row["id"])
+    ids = list(first_of_agent.values())[:count]
+    if len(ids) < count:
+        pytest.skip(f"fixture DB has fewer than {count} agents")
+    with session() as conn:
+        conn.executemany("UPDATE campaigns SET autopilot=1, enabled=1, paused=0, "
+                         "hidden=0 WHERE id=?", [(i,) for i in ids])
+        conn.commit()
+    return ids
 
 
 def test_stranded_lists_a_past_planned_run(client):
     """A run left `planned` on an earlier date is 491 calls nobody dialled."""
-    campaign_id = _armed_campaign_id()
+    campaign_id = _arm()[0]
     yesterday = (date.today() - timedelta(days=1)).isoformat()
     _seed_run(campaign_id, yesterday, "auto", "planned", 3)
 
@@ -72,7 +106,7 @@ def test_stranded_lists_a_past_planned_run(client):
 
 def test_stranded_ignores_today_and_committed_runs(client):
     """Today's plan is awaiting approval, not stranded; a committed run dialled."""
-    campaign_id = _armed_campaign_id()
+    campaign_id = _arm()[0]
     today = date.today().isoformat()
     yesterday = (date.today() - timedelta(days=1)).isoformat()
     _seed_run(campaign_id, today, "auto", "planned", 5)
