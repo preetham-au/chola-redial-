@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from collections import Counter
 from datetime import date, datetime, time, timedelta
@@ -182,10 +183,34 @@ def list_campaigns(agent_id: Optional[int] = Query(None),
 # There is no `agents` table on purpose: an agent IS the set of campaigns that
 # carry its id, so the roster is derived and can never disagree with the data.
 
+def _agent_languages() -> dict[int, str]:
+    """agent id -> the language it speaks, from AGENT_LANGUAGES.
+
+    There is no agents table and no name in the data -- `list_agents` has always
+    answered "Agent 125" -- so the label has to come from configuration. It is
+    NOT a frontend constant: hardcoding "125 is Hindi" in the UI puts a fact
+    about this deployment in the build, and breaks the day a third agent lands.
+
+    Format: `AGENT_LANGUAGES=125:Hindi,127:Tamil`. A malformed entry raises
+    rather than silently labelling an agent wrong -- a wrong language on a
+    dialling console is a script read to the wrong cohort.
+    """
+    raw = (os.environ.get("AGENT_LANGUAGES") or "").strip()
+    out: dict[int, str] = {}
+    for part in filter(None, (p.strip() for p in raw.split(","))):
+        agent, _, label = part.partition(":")
+        if not label.strip():
+            raise ValueError(f"AGENT_LANGUAGES entry {part!r} is not `id:Language`")
+        out[int(agent)] = label.strip()
+    return out
+
+
 @router.get("/api/agents")
 def list_agents() -> list[dict[str, Any]]:
+    languages = _agent_languages()
     with session() as conn:
         return [{"agent_id": r["agent_id"], "name": f"Agent {r['agent_id']}",
+                 "language": languages.get(r["agent_id"]),
                  "campaigns": r["campaigns"], "enabled": r["enabled"],
                  "paused_campaigns": r["paused_campaigns"],
                  # Paused only when there is something running to pause and all

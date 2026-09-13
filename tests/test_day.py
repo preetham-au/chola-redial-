@@ -92,6 +92,24 @@ def _arm(count: int = 1) -> list[int]:
     return ids
 
 
+def _arm_two_agents() -> list[tuple[int, int]]:
+    """Arm one campaign on each of two agents; return [(agent_id, campaign_id), ...].
+
+    The agent-scoping tests need the AGENT ids, which `_arm` does not return --
+    it answers in campaign ids because every other test here seeds runs against
+    a campaign. Read back rather than hardcoded: `_arm` picks from the same
+    table, so which campaign belongs to which agent is the DB's answer.
+    """
+    ids = _arm(2)
+    marks = ",".join("?" * len(ids))
+    with session() as conn:
+        agent_of = {r["id"]: r["agent_id"] for r in conn.execute(
+            f"SELECT id, agent_id FROM campaigns WHERE id IN ({marks})", ids)}
+    pairs = [(agent_of[i], i) for i in ids]
+    assert len({a for a, _ in pairs}) == 2, "_arm must pick one campaign per agent"
+    return pairs
+
+
 def test_stranded_lists_a_past_planned_run(client):
     """A run left `planned` on an earlier date is 491 calls nobody dialled."""
     campaign_id = _arm()[0]
@@ -475,3 +493,237 @@ def test_a_campaign_closing_exactly_on_the_boundary_has_no_afternoon_band(client
         "a zero-width band must not write a run whose every slot shares one minute"
     assert approved["status"] == "window_closed", approved
     assert approved.get("posted") is None, "a zero-width band must never reach Formi"
+
+
+# ---------------------------------------------------------------------------
+# Agent scoping
+# ---------------------------------------------------------------------------
+# Agents 125 and 127 hold mirrored campaigns in two languages, and every one of
+# these endpoints used to sum them. Both halves are asserted throughout: a test
+# that only ever passes `agent_id` says nothing about the default path, and one
+# that never passes it says nothing about the filter.
+
+def test_day_without_agent_id_covers_every_agent_and_scoping_narrows_it(client):
+    """The scoped day must be a PROPER subset of the unscoped one.
+
+    This is the assertion the feature lives or dies on. `agent_id` that is read
+    and then ignored leaves both calls identical, and a subset check alone
+    passes on that -- a set is a subset of itself.
+    """
+    (first, first_c), (second, second_c) = _arm_two_agents()
+    whole = {c["id"]: c["agent_id"] for c in client.get("/api/day").json()["campaigns"]}
+
+    assert {first, second} <= set(whole.values()), \
+        "an unscoped day must still show every armed agent, exactly as before"
+
+    parts = {}
+    for agent in (first, second):
+        body = client.get(f"/api/day?agent_id={agent}").json()
+        ids = {c["id"] for c in body["campaigns"]}
+        assert ids, f"agent {agent} has an armed campaign and must still show it"
+        assert ids < set(whole), \
+            f"the day scoped to agent {agent} equals the unscoped day - it is not scoped"
+        assert body["agent_id"] == agent, "the response must say what it was scoped to"
+        assert body["totals"]["campaigns"] == len(body["campaigns"]), \
+            "the totals must count the scoped roster, not the whole day"
+        parts[agent] = ids
+
+    assert parts[first].isdisjoint(parts[second]), "two agents cannot share a campaign"
+    assert parts[first] | parts[second] == set(whole), \
+        "between them the agents must account for the whole unscoped day"
+    assert client.get("/api/day").json()["agent_id"] is None, \
+        "an unscoped day is not scoped to anybody"
+
+
+def test_day_scoped_to_one_agent_excludes_the_other(client):
+    (first, _), (second, _) = _arm_two_agents()
+    body = client.get(f"/api/day?agent_id={first}").json()
+
+    assert body["campaigns"], "the scoped agent must still have its campaigns"
+    assert all(c["agent_id"] == first for c in body["campaigns"]), \
+        "a scoped day must never show another agent's campaigns"
+    assert all(c["agent_id"] != second for c in body["campaigns"])
+
+
+def test_day_for_an_agent_with_nothing_armed_is_empty_not_an_error(client):
+    _arm_two_agents()
+    res = client.get("/api/day?agent_id=999999")
+
+    assert res.status_code == 200, "a quiet agent is a real state, not a 404"
+    assert res.json()["campaigns"] == []
+    assert res.json()["status"] == "no_campaigns"
+
+
+def test_day_scopes_the_stopped_list_to_the_agent(client):
+    """A scoped panel showing the other language's stopped campaigns is the same
+    bug as showing its armed ones -- both land in the operator's `stopped` list."""
+    (first, _), (second, second_c) = _arm_two_agents()
+    with session() as conn:
+        conn.execute("UPDATE campaigns SET paused=1 WHERE id=?", (second_c,))
+        conn.commit()
+
+    scoped = {c["id"] for c in client.get(f"/api/day?agent_id={first}").json()["stopped"]}
+    whole = {c["id"] for c in client.get("/api/day").json()["stopped"]}
+
+    assert second_c in whole, "an unscoped day still reports every stopped campaign"
+    assert second_c not in scoped, \
+        "a scoped panel must not show another agent's stopped campaigns"
+
+
+def test_day_scopes_a_hidden_campaign_that_is_still_dialling(client, pin_clock):
+    """The hidden-but-dialling warning lands in the same `stopped` array.
+
+    Scoped with `stopped` or not at all: half a scoped list is worse than none,
+    because the operator cannot tell which half they are looking at.
+    """
+    (first, _), (second, second_c) = _arm_two_agents()
+    now = pin_clock(9)
+    today = now.date().isoformat()
+    run_id = _seed_run(second_c, today, "auto", "committed", 2)
+    with session() as conn:
+        conn.execute("UPDATE campaigns SET hidden=1 WHERE id=?", (second_c,))
+        conn.execute("UPDATE plan_items SET status='simulated', scheduled_time=? "
+                     "WHERE run_id=?", (f"{today}T23:59:00", run_id))
+        conn.commit()
+
+    scoped = {c["id"] for c in client.get(f"/api/day?agent_id={first}").json()["stopped"]}
+    whole = {c["id"] for c in client.get("/api/day").json()["stopped"]}
+
+    assert second_c in whole, "an unscoped day must still warn about it"
+    assert second_c not in scoped, \
+        "a scoped panel must not warn about another agent's hidden campaign"
+
+
+def test_day_scopes_the_stranded_warning_to_the_agent(client):
+    (first, first_c), (second, second_c) = _arm_two_agents()
+    yesterday = (now_ist().date() - timedelta(days=1)).isoformat()
+    _seed_run(first_c, yesterday, "auto", "planned", 3)
+    _seed_run(second_c, yesterday, "auto", "planned", 5)
+
+    scoped = {s["campaign_id"] for s in
+              client.get(f"/api/day?agent_id={first}").json()["stranded"]}
+    whole = {s["campaign_id"] for s in client.get("/api/day").json()["stranded"]}
+
+    assert {first_c, second_c} <= whole, "an unscoped day reports both agents' plans"
+    assert first_c in scoped, "the scoped agent's own stranded plan is still reported"
+    assert second_c not in scoped, \
+        "a scoped panel must not report another agent's stranded plan"
+
+
+def test_prepare_is_scoped_to_its_agent(client, pin_clock):
+    """The roster the prepare pass walks is the scoped one.
+
+    Pinned past the boundary so every campaign answers `window_closed` and no run
+    is written: `client` is session-scoped, and what is under test is WHICH
+    campaigns the pass visits, not what it plans for them.
+    """
+    import api.day as day_module
+
+    (first, first_c), (_, second_c) = _arm_two_agents()
+    now = pin_clock(15)
+
+    scoped = day_module.prepare_day(now.date(), "auto", False, first)
+    whole = day_module.prepare_day(now.date(), "auto", False)
+
+    visited = {c["campaign_id"] for c in scoped["campaigns"]}
+    assert visited == {first_c}, f"the scoped pass visited {visited}"
+    assert {first_c, second_c} <= {c["campaign_id"] for c in whole["campaigns"]}, \
+        "an unscoped pass must still prepare every armed campaign"
+
+
+def test_prepare_endpoint_passes_agent_id_through(client, pin_clock):
+    """`PrepareBody.agent_id` must actually reach `prepare_day`.
+
+    The field can be declared, accepted and dropped on the floor, and every
+    direct-call test above still passes.
+    """
+    (first, first_c), (_, second_c) = _arm_two_agents()
+    now = pin_clock(15)
+    body = {"date": now.date().isoformat(), "kind": "auto", "agent_id": first}
+
+    visited = {c["campaign_id"] for c in
+               client.post("/api/day/prepare", json=body).json()["campaigns"]}
+
+    assert visited == {first_c}, f"the endpoint prepared {visited}"
+    assert second_c not in visited
+
+
+def test_approve_is_scoped_to_its_agent(client):
+    """Approve's roster is the scoped one too -- the roster that reaches Formi.
+
+    Dated tomorrow with no plan prepared, so every campaign answers
+    `not_prepared` and nothing dials. What is asserted is which campaigns are in
+    the answer at all, which is exactly what the roster query decides.
+    """
+    (first, first_c), (_, second_c) = _arm_two_agents()
+    tomorrow = (now_ist().date() + timedelta(days=1)).isoformat()
+
+    scoped = client.post("/api/day/approve",
+                         json={"date": tomorrow, "agent_id": first}).json()
+    whole = client.post("/api/day/approve", json={"date": tomorrow}).json()
+
+    visited = {c["campaign_id"] for c in scoped["campaigns"]}
+    assert visited == {first_c}, f"the scoped approve visited {visited}"
+    assert {first_c, second_c} <= {c["campaign_id"] for c in whole["campaigns"]}, \
+        "an unscoped approve must still visit every armed campaign"
+
+
+def test_armed_helper_leaves_the_unscoped_clause_exactly_as_it_was(client):
+    """`_armed(None)` is the literal roster string, with no parameters.
+
+    Every caller interpolates the fragment into SQL it also passes parameters
+    for, so a helper that quietly appended `AND agent_id=?` with nothing to bind
+    would fail at the driver rather than return the wrong rows.
+    """
+    from api.day import _armed
+
+    assert _armed() == (ARMED, [])
+    assert _armed(None) == (ARMED, [])
+    where, params = _armed(125)
+    assert where == f"{ARMED} AND agent_id=?" and params == [125]
+
+
+# ---------------------------------------------------------------------------
+# Agent language labels
+# ---------------------------------------------------------------------------
+
+def test_agents_carry_a_language_label(client, monkeypatch):
+    """The label comes from AGENT_LANGUAGES, never from a constant in the code."""
+    import api.routes_core as core
+
+    monkeypatch.setenv("AGENT_LANGUAGES", "125:Hindi,127:Tamil")
+    labels = {a["agent_id"]: a["language"] for a in core.list_agents()}
+
+    assert labels, "the fixture DB must hold at least one agent"
+    assert labels.get(125) == "Hindi", labels
+    assert labels.get(127) == "Tamil", labels
+
+
+def test_an_unlabelled_agent_gets_no_language_rather_than_a_guess(client, monkeypatch):
+    import api.routes_core as core
+
+    monkeypatch.setenv("AGENT_LANGUAGES", "125:Hindi")
+    labels = {a["agent_id"]: a["language"] for a in core.list_agents()}
+
+    assert labels.get(125) == "Hindi"
+    assert labels.get(127) is None, "an agent nobody labelled has no language"
+
+
+def test_agents_carry_the_field_even_with_nothing_configured(client, monkeypatch):
+    """The key is always present, so the client never has to feature-detect it."""
+    import api.routes_core as core
+
+    monkeypatch.delenv("AGENT_LANGUAGES", raising=False)
+    agents = core.list_agents()
+
+    assert agents, "the fixture DB must hold at least one agent"
+    assert all("language" in a and a["language"] is None for a in agents)
+
+
+def test_a_malformed_agent_language_is_refused_rather_than_guessed(client, monkeypatch):
+    """`127` with no label must raise, not silently label agent 127 with ''."""
+    import api.routes_core as core
+
+    monkeypatch.setenv("AGENT_LANGUAGES", "125:Hindi,127")
+    with pytest.raises(ValueError, match="127"):
+        core.list_agents()

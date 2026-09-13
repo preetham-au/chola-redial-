@@ -201,17 +201,35 @@ One page for the whole day across every campaign in the plan, and one approval.
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET` | `/api/day?date=&kind=` | the whole day. Cheap by construction — two `GROUP BY`s over rows the console already wrote, so a screen may poll it all day without costing a warehouse query. Never re-runs the engine. |
-| `POST` | `/api/day/prepare` | `{date?, kind?, resync?}` → builds `planned` runs for every campaign in the plan. **Dials nothing.** `resync: true` (what a pass sets) re-reads campaign status and re-pulls leads first. |
-| `POST` | `/api/day/approve` | `{date?, kind?, buckets?[], campaign_ids?[]}` → **dials.** Empty `buckets` means every bucket; empty `campaign_ids` means every campaign with a plan waiting. |
+| `GET` | `/api/day?date=&kind=&agent_id=` | the whole day. Cheap by construction — two `GROUP BY`s over rows the console already wrote, so a screen may poll it all day without costing a warehouse query. Never re-runs the engine. |
+| `POST` | `/api/day/prepare` | `{date?, kind?, resync?, agent_id?}` → builds `planned` runs for every campaign in the plan. **Dials nothing.** `resync: true` (what a pass sets) re-reads campaign status and re-pulls leads first. |
+| `POST` | `/api/day/approve` | `{date?, kind?, buckets?[], campaign_ids?[], agent_id?}` → **dials.** Empty `buckets` means every bucket; empty `campaign_ids` means every campaign with a plan waiting. |
 
 `status` is one of `no_campaigns` · `not_prepared` · `awaiting_approval` ·
 `approved`, so the screen has one thing to switch on rather than four counters to
 interpret.
 
+**`agent_id` narrows the day to one agent — one language.** Omitted, every
+endpoint here answers for every armed campaign, exactly as it did before scoping
+existed. Supplied, `campaigns`, `stopped`, `stranded`, `totals`, `buckets`,
+`red_bands` and `capacity_before_close` all describe that agent alone, and the
+response echoes it back in `agent_id` (`null` when unscoped). Agents 125 and 127
+hold mirrored campaigns in two languages and this screen used to sum them: 4,271
+Hindi slots and 481 Tamil ones were shown as one number with one Approve button
+that dialled both.
+
+It is **not** a campaign filter. A campaign carries its agent already, so a
+campaign created tomorrow still auto-arms and appears under its own agent with
+nothing to list anywhere. An agent with nothing armed answers `200` with
+`no_campaigns` and empty lists — a quiet agent is a real state, not a `404`.
+
 ```jsonc
 // GET /api/day
 { "date": "2026-09-09", "kind": "auto", "wave": "morning",
+  // What this answer is narrowed to; null when it is the whole day. A screen can
+  // tell "one agent's day" from "every agent's" without keeping its own copy of
+  // what it asked for.
+  "agent_id": 125,
   "now": "11:04", "dry_run": true,
   // The campaigns' windows clipped to this WAVE'S BAND, so the header names
   // the hours this approval can actually reach. `auto` ends at WAVE_BOUNDARY
@@ -236,7 +254,18 @@ interpret.
                    "ready": 312, "by_bucket": { "M0": 96 },
                    "posted": 0, "failed": 0, "dropped": 0 } ],
   // "Why is nothing happening for X" — armed campaigns now held, with the reason.
+  // A campaign hidden while it still has calls on Formi's clock appears here too,
+  // until its last slot has gone out.
   "stopped": [ { "id": 1644, "name": "…", "why": "paused in the Formi platform" } ],
+  // Plans PREPARED ON AN EARLIER DAY that nobody ever approved. Not history:
+  // those leads were never called and nothing else in this console says so. A
+  // run stays `planned` until somebody approves it — on 12 Sep 2026 eight
+  // campaigns holding 491 slots sat like that until the day ended. Bounded to
+  // the last 14 days and to the campaigns currently in the daily plan; clamped
+  // against the server's today, so asking for tomorrow does not report this
+  // morning's queued plan as abandoned.
+  "stranded": [ { "campaign_id": 1650, "name": "…", "run_date": "2026-09-12",
+                  "kind": "auto", "slots": 214 } ],
   "dial_log": { "dialled": 88, "queued": 12, "missing": 1 } }
 ```
 
@@ -428,9 +457,17 @@ Two agents are in use: **125** and **127**. Mixing their campaigns in one view i
 how you dial a Hindi script at a Tamil cohort, so the agent is a first-class
 selector, not a filter chip.
 
+`language` is the label for that voice, and it comes from the **`AGENT_LANGUAGES`
+env var** (`AGENT_LANGUAGES=125:Hindi,127:Tamil`), never from a constant in the
+UI — "125 is Hindi" is a fact about this deployment, and baking it into the build
+breaks the day a third agent lands. It is `null` for an agent the deployment has
+not labelled, and a malformed entry raises rather than labelling an agent wrong.
+There is no `agents` table on purpose: an agent *is* the set of campaigns that
+carry its id, so the roster is derived and can never disagree with the data.
+
 | Method | Path | Notes |
 |---|---|---|
-| `GET` | `/api/agents` | `[{agent_id, name, campaigns, enabled, paused_campaigns, paused}]` |
+| `GET` | `/api/agents` | `[{agent_id, name, language, campaigns, enabled, paused_campaigns, paused}]` |
 | `GET` | `/api/campaigns?agent_id=` | scoped list; omitting `agent_id` returns all. Hidden campaigns are excluded from both. |
 | `POST` | `/api/agents/{agent_id}/pause` | pauses **every** campaign on that agent |
 | `POST` | `/api/agents/{agent_id}/resume` | |

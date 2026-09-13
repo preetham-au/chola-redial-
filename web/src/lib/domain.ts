@@ -18,6 +18,10 @@ export function agentsFrom(campaigns: Campaign[]): Agent[] {
       return {
         agent_id,
         name: `Agent ${agent_id}`,
+        // Only the server knows the label — it comes from AGENT_LANGUAGES, and
+        // deriving one from campaign names here is the hardcoding that env var
+        // exists to prevent.
+        language: null,
         campaigns: cs.length,
         enabled: live.length,
         paused_campaigns: cs.filter((c) => c.paused).length,

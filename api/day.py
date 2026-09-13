@@ -115,6 +115,36 @@ def _band(kind: str, dcfg: DispatchConfig) -> DispatchConfig:
 # dialled after it was taken out. Widening the roster means editing this line.
 ARMED = "autopilot=1 AND enabled=1 AND paused=0 AND hidden=0"
 
+
+def _scope(where: str, agent_id: Optional[int],
+           column: str = "agent_id") -> tuple[str, list[Any]]:
+    """`where` narrowed to one agent, or left exactly as it was. One place, so a
+    roster and the `stopped` list beside it cannot end up scoped differently.
+
+    `column` is the qualified name where the clause lands in a join and a bare
+    `agent_id` would be left to SQLite to resolve.
+    """
+    return (where, []) if agent_id is None else (f"{where} AND {column}=?", [agent_id])
+
+
+def _armed(agent_id: Optional[int] = None) -> tuple[str, list[Any]]:
+    """The roster clause, optionally narrowed to one agent.
+
+    Agent scoping is NOT a campaign filter: a campaign carries its agent already,
+    so a newly created one still auto-arms and appears under its own agent with
+    nothing to configure. What it buys is two languages that stop being one
+    number -- agents 125 and 127 hold mirrored campaigns and the day screen used
+    to sum them, so 4,271 Hindi slots and 481 Tamil ones were shown as 4,752.
+    """
+    return _scope(ARMED, agent_id)
+
+
+# Armed once and now held. Keyed on the LATCH as well as the switch, because a
+# stop disarms `autopilot` and moves the fact that it was armed into
+# `autopilot_latched` -- reading only the switch loses the campaign the operator
+# is looking for.
+STOPPED = "(autopilot=1 OR autopilot_latched=1) AND (paused=1 OR enabled=0)"
+
 # How far back `_stranded` looks. Older than this the leads have been re-planned
 # several times over and the row is history, not a thing to act on.
 STRANDED_DAYS = 14
@@ -127,6 +157,9 @@ class PrepareBody(BaseModel):
     # and a warehouse round-trip per campaign turns a button press into minutes.
     # The scheduled pass sets it — the afternoon wave is worthless without it.
     resync: bool = False
+    # Narrows the pass to one agent — one language. None = every armed campaign,
+    # which is what the scheduled passes use.
+    agent_id: Optional[int] = None
 
 
 class ApproveBody(BaseModel):
@@ -137,6 +170,9 @@ class ApproveBody(BaseModel):
     buckets: list[str] = Field(default_factory=list)
     # Empty = every campaign with a plan waiting. Named ids narrow it.
     campaign_ids: list[int] = Field(default_factory=list)
+    # Narrows the approval to one agent — one language. None = every armed
+    # campaign, which is what an unscoped console has always dialled.
+    agent_id: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +338,8 @@ def _dialled_today(conn: sqlite3.Connection, day: date) -> dict[str, int]:
     return {r["verified"]: r["n"] for r in rows}
 
 
-def _stranded(conn: sqlite3.Connection, day: date) -> list[dict[str, Any]]:
+def _stranded(conn: sqlite3.Connection, day: date,
+              agent_id: Optional[int] = None) -> list[dict[str, Any]]:
     """Runs prepared on an EARLIER day and never dialled.
 
     A run stays `planned` until somebody approves it. On 12 Sep 2026 eight
@@ -329,24 +366,29 @@ def _stranded(conn: sqlite3.Connection, day: date) -> list[dict[str, Any]]:
     # The roster predicate is scoped to its own SELECT so every bare column in
     # ARMED resolves against `campaigns` by construction -- qualifying only the
     # first of the four left the rest to SQLite's search across the join.
+    where, params = _armed(agent_id)
     rows = conn.execute(
         f"SELECT r.campaign_id, c.name, r.run_date, r.kind, r.slots "
         f"FROM runs r JOIN campaigns c ON c.id=r.campaign_id "
         f"WHERE r.status='planned' AND r.run_date < ? AND r.run_date >= ? "
         f"AND r.slots > 0 "
-        f"AND r.campaign_id IN (SELECT id FROM campaigns WHERE {ARMED}) "
-        f"ORDER BY r.run_date DESC, r.campaign_id", (upper, since)).fetchall()
+        f"AND r.campaign_id IN (SELECT id FROM campaigns WHERE {where}) "
+        f"ORDER BY r.run_date DESC, r.campaign_id", (upper, since, *params)).fetchall()
     return [{"campaign_id": r["campaign_id"], "name": r["name"], "run_date": r["run_date"],
              "kind": r["kind"], "slots": r["slots"]} for r in rows]
 
 
 @router.get("/api/day")
-def get_day(date: Optional[str] = Query(None), kind: str = Query(MORNING)) -> dict[str, Any]:
+def get_day(date: Optional[str] = Query(None), kind: str = Query(MORNING),
+            agent_id: Optional[int] = Query(None)) -> dict[str, Any]:
     """The whole day on one page: what is ready, in what order, and what it did.
 
     Cheap by construction — two GROUP BYs over rows this console already wrote.
     It never re-runs the engine, so it can be polled by a screen that is open all
     day without costing a warehouse query.
+
+    `agent_id` narrows every list here to one agent — one language. Omitted, the
+    answer is the whole day across every armed campaign, exactly as before.
     """
     if kind not in KINDS:
         raise HTTPException(422, f"kind must be one of {list(KINDS)}, got {kind!r}")
@@ -355,32 +397,38 @@ def get_day(date: Optional[str] = Query(None), kind: str = Query(MORNING)) -> di
     today = day == now.date()
 
     with session() as conn:
-        campaigns = conn.execute(f"SELECT * FROM campaigns WHERE {ARMED} ORDER BY id").fetchall()
+        where, params = _armed(agent_id)
+        campaigns = conn.execute(
+            f"SELECT * FROM campaigns WHERE {where} ORDER BY id", params).fetchall()
         # Stopped campaigns are still shown: "why is nothing happening for X" is
         # the question this screen exists to answer, and an empty list answers it
-        # with silence. Keyed on the LATCH as well as the switch, because a stop
-        # disarms `autopilot` and moves the fact that it was armed into
-        # `autopilot_latched` — reading only the switch loses the campaign the
-        # operator is looking for.
+        # with silence. Scoped with the roster above, or a panel showing one
+        # language would list the other one's stopped campaigns.
+        stopped_where, stopped_params = _scope(STOPPED, agent_id)
         stopped = conn.execute(
-            "SELECT * FROM campaigns WHERE (autopilot=1 OR autopilot_latched=1) "
-            "AND (paused=1 OR enabled=0) ORDER BY id").fetchall()
+            f"SELECT * FROM campaigns WHERE {stopped_where} ORDER BY id",
+            stopped_params).fetchall()
         # A hidden campaign is gone from every list in the console, and hiding
         # deliberately leaves today's queued calls on Formi's clock. Those two
         # together would put calls on the wire with nothing on any screen saying
         # so, which is the one thing this console must never do. It appears here
         # while — and only while — it still has calls to place, then drops off.
+        # Scoped too: it joins the `stopped` list below, and half a scoped list is
+        # worse than none because the operator cannot tell which half they see.
+        hidden_where, hidden_params = _scope(
+            "c.hidden=1 AND r.run_date=? AND r.status='committed' "
+            "AND i.status IN ('posted','simulated') AND i.scheduled_time > ?",
+            agent_id, column="c.agent_id")
         dialling_while_hidden = conn.execute(
             "SELECT DISTINCT c.* FROM campaigns c "
             "JOIN runs r ON r.campaign_id=c.id JOIN plan_items i ON i.run_id=r.id "
-            "WHERE c.hidden=1 AND r.run_date=? AND r.status='committed' "
-            "AND i.status IN ('posted','simulated') AND i.scheduled_time > ? "
-            "ORDER BY c.id",
-            (day.isoformat(), now.strftime("%Y-%m-%dT%H:%M:00"))).fetchall()
+            f"WHERE {hidden_where} ORDER BY c.id",
+            (day.isoformat(), now.strftime("%Y-%m-%dT%H:%M:00"),
+             *hidden_params)).fetchall()
         runs = _plan_rows(conn, [c["id"] for c in campaigns], day, kind)
         counts = _slot_counts(conn, [r["id"] for r in runs.values()])
         log = _dialled_today(conn, day)
-        stranded_runs = _stranded(conn, day)
+        stranded_runs = _stranded(conn, day, agent_id)
 
         from .db import current_config                  # noqa: PLC0415 — avoids a cycle
         # Every armed campaign's own config. There is no campaign whose settings
@@ -445,6 +493,10 @@ def get_day(date: Optional[str] = Query(None), kind: str = Query(MORNING)) -> di
 
     return {
         "date": day.isoformat(), "kind": kind, "wave": WAVE_LABEL[kind],
+        # What this answer is narrowed to. None = every armed campaign, so a
+        # screen can tell "one agent's day" from "the whole day" without keeping
+        # its own copy of what it asked for.
+        "agent_id": agent_id,
         "now": now.strftime("%H:%M"), "dry_run": dry_run(),
         # The envelope across the armed campaigns, not one campaign's own hours.
         "window": span["window"], "window_varies": span["varies"],
@@ -481,7 +533,7 @@ def get_day(date: Optional[str] = Query(None), kind: str = Query(MORNING)) -> di
 # ---------------------------------------------------------------------------
 
 def prepare_day(day: Optional[date] = None, kind: str = MORNING,
-                resync: bool = False) -> dict[str, Any]:
+                resync: bool = False, agent_id: Optional[int] = None) -> dict[str, Any]:
     """Build (or rebuild) today's plan for every campaign in the daily plan.
 
     Plan only. This function cannot dial: it never calls `_commit`, and the runs
@@ -508,8 +560,9 @@ def prepare_day(day: Optional[date] = None, kind: str = MORNING,
             log.warning("could not re-read campaign status before the %s wave: %s", kind, exc)
 
     with session() as conn:
+        where, params = _armed(agent_id)
         ids = [r["id"] for r in conn.execute(
-            f"SELECT id FROM campaigns WHERE {ARMED} ORDER BY id")]
+            f"SELECT id FROM campaigns WHERE {where} ORDER BY id", params)]
 
     results = [_prepare_one(campaign_id, day, kind, resync) for campaign_id in ids]
     return {"date": day.isoformat(), "kind": kind, "wave": WAVE_LABEL[kind],
@@ -582,7 +635,7 @@ def _prepare_one(campaign_id: int, day: date, kind: str, resync: bool) -> dict[s
 @router.post("/api/day/prepare")
 def post_prepare(body: PrepareBody = Body(default_factory=PrepareBody)) -> dict[str, Any]:
     """Build today's plan now. Writes `planned` runs and dials nothing."""
-    return prepare_day(_parse_day(body.date), body.kind, body.resync)
+    return prepare_day(_parse_day(body.date), body.kind, body.resync, body.agent_id)
 
 
 # ---------------------------------------------------------------------------
@@ -609,7 +662,9 @@ def approve_day(body: ApproveBody = Body(default_factory=ApproveBody)) -> dict[s
 
     results: list[dict[str, Any]] = []
     with session() as conn:
-        campaigns = conn.execute(f"SELECT * FROM campaigns WHERE {ARMED} ORDER BY id").fetchall()
+        where, params = _armed(body.agent_id)
+        campaigns = conn.execute(
+            f"SELECT * FROM campaigns WHERE {where} ORDER BY id", params).fetchall()
         for campaign in campaigns:
             if wanted and campaign["id"] not in wanted:
                 continue

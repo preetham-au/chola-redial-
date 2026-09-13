@@ -513,6 +513,17 @@ ok(
   const derived = await api.agents();
   ok('the agent list survives a backend without /api/agents', derived.length === agents.length);
 
+  // The day is scoped by agent — one language — and the offline fixture has to
+  // be scoped too, or two panels show the same campaigns under two languages.
+  const dayAll = await api.day('2026-09-13', 'auto');
+  const day127 = await api.day('2026-09-13', 'auto', 127);
+  ok('an unscoped day still spans every agent, exactly as before scoping',
+     new Set(dayAll.campaigns.map((c) => c.agent_id)).size > 1 && dayAll.agent_id === null);
+  ok('a scoped day cannot leak another agent’s campaigns, offline either',
+     day127.campaigns.length > 0 && day127.campaigns.every((c) => c.agent_id === 127)
+     && day127.agent_id === 127);
+  ok('scoping a day actually narrows it', day127.campaigns.length < dayAll.campaigns.length);
+
   // --- a 500 is not "unreachable" --------------------------------------------
   // One crashing endpoint must not blank the console into fixtures. fetch is
   // stubbed rather than trusted: everything above runs with no fetch at all, so
@@ -537,6 +548,29 @@ ok(
   await api.health();
   ok('a 502/503/504 IS the proxy speaking for a dead backend, so that still goes offline',
      isOffline());
+  retryLive();
+
+  // --- agent scoping on the wire ---------------------------------------------
+  // Everything above runs through the offline fixture, which cannot show what
+  // the client actually SENDS. An unscoped day must send no `agent_id` at all:
+  // `agent_id=undefined` is a string the server reads as a campaign nobody owns.
+  const sent: string[] = [];
+  (globalThis as { fetch?: unknown }).fetch = async (url: unknown, init?: RequestInit) => {
+    sent.push(`${String(url)} ${String(init?.body ?? '')}`);
+    return { ok: true, status: 200, json: async () => ({ campaigns: [] }) };
+  };
+  retryLive();
+
+  await api.day('2026-09-13', 'auto');
+  ok('an unscoped day sends no agent_id at all, not an empty or undefined one',
+     !sent[0].includes('agent_id'));
+  await api.day('2026-09-13', 'auto', 127);
+  ok('a scoped day puts the agent on the query string', sent[1].includes('agent_id=127'));
+  await api.prepareDay('2026-09-13', 'auto', false, 127);
+  ok('prepare carries the agent in its body', sent[2].includes('"agent_id":127'));
+  await api.approveDay('2026-09-13', 'auto', [], [], 127);
+  ok('approve — the only call that reaches Formi — carries the agent too',
+     sent[3].includes('"agent_id":127'));
   retryLive();
 
   console.log('\nall checks passed');

@@ -87,8 +87,11 @@ export const mockAutopilot: AutopilotStatus = {
 
 /** The day, offline. Deliberately `awaiting_approval` with real-looking counts:
  *  the screen an operator opens most is the one whose empty state teaches least. */
-export const mockDay = (date: string, kind: string): DayView => {
-  const armed = mockCampaigns.filter((c) => c.enabled && !c.paused).slice(0, 4);
+export const mockDay = (date: string, kind: string, agent_id?: number): DayView => {
+  // Scoped offline too: two panels showing the same campaigns under two
+  // different languages is the exact confusion agent scoping removes.
+  const scoped = mockCampaigns.filter((c) => agent_id === undefined || c.agent_id === agent_id);
+  const armed = scoped.filter((c) => c.enabled && !c.paused).slice(0, 4);
   const per = [312, 184, 96, 41];
   const campaigns: DayCampaign[] = armed.map((c, i) => ({
     ...c,
@@ -106,6 +109,7 @@ export const mockDay = (date: string, kind: string): DayView => {
   return {
     date,
     kind,
+    agent_id: agent_id ?? null,
     wave: kind === 'auto_pm' ? 'afternoon' : 'morning',
     now: '09:00',
     dry_run: true,
@@ -130,7 +134,7 @@ export const mockDay = (date: string, kind: string): DayView => {
         ready: Math.round(ready * 0.17) },
     ],
     campaigns,
-    stopped: mockCampaigns
+    stopped: scoped
       .filter((c) => c.paused || !c.enabled)
       .slice(0, 2)
       .map((c) => ({ ...c, why: c.enabled ? 'paused in Formi' : 'disabled' })),

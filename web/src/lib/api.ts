@@ -238,19 +238,30 @@ export const api = {
      One screen, one decision. `day` is cheap enough to poll: the server reads
      rows it already wrote and never re-runs the engine. */
 
-  day: (date: string, kind = 'auto') =>
-    req<DayView>(`/api/day${q({ date, kind })}`, undefined, () => mockDay(date, kind)),
+  /** `agent_id` narrows the day to one agent — one language. Omitted, `q()` drops
+   *  the parameter entirely and the server answers for every armed campaign,
+   *  exactly as it did before scoping existed. */
+  day: (date: string, kind = 'auto', agent_id?: number) =>
+    req<DayView>(`/api/day${q({ date, kind, agent_id })}`, undefined,
+      () => mockDay(date, kind, agent_id)),
 
   /** Build (or rebuild) the plan. Writes `planned` runs and dials nothing. */
-  prepareDay: (date: string, kind = 'auto', resync = false) =>
-    req<PrepareResult>('/api/day/prepare', json({ date, kind, resync }), () => {
+  prepareDay: (date: string, kind = 'auto', resync = false, agent_id?: number) =>
+    req<PrepareResult>('/api/day/prepare', json({ date, kind, resync, agent_id }), () => {
       throw new ApiError('The server is unreachable — no plan was built.', 503);
     }),
 
   /** The only call in this client that reaches Formi. `buckets` empty = all of
    *  them; the rest are not dialled today and return in tomorrow's plan. */
-  approveDay: (date: string, kind = 'auto', buckets: string[] = [], campaign_ids: number[] = []) =>
-    req<ApproveResult>('/api/day/approve', json({ date, kind, buckets, campaign_ids }), () => {
+  approveDay: (
+    date: string,
+    kind = 'auto',
+    buckets: string[] = [],
+    campaign_ids: number[] = [],
+    agent_id?: number,
+  ) =>
+    req<ApproveResult>('/api/day/approve',
+      json({ date, kind, buckets, campaign_ids, agent_id }), () => {
       // Never invent an approval. This is the one answer that would tell an
       // operator customers were called when nothing was.
       throw new ApiError('The server is unreachable — nothing was approved or dialled.', 503);

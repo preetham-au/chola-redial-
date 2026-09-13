@@ -24,6 +24,10 @@ export interface Campaign {
 export interface Agent {
   agent_id: number;
   name: string;
+  /** From AGENT_LANGUAGES on the server. Null when the deployment has not
+   *  labelled this agent. Never hardcode it in the UI: "125 is Hindi" is a fact
+   *  about one deployment, not about this console. */
+  language: string | null;
   campaigns: number;
   /** how many of them are enabled, not a flag */
   enabled: number;
@@ -216,6 +220,9 @@ export interface DayView {
   date: string;
   kind: string;
   wave: string;
+  /** What this answer is narrowed to. Null when the day is not scoped to one
+   *  agent, in which case every list here spans every armed campaign. */
+  agent_id: number | null;
   /** Server clock, IST HH:MM. */
   now: string;
   dry_run: boolean;
