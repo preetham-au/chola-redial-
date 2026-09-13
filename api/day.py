@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from datetime import date
+from datetime import date, timedelta
 from typing import Any, Optional
 
 from fastapi import APIRouter, Body, HTTPException, Query
@@ -240,6 +240,29 @@ def _dialled_today(conn: sqlite3.Connection, day: date) -> dict[str, int]:
     return {r["verified"]: r["n"] for r in rows}
 
 
+def _stranded(conn: sqlite3.Connection, day: date) -> list[dict[str, Any]]:
+    """Runs prepared on an EARLIER day and never dialled.
+
+    A run stays `planned` until somebody approves it. On 12 Sep 2026 eight
+    campaigns holding 491 slots sat like that until the day ended, and no screen
+    in this console said so -- the day view only ever looked at the date it was
+    asked about. Those leads were not dropped, re-queued or reported; they simply
+    did not get called.
+
+    Bounded to the last 14 days: older than that the leads have been re-planned
+    several times over and the row is history, not a thing to act on.
+    """
+    since = (day - timedelta(days=14)).isoformat()
+    rows = conn.execute(
+        f"SELECT r.campaign_id, c.name, r.run_date, r.kind, r.slots "
+        f"FROM runs r JOIN campaigns c ON c.id=r.campaign_id "
+        f"WHERE r.status='planned' AND r.run_date < ? AND r.run_date >= ? "
+        f"AND r.slots > 0 AND c.{ARMED} "
+        f"ORDER BY r.run_date DESC, r.campaign_id", (day.isoformat(), since)).fetchall()
+    return [{"campaign_id": r["campaign_id"], "name": r["name"], "run_date": r["run_date"],
+             "kind": r["kind"], "slots": r["slots"]} for r in rows]
+
+
 @router.get("/api/day")
 def get_day(date: Optional[str] = Query(None), kind: str = Query(MORNING)) -> dict[str, Any]:
     """The whole day on one page: what is ready, in what order, and what it did.
@@ -280,6 +303,7 @@ def get_day(date: Optional[str] = Query(None), kind: str = Query(MORNING)) -> di
         runs = _plan_rows(conn, [c["id"] for c in campaigns], day, kind)
         counts = _slot_counts(conn, [r["id"] for r in runs.values()])
         log = _dialled_today(conn, day)
+        stranded_runs = _stranded(conn, day)
 
         from .db import current_config                  # noqa: PLC0415 — avoids a cycle
         # Every armed campaign's own config. There is no campaign whose settings
@@ -369,6 +393,9 @@ def get_day(date: Optional[str] = Query(None), kind: str = Query(MORNING)) -> di
         # The honest half of "did the call happen": counts straight off the dial
         # log, where `dialled` means the warehouse showed a real interaction.
         "dial_log": log,
+        # Plans from earlier days that nobody ever approved. Not history: those
+        # leads were never called and nothing else in this console says so.
+        "stranded": stranded_runs,
     }
 
 

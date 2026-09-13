@@ -152,6 +152,8 @@ export function Today() {
         </div>
       )}
 
+      {d && <Stranded day={d} />}
+
       <Headline
         day={d}
         busy={busy}
@@ -840,6 +842,31 @@ function PickCampaigns({
         </div>
       )}
     </Modal>
+  );
+}
+
+/** Plans nobody ever approved. Left alone, this is silent: the run stays
+ *  `planned` for ever and those leads are simply never called. */
+function Stranded({ day }: { day: DayView }) {
+  if (day.stranded.length === 0) return null;
+  const calls = day.stranded.reduce((s, r) => s + r.slots, 0);
+  const campaigns = new Set(day.stranded.map((r) => r.campaign_id)).size;
+  return (
+    <div className="warnbox">
+      <AlertTriangle />
+      <span>
+        <b>
+          {n(calls)} {calls === 1 ? 'call was' : 'calls were'} planned on {campaigns}{' '}
+          {campaigns === 1 ? 'campaign' : 'campaigns'} and never dialled.
+        </b>{' '}
+        {day.stranded
+          .slice(0, 4)
+          .map((r) => `${r.name} · ${r.run_date} ${r.kind === 'auto' ? 'morning' : 'afternoon'} (${n(r.slots)})`)
+          .join(', ')}
+        {day.stranded.length > 4 && ` and ${day.stranded.length - 4} more`}. Those leads return
+        in a later plan; they were not called on the day they were planned for.
+      </span>
+    </div>
   );
 }
 

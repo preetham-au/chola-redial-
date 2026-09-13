@@ -135,6 +135,9 @@ export const mockDay = (date: string, kind: string): DayView => {
       .slice(0, 2)
       .map((c) => ({ ...c, why: c.enabled ? 'paused in Formi' : 'disabled' })),
     dial_log: {},
+    // Empty offline: a fixture must not show a warning about calls that were
+    // never planned, let alone never dialled.
+    stranded: [],
   };
 };
 

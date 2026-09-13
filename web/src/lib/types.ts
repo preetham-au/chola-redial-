@@ -204,6 +204,14 @@ export interface DayCampaign extends Campaign {
   dropped: number;
 }
 
+export interface StrandedRun {
+  campaign_id: number;
+  name: string;
+  run_date: string;
+  kind: string;
+  slots: number;
+}
+
 export interface DayView {
   date: string;
   kind: string;
@@ -234,6 +242,9 @@ export interface DayView {
   stopped: (Campaign & { why: string })[];
   /** verify state -> count, straight off the dial log. */
   dial_log: Record<string, number>;
+  /** Plans from earlier days that were never approved. Those leads were never
+   *  called — nothing else in this console reports them. */
+  stranded: StrandedRun[];
 }
 
 export interface PrepareResult {
