@@ -1315,6 +1315,21 @@ export function mergeResults(parts: ApproveResult[], day: DayView): ApproveResul
   );
 }
 
+/** The row a campaign gets when the approve answered with none of its own.
+ *
+ *  `approve_day` loops the campaigns that are armed RIGHT NOW and `continue`s
+ *  past any requested id that is no longer one — disarmed by the 15:00
+ *  unattended pass, by a picker hide, or by a Formi pause picked up in
+ *  `_resync_status` between the queue being built and this entry being reached.
+ *  It answers 200 with `campaigns: []`, and `[].every(...)` is `true`: the
+ *  progress row went green, `mergeResults` added nothing, and the result read
+ *  "Every selected lead is on the clock" over ~250 leads nobody dialled.
+ *
+ *  A campaign that came back with no result did not succeed, so it gets a row
+ *  of its own, under its own name, in the one place the operator reads. */
+const noResult = (c: ReturnType<typeof dialQueue>[number]): ApproveResult['campaigns'][number] =>
+  ({ campaign_id: c.campaign_id, name: c.name, status: 'no_result' });
+
 /** Walk the queue, one request at a time, reporting each campaign as it goes.
  *
  *  The loop itself, lifted out of the click handler that used to hold it. A
@@ -1338,8 +1353,11 @@ export async function runQueue(
     on(c, 'running');
     try {
       const out = await api.approveDay(...c.args);
-      merged.push(out);
-      on(c, out.campaigns.every((r) => r.status === 'approved' && !r.failed) ? 'done' : 'failed');
+      // Never `out.campaigns` raw: an empty list is a campaign that was skipped,
+      // not a campaign that succeeded, and `every` on it says the opposite.
+      const rows = out.campaigns.length > 0 ? out.campaigns : [noResult(c)];
+      merged.push({ ...out, campaigns: rows });
+      on(c, rows.every((r) => r.status === 'approved' && !r.failed) ? 'done' : 'failed');
     } catch (e) {
       // One campaign failing must not end the day for the rest.
       on(c, 'failed', (e as Error).message);
@@ -1620,6 +1638,7 @@ const WHY: Record<string, string> = {
   already_committed: 'already dialled earlier today',
   already_paused: 'the run is paused — resume it to send the rest',
   nothing_to_dial: 'nothing left that fits before the window shuts',
+  no_result: 'it was no longer in the daily plan when the day was approved — nothing was dialled',
 };
 
 /** What actually happened, kept on screen instead of summed into a toast.
@@ -1739,7 +1758,11 @@ export function DialResult({
         {res.not_dialled > 0 && (
           <>{n(res.not_dialled)} did not fit before the window shut — back in the next plan</>
         )}
-        {notScheduled === 0 && 'Every selected lead is on the clock.'}
+        {/* Earned, not assumed. A campaign that was skipped, refused or never
+            started contributes nothing to `notScheduled` — the totals of a
+            campaign that produced no result are all zero — so the counts alone
+            cannot tell a clean day from a day that did nothing. */}
+        {notScheduled === 0 && problems.length === 0 && 'Every selected lead is on the clock.'}
         {res.dry_run && ' Nothing reached Formi: the server is in dry run.'}
       </p>
 

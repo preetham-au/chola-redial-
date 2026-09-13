@@ -1170,6 +1170,40 @@ ok(
      queue.length > 1 && sent.length === 1);
   retryLive();
 
+  // --- a campaign the approve answered nothing for did not dial ---------------
+  //
+  // `approve_day` loops the campaigns that are armed RIGHT NOW and `continue`s
+  // past any requested id that no longer is — so it answers 200 with
+  // `campaigns: []`, every count zero. `[].every(...)` is `true`: the progress
+  // row went green, the merge added nothing, and the result read "Every
+  // selected lead is on the clock" over ~250 leads nobody dialled. The stub
+  // below is that answer exactly, zeroes and all, so the only thing that can
+  // redden these three lines is the screen telling the truth about it.
+  (globalThis as { fetch?: unknown }).fetch = async () => ({
+    ok: true, status: 200,
+    json: async () => ({
+      date: '2026-09-13', kind: 'auto', wave: 'morning', dry_run: false,
+      buckets: 'all', approved: 0, posted: 0, failed: 0, not_dialled: 0, campaigns: [],
+    }),
+  });
+  retryLive();
+  const states: ProgressRow['state'][] = [];
+  const none = await runQueue(queue, (_c, s) => states.push(s), () => false);
+  ok('a campaign the approve answered nothing for is never reported as done',
+     states.length === queue.length * 2 && !states.includes('done'));
+  const merged = mergeResults(none, tamil);
+  ok('and it keeps a row of its own, under its own name, in the result the operator reads',
+     merged.campaigns.length === queue.length
+     && merged.campaigns.every((c) => c.status === 'no_result')
+     && merged.campaigns.map((c) => c.name).join() === queue.map((c) => c.name).join());
+  const nothing = renderToStaticMarkup(
+    <DialResult res={merged} args={approveArgs(A127, tamil, [])} onChange={() => {}} />,
+  );
+  ok('and a day where nothing went out never reads as one where everything did',
+     !has(nothing, 'Every selected lead is on the clock')
+     && has(nothing, queue[0].name) && has(nothing, 'no longer in the daily plan'));
+  retryLive();
+
   console.log('\nall checks passed');
 })();
 // A thrown ok() inside the async block surfaces as an unhandled rejection,
