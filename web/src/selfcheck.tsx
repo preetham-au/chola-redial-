@@ -1047,9 +1047,19 @@ ok(
 
   // The card itself: it is the one place an operator sees the verdict, and the
   // sentence under the bars is the only part of it that names a number.
-  const proof = (spread: DaySpread, dial_log: Record<string, number> = { dialled: 7 }) =>
+  // `dry_run` is explicit on every render below: the fixture ships `true`, and
+  // a card that only ever gets tested in dry run is exactly how the dry-run
+  // wording got missed in the first place.
+  const proof = (
+    spread: DaySpread,
+    dial_log: Record<string, number> = { dialled: 7 },
+    dry_run = false,
+  ) =>
     renderToStaticMarkup(
-      <Proof day={{ ...mockDay('2026-09-13', 'auto'), spread, dial_log }} onReload={() => {}} />,
+      <Proof
+        day={{ ...mockDay('2026-09-13', 'auto'), dry_run, spread, dial_log }}
+        onReload={() => {}}
+      />,
     );
   ok('a day with nothing on the clock shows no proof card at all, rather than an empty one',
      proof({ band: AM, hours: {} }) === '');
@@ -1072,6 +1082,26 @@ ok(
   // NOT one of them — reddening the whole day would say nothing.
   ok('and only the stray hours are painted red',
      (strayed.match(/var\(--bad\)/g) ?? []).length === 3);
+
+  // DRY_RUN. `_spread` counts `simulated` rows beside `posted` ones, so the
+  // card draws a full histogram out of calls that never left the building. The
+  // bars are still worth seeing — that IS the schedule — but the sentences over
+  // them are the ones an operator reads as "the day went out".
+  const rehearsed = proof({ band: AM, hours: { '9': 40, '13': 12 } }, { dialled: 7 }, true);
+  ok('a rehearsed wave never claims its calls are on the clock',
+     !has(rehearsed, 'on the clock') && has(rehearsed, '52 simulated, none dialled'));
+  ok('and says so in full, rather than leaving it to the eyebrow',
+     has(rehearsed, 'Nothing on this card was dialled'));
+  ok('and does not wear the green a dialled day earns',
+     has(kept, 'var(--ok)') && !has(rehearsed, 'var(--ok)'));
+  // The heading is the largest text on the card and the first thing read.
+  ok('and its heading is in the conditional too',
+     has(kept, 'Where the calls landed')
+     && has(rehearsed, 'Where the calls would have landed'));
+  const rehearsedStray = proof({ band: AM, hours: { '9': 40, '19': 12, '20': 3 } }, {}, true);
+  ok('a rehearsed wave that strayed is told where it WOULD have strayed, not where it landed',
+     has(rehearsedStray, '15 calls were scheduled outside the 09:00–13:30 band')
+     && !has(rehearsedStray, 'calls landed outside'));
 }
 
 // --- scope leak guard (async: exercises the api layer's offline fallback) ----

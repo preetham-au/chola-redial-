@@ -1326,6 +1326,12 @@ export function Proof({ day, onReload }: { day: DayView; onReload: () => void })
 
   const peak = Math.max(...hours.map(([, v]) => v));
   const outside = outsideBand(day.spread);
+  // The spread counts `simulated` rows beside `posted` ones, so under DRY_RUN
+  // these bars are drawn entirely from calls that never left the building. The
+  // shape is still worth showing — it is the schedule this wave WOULD have
+  // dialled — but every sentence over it has to stay in the conditional, and
+  // the bars cannot wear the same green a live day earns.
+  const live = !day.dry_run;
 
   const check = async () => {
     setBusy(true);
@@ -1342,8 +1348,9 @@ export function Proof({ day, onReload }: { day: DayView; onReload: () => void })
 
   return (
     <Card
-      title="Where the calls landed"
-      eyebrow={`${n(total)} on the clock · band ${day.spread.band.start}–${day.spread.band.end}`}
+      title={live ? 'Where the calls landed' : 'Where the calls would have landed'}
+      eyebrow={`${n(total)} ${live ? 'on the clock' : 'simulated, none dialled'}`
+        + ` · band ${day.spread.band.start}–${day.spread.band.end}`}
     >
       <div className="row" style={{ gap: 4, alignItems: 'flex-end', height: 64 }}>
         {hours.map(([h, v]) => (
@@ -1351,7 +1358,9 @@ export function Proof({ day, onReload }: { day: DayView; onReload: () => void })
             <div
               style={{
                 height: `${(v / peak) * 48}px`,
-                background: outside.some(([o]) => o === h) ? 'var(--bad)' : 'var(--ok)',
+                background: outside.some(([o]) => o === h)
+                  ? 'var(--bad)'
+                  : live ? 'var(--ok)' : 'var(--faint)',
                 borderRadius: 2,
               }}
             />
@@ -1362,9 +1371,20 @@ export function Proof({ day, onReload }: { day: DayView; onReload: () => void })
 
       {outside.length > 0 && (
         <p className="hero-sub" style={{ color: 'var(--bad)' }}>
-          {n(outside.reduce((s, [, v]) => s + v, 0))} calls landed outside the{' '}
-          {day.spread.band.start}–{day.spread.band.end} band.
+          {n(outside.reduce((s, [, v]) => s + v, 0))} calls {live ? 'landed' : 'were scheduled'}
+          {' '}outside the {day.spread.band.start}–{day.spread.band.end} band.
         </p>
+      )}
+
+      {!live && (
+        <div className="warnbox">
+          <AlertTriangle />
+          <span>
+            The server is in dry run. Nothing on this card was dialled — these are the calls this
+            wave <b>would</b> have placed. The warehouse has no interaction to read back, so the
+            counts below stay where they are however often you check.
+          </span>
+        </div>
       )}
 
       <div className="dialbar-keys">
