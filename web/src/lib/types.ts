@@ -274,6 +274,12 @@ export interface DayView {
   /** Plans from earlier days that were never approved. Those leads were never
    *  called — nothing else in this console reports them. */
   stranded: StrandedRun[];
+  /** How many distinct PEOPLE those runs hold. An unapproved plan is rebuilt for
+   *  the same leads the next morning, so summing the rows' `slots` multiplies one
+   *  backlog by the days it sat — 544 leads over a fortnight read as "7,616 calls
+   *  never dialled". Each row's `slots` is still true of that row; this is the
+   *  only number that is true of the backlog. */
+  stranded_leads: number;
 }
 
 export interface PrepareResult {

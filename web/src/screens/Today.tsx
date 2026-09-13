@@ -1166,16 +1166,21 @@ function PickCampaigns({
 
 /** Plans nobody ever approved. Left alone, this is silent: the run stays
  *  `planned` for ever and those leads are simply never called. */
-function Stranded({ day }: { day: DayView }) {
+export function Stranded({ day }: { day: DayView }) {
   if (day.stranded.length === 0) return null;
-  const calls = day.stranded.reduce((s, r) => s + r.slots, 0);
+  // NOT the sum of the rows' `slots`. An unapproved plan is built again for the
+  // same leads every morning it sits, so that sum multiplies one backlog by the
+  // days it waited — 544 people read as "7,616 calls never dialled", a number
+  // nobody could act on and nothing else in the console agreed with. The rows
+  // below still carry their own `slots`, which is true of each run.
+  const leads = day.stranded_leads;
   const campaigns = new Set(day.stranded.map((r) => r.campaign_id)).size;
   return (
     <div className="warnbox">
       <AlertTriangle />
       <span>
         <b>
-          {n(calls)} {calls === 1 ? 'call was' : 'calls were'} planned on {campaigns}{' '}
+          {n(leads)} {leads === 1 ? 'lead was' : 'leads were'} planned on {campaigns}{' '}
           {campaigns === 1 ? 'campaign' : 'campaigns'} and never dialled.
         </b>{' '}
         {day.stranded

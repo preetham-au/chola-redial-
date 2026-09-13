@@ -17,6 +17,7 @@ import {
   Headline,
   PanelHead,
   Proof,
+  Stranded,
   Today,
   approveArgs,
   approveModal,
@@ -846,6 +847,34 @@ ok(
   ok('and a day cut off part-way never reads as one where every lead is on the clock',
      has(clean, 'Every selected lead is on the clock')
      && !has(partial, 'Every selected lead is on the clock'));
+}
+
+// --- the stranded warning counts people, not slots ---------------------------
+//
+// An unapproved plan is built again for the same leads the next morning, so a
+// backlog that sat a fortnight has a run row per day it waited. Summing the
+// rows' `slots` multiplies the backlog by that wait: 544 people were reported
+// as "7,616 calls were planned and never dialled" — a number nothing else in
+// the console agreed with and nobody could act on. The rows below still carry
+// their own `slots`, which is true of each run; the headline is the distinct
+// lead count the server now sends.
+{
+  const base = mockDay('2026-09-13', 'auto');
+  const runs = Array.from({ length: 14 }, (_, i) => ({
+    run_id: 800 + i, campaign_id: 1, name: 'Backlog campaign',
+    run_date: `2026-08-${String(20 + i).padStart(2, '0')}`, kind: 'auto', slots: 544,
+  }));
+  const html = renderToStaticMarkup(
+    <Stranded day={{ ...base, stranded: runs, stranded_leads: 544 }} />,
+  );
+  ok('the stranded headline counts the people behind the backlog',
+     has(html, '544 leads were planned'));
+  ok('and never the same backlog once per day it sat unapproved',
+     !has(html, '7,616') && !has(html, '7616'));
+  ok('while each run row still reports its own slots, which is true of that run',
+     has(html, 'Backlog campaign · 2026-08-20 morning (544)'));
+  ok('a day with nothing stranded still shows no warning at all',
+     renderToStaticMarkup(<Stranded day={base} />) === '');
 }
 
 // --- the call log: proof, not paperwork -------------------------------------

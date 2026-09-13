@@ -167,6 +167,7 @@ export const mockDay = (date: string, kind: string, agent_id?: number): DayView 
     // Empty offline: a fixture must not show a warning about calls that were
     // never planned, let alone never dialled.
     stranded: [],
+    stranded_leads: 0,
   };
 };
 
