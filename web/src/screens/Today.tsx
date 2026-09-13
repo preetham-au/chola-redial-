@@ -121,7 +121,29 @@ export const recheckMessage = (out: PrepareResult, day: DayView): [Toast['kind']
     .map((c) => name(c.campaign_id));
   if (failed.length > 0)
     said.push(`Could not plan ${failed.join(', ')} — left out of this plan.`);
-  return [stopped.length + failed.length > 0 ? 'bad' : 'ok', said.join(' ')];
+  // `finished` is not an ordinary answer: `_prepare_one` reaches it through
+  // `_stop`, which is `UPDATE campaigns SET autopilot=0`. The campaign is
+  // DISARMED, for good and for every later wave, and nothing re-arms it but a
+  // person. That went out under the green tone, in a sentence that named
+  // nobody, so the campaign simply stopped appearing in tomorrow's plan.
+  const disarmed = out.campaigns
+    .filter((c) => c.status === 'finished')
+    .map((c) => name(c.campaign_id));
+  if (disarmed.length > 0)
+    said.push(`Autopilot switched off for ${disarmed.join(', ')} — no lead left to call.`
+      + ' Re-arm in Choose campaigns if that is wrong.');
+  // A re-check that came back with no plan at all is the one this button exists
+  // to catch, and it is exactly the one the tone used to call a success: every
+  // campaign answering `window_closed` leaves both counts at zero and every
+  // list above empty, so "Re-checked: 0 still ready across 0 campaigns" went out
+  // green next to an Approve that would now dial nobody.
+  const none = out.prepared === 0;
+  if (none)
+    said.push(out.campaigns.length === 0
+      ? 'No campaign was armed for this plan, so nothing was re-checked.'
+      : 'No campaign came back with a plan — there is nothing here to dial.');
+  const wrong = stopped.length + failed.length + disarmed.length > 0 || none;
+  return [wrong ? 'bad' : 'ok', said.join(' ')];
 };
 
 /** Exactly what `api.approveDay` takes, named so the approve and its Retry can

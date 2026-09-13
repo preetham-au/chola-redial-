@@ -1190,6 +1190,31 @@ ok(
      tone({}) === 'ok'
      && tone({ stopped_in_formi: [paused.id] }) === 'bad'
      && tone({ campaigns: [failed(broken.id, 'error')] }) === 'bad');
+
+  // `finished` is not an ordinary answer. `_prepare_one` reaches it through
+  // `_stop` — `UPDATE campaigns SET autopilot=0` — so the campaign is disarmed
+  // for good and for every later wave, and only a person re-arms it. That went
+  // out green, in a sentence naming nobody; the campaign just stopped appearing
+  // in tomorrow's plan and no screen ever said why.
+  const fin = { campaigns: [failed(broken.id, 'finished')], ready: 2, prepared: 1 };
+  ok('a campaign the re-check switched autopilot off for is named, not silently disarmed',
+     has(say(fin), `Autopilot switched off for ${broken.name}`) && tone(fin) === 'bad');
+  ok('and a re-check that disarmed nothing says nothing about autopilot',
+     !has(say({}), 'Autopilot switched off'));
+
+  // The whole reason the tone exists. Every campaign answering `window_closed`
+  // — the ordinary afternoon answer — leaves ready and prepared at zero with
+  // every list above empty, so the one reading that means NOTHING WILL DIAL was
+  // the one reading that came out green: "Re-checked: 0 still ready across 0
+  // campaigns", next to an Approve button that would now call nobody.
+  const shutout = { ready: 0, prepared: 0,
+                    campaigns: [failed(paused.id, 'window_closed'),
+                                failed(broken.id, 'window_closed')] };
+  ok('a re-check where no campaign came back with a plan is never toasted as success',
+     tone(shutout) === 'bad' && has(say(shutout), 'nothing here to dial'));
+  ok('and an empty scope says it was empty rather than reporting a clean zero',
+     tone({ ready: 0, prepared: 0 }) === 'bad'
+     && has(say({ ready: 0, prepared: 0 }), 'No campaign was armed'));
   retryLive();
 
   // --- and the day actually goes out one campaign at a time -------------------
