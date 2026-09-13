@@ -14,6 +14,7 @@ import { Row as LogRow } from './screens/CallLog';
 import { selectionSplit } from './screens/CampaignVisibility';
 import { ApiError, api, isOffline, retryLive } from './lib/api';
 import {
+  mockAgentPause,
   mockBuckets,
   mockCampaigns,
   mockConfig,
@@ -264,6 +265,18 @@ ok(
      has(head(day({ status: 'no_campaigns' })), 'Choose campaigns'));
   ok('and says picking campaigns places no call',
      has(head(day({ status: 'no_campaigns' })), 'places no call'));
+
+  // Both of those hand Headline the status by hand; this pins the fixture that
+  // produces it. An unscoped `mockDay` always has campaigns, so nothing else
+  // here evaluates the empty-scope branch -- pausing an agent empties its
+  // roster and is the one way offline to reach it. Restored campaign by
+  // campaign: one of 125's was already paused, so a blanket un-pause would
+  // leave the fixture disagreeing with itself for every check after this one.
+  const paused125 = mockCampaigns.filter((c) => c.agent_id === 125).map((c) => c.paused);
+  mockAgentPause(125, true);
+  ok('an agent with every campaign paused is a day with no campaigns, offline too',
+     mockDay('2026-09-09', 'auto', 125).status === 'no_campaigns');
+  mockCampaigns.filter((c) => c.agent_id === 125).forEach((c, i) => { c.paused = paused125[i]; });
 
   // The picker's one wire-bearing decision. Everything it sends changes who is
   // dialled once the day is approved, so it sends the difference and nothing else.

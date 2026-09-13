@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import unicodedata
 from collections import Counter
 from datetime import date, datetime, time, timedelta
 from typing import Any, Optional, Sequence
@@ -216,11 +217,25 @@ def _agent_languages() -> dict[int, str]:
         # the comma splits entries, so a semicolon -- the likeliest hand-edit slip
         # in this variable -- swallows the rest of the line: `125:Hindi;127:Tamil`
         # booted clean as `{125: 'Hindi;127:Tamil'}`, labelling Hindi's agent with
-        # the whole string and leaving 127 unlabelled, silently. Letters, spaces
-        # and hyphens carry every language name a two-agent console can need
-        # ("Tamil", "Brazilian Portuguese", "Serbo-Croatian"); a separator or a
+        # the whole string and leaving 127 unlabelled, silently. A separator or a
         # digit inside a label means the operator typed the list wrong.
-        if not label.replace(" ", "").replace("-", "").isalpha():
+        #
+        # "Letters" means letters in ANY script, combining marks included.
+        # `str.isalpha()` is False for every Indic vowel sign and virama (Mn/Mc),
+        # so this refused `125:हिन्दी,127:தமிழ்` -- the exact two cohorts this
+        # console dials -- at boot, on a legal value, and blamed a missing comma
+        # that was never missing. It was never a deliberate Latin-only rule:
+        # `Français`, `Русский`, `العربية` and `日本語` all booted, because those
+        # names happen to carry no marks. A guard that stops a live dialler on a
+        # legal value is worse than the typo it prevents, the same reasoning as
+        # api.day's WAVE_BOUNDARY and its unpadded times.
+        #
+        # Spaces, hyphens and the apostrophe of `N'Ko` are stripped before the
+        # check rather than allowed inside it, so a label that is nothing but
+        # punctuation is still refused along with the empty one.
+        bare = label.replace(" ", "").replace("-", "").replace("'", "")
+        if not (bare and all(c.isalpha() or unicodedata.category(c) in ("Mn", "Mc")
+                             for c in bare)):
             raise ValueError(f"AGENT_LANGUAGES gives agent {agent_id} the label "
                              f"{label!r}, which is not a language name -- entries are "
                              f"separated by COMMAS, as `125:Hindi,127:Tamil`")

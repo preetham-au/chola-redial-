@@ -928,6 +928,26 @@ def test_a_label_that_is_not_a_language_is_refused(client, monkeypatch, value, l
         f"the refusal must name the agent and the offending label: {raised.value}"
 
 
+@pytest.mark.parametrize("label", [
+    # The two this console actually dials. Every Indic vowel sign and virama is
+    # a combining mark, and `str.isalpha()` is False for those, so the label
+    # guard refused both at boot on a value that is exactly right.
+    "हिन्दी", "தமிழ்", "ਪੰਜਾਬੀ", "తెలుగు",
+    # These booted even then -- they carry no combining marks. The guard was
+    # never a Latin-only rule, which is why refusing the four above was a bug.
+    "日本語", "Français", "Русский", "العربية",
+    # Punctuation that belongs to a language name, not a separator.
+    "N'Ko", "Brazilian Portuguese", "Serbo-Croatian",
+])
+def test_a_language_name_in_any_script_is_accepted(client, monkeypatch, label):
+    import api.routes_core as core
+
+    monkeypatch.setenv("AGENT_LANGUAGES", f"125:{label}")
+    labels = {a["agent_id"]: a["language"] for a in core.list_agents()}
+
+    assert labels.get(125) == label, labels
+
+
 def test_a_padded_duplicate_agent_id_is_still_a_duplicate(client, monkeypatch):
     """`0125` and `125` are the same agent, and the label guard must not mask it."""
     import api.routes_core as core
