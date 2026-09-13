@@ -1183,7 +1183,14 @@ def test_last_dialled_is_the_most_recent_day_that_posted(client):
             "SELECT id FROM campaigns WHERE id NOT IN "
             "(SELECT campaign_id FROM runs) ORDER BY id LIMIT 1").fetchone()
         if free is None:
-            pytest.skip("every campaign already carries a run; nothing to own a history")
+            # fail, not skip. This precondition can only ever VANISH as the suite
+            # grows -- one new test seeding a run against the last free campaign
+            # silently retires this one while the suite still reads green, and
+            # the only trace is the skip count going 1 -> 2. Red says out loud
+            # that the shared database ran out of free campaigns and this
+            # assertion stopped running.
+            pytest.fail("every campaign already carries a run; seed a fresh campaign "
+                        "here rather than letting this test quietly stop running")
         campaign_id = int(free["id"])
         conn.execute("UPDATE campaigns SET autopilot=1, enabled=1, paused=0, hidden=0 "
                      "WHERE id=?", (campaign_id,))

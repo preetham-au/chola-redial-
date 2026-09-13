@@ -30,7 +30,9 @@ import { bandRange, bucketColor, friendlyBucket, n } from '../lib/domain';
 import { navigate, useAsync, useStore } from '../lib/store';
 import { Card, Empty, Fact, Modal, TypeToConfirm } from '../components/ui';
 import { DayProgress, type ProgressRow } from '../components/DayProgress';
-import type { Agent, ApproveResult, Campaign, DayBucket, DayCampaign, DayView } from '../lib/types';
+import type {
+  Agent, ApproveResult, Campaign, DayBucket, DayCampaign, DayView, PrepareResult,
+} from '../lib/types';
 
 const WAVES = [
   { kind: 'auto', label: 'Morning' },
@@ -74,6 +76,36 @@ export const panelDay = (agent: Agent | null, date: string, kind: string) =>
  *  `day.agent_id`, which is the server's echo and not the panel's identity. */
 export const panelPrepare = (agent: Agent | null, date: string, kind: string, resync = false) =>
   api.prepareDay(date, kind, resync, agent?.agent_id);
+
+/** What the re-check has to say for itself.
+ *
+ *  A ready count falling from 4 to 2 is not an explanation. The two facts that
+ *  explain it are the two only a `resync` pass can learn, and both used to be
+ *  dropped on the floor: `stopped_in_formi` — campaigns this pass found paused
+ *  in Formi and stopped, which is the 11:00 pause still sitting in the 15:00
+ *  plan the button exists to catch — and any campaign answering `resync_failed`,
+ *  whose warehouse read failed, so it is now in NO plan at all rather than
+ *  planned off a stale copy.
+ *
+ *  Ids are named from the panel's own `day`, which already holds every campaign
+ *  on screen. `#id` for one it does not, rather than dropping it: a campaign
+ *  stopped outside this panel's view is still a campaign that was stopped.
+ *
+ *  Pure and exported because the handler that toasts it is an async click the
+ *  static renderer never reaches — written inline, the sentence naming the
+ *  stopped campaigns could be deleted with the whole gate still green. */
+export const recheckMessage = (out: PrepareResult, day: DayView) => {
+  const said = [`Re-checked: ${n(out.ready)} still ready across ${out.prepared} campaigns.`];
+  const stopped = (out.stopped_in_formi ?? [])
+    .map((id) => day.campaigns.find((c) => c.id === id)?.name ?? `#${id}`);
+  if (stopped.length > 0) said.push(`Stopped in Formi since: ${stopped.join(', ')}.`);
+  const failed = out.campaigns
+    .filter((c) => c.status === 'resync_failed')
+    .map((c) => c.name ?? `#${c.campaign_id}`);
+  if (failed.length > 0)
+    said.push(`Could not re-read Formi for ${failed.join(', ')} — left out of this plan.`);
+  return said.join(' ');
+};
 
 /** Exactly what `api.approveDay` takes, named so the approve and its Retry can
  *  pass one value between them instead of five. */
@@ -1273,7 +1305,7 @@ export function ApproveDay({
     setRechecking(true);
     try {
       const out = await panelPrepare(agent, day.date, day.kind, true);
-      toast('ok', `Re-checked: ${n(out.ready)} still ready across ${out.prepared} campaigns.`);
+      toast('ok', recheckMessage(out, day));
       onDone();
       onClose();
     } catch (e) {

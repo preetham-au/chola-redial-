@@ -27,6 +27,7 @@ import {
   panelPrepare,
   panelsFor,
   planAge,
+  recheckMessage,
   retryArgs,
   runQueue,
   scopeMismatch,
@@ -58,7 +59,7 @@ import {
   passState,
 } from './lib/domain';
 import type {
-  Agent, ApproveResult, Campaign, Config, DayCampaign, TestCallResult,
+  Agent, ApproveResult, Campaign, Config, DayCampaign, PrepareResult, TestCallResult,
 } from './lib/types';
 
 const ROWS = configurableBuckets(mockConfig.frequency_table);
@@ -444,10 +445,29 @@ ok(
   const age = () =>
     planAge([{ plan_built_at: '2026-09-13T09:00:00' }] as DayCampaign[],
             Date.parse('2026-09-13T03:30:00Z') + 45 * 60000).minutes;
-  ok('the plan’s age is read in the IST the server wrote it in', age() === 45);
+  // Named for what it proves on ANY host, not for the offset. This dev box is
+  // Asia/Calcutta, where the naive parse and the pinned one are the same instant
+  // — so it says nothing about the offset (dropping `+05:30` leaves it green)
+  // and everything about the arithmetic: /60000 mistyped as /6000 reddens here.
+  // The offset claim belongs to the check below, which is its only guard.
+  ok('a plan built 45 minutes ago is 45 minutes old', age() === 45);
   ok('and is the same age from a browser that is not on IST, either side of it',
      under('UTC', age) === 45 && under('Pacific/Auckland', age) === 45
      && under('America/New_York', age) === 45);
+  // That check has teeth only while node honours a mid-process `process.env.TZ`
+  // write. If it ever stops, `under` silently becomes a no-op, every zone reads
+  // as IST, the line above passes with the offset deleted, and the `+05:30` fix
+  // is unguarded with the whole gate green — verified: neuter `under` and
+  // dropping the offset passes everything. So prove the mechanism bites, by
+  // asserting the UNPINNED parse really is wrong under UTC: a naive `new Date`
+  // reads 09:00 IST as 09:00Z, five and a half hours late, making the plan
+  // 330 minutes YOUNGER than its true 45.
+  const bare = (tz: string) => under(tz, () => Math.round(
+    (Date.parse('2026-09-13T03:30:00Z') + 45 * 60000
+     - new Date('2026-09-13T09:00:00').getTime()) / 60000));
+  ok('and the forced timezone really bites — an unpinned parse IS wrong under UTC, '
+     + 'so a TZ write node stopped honouring goes red here rather than quiet',
+     bare('UTC') === 45 - 330 && bare('Asia/Calcutta') === 45);
 
   const modal = (over: Partial<typeof base>) =>
     renderToStaticMarkup(
@@ -966,8 +986,17 @@ ok(
   ok('a panel reads its own agent’s day, scoped from the panel and nothing else',
      sent[0].includes('agent_id=127'));
   await panelPrepare(A127, '2026-09-13', 'auto');
-  ok('and builds the plan for that same agent alone — never for both languages',
-     sent[1].includes('"agent_id":127'));
+  // `resync` false is half of what this line asserts. The panel's ordinary
+  // Prepare must NOT re-read Formi: `resync` on runs `_resync_status`, which
+  // pauses campaigns and re-pulls every campaign's leads out of Metabase, and a
+  // warehouse that hiccups answers `resync_failed` — the campaign is left
+  // unplanned. That is the right price for the re-check, which exists because
+  // the plan is hours old, and the wrong one for a button pressed every morning
+  // against a copy the hourly sync already keeps fresh. Flipping the default
+  // used to pass this whole gate.
+  ok('and builds the plan for that same agent alone — never for both languages, '
+     + 'and does NOT re-read Formi doing it',
+     sent[1].includes('"agent_id":127') && sent[1].includes('"resync":false'));
   await panelDay(null, '2026-09-13', 'auto');
   ok('an unscoped panel still reads the whole day, byte for byte as before scoping',
      !sent[2].includes('agent_id'));
@@ -983,6 +1012,34 @@ ok(
   await panelPrepare(A127, '2026-09-13', 'auto', true);
   ok('the re-check re-reads Formi for the panel’s own agent alone, never the roster',
      sent[4].includes('"agent_id":127') && sent[4].includes('"resync":true'));
+
+  // …and it has to SAY what the re-read found. Two facts come back that no other
+  // call can learn, and the operator cannot see either one: the ready count
+  // dropping from 4 to 2 as the modal closes explains nothing. `stopped_in_formi`
+  // is the campaign Formi paused at 11:00 that was still in the 15:00 plan — the
+  // whole reason this button exists — and `resync_failed` is a campaign whose
+  // warehouse read failed, which is now in NO plan rather than planned off a
+  // stale copy. Pinned here because the toast fires from an async click handler
+  // the static renderer never reaches; the sentence is a pure function so this
+  // is the one door into it.
+  const rd = mockDay('2026-09-13', 'auto', 127);
+  const [paused, broken] = rd.campaigns;
+  const prep = (over: Partial<PrepareResult>): PrepareResult => ({
+    date: '2026-09-13', kind: 'auto', wave: 'Morning', ready: 2, prepared: 2,
+    campaigns: [], ...over,
+  });
+  ok('the re-check names the campaign Formi had paused since the plan was built, '
+     + 'rather than only letting the ready count drop',
+     has(recheckMessage(prep({ stopped_in_formi: [paused.id] }), rd), paused.name)
+     && !has(recheckMessage(prep({}), rd), 'Stopped in Formi'));
+  ok('and names one the warehouse would not answer for, which is now in no plan at all',
+     has(recheckMessage(prep({ campaigns: [
+       { campaign_id: broken.id, name: broken.name, status: 'resync_failed' },
+       { campaign_id: paused.id, name: paused.name, status: 'prepared' },
+     ] }), rd), broken.name)
+     && !has(recheckMessage(prep({ campaigns: [
+       { campaign_id: paused.id, name: paused.name, status: 'prepared' },
+     ] }), rd), 'Could not re-read'));
   retryLive();
 
   // --- and the day actually goes out one campaign at a time -------------------

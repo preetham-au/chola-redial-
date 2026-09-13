@@ -276,11 +276,19 @@ export interface PrepareResult {
   campaigns: Array<{
     campaign_id: number;
     name?: string;
+    /** `prepared` | `not_in_daily_plan` | `finished` | `resync_failed`. The last
+     *  one is the only failure: the warehouse could not be read, so the campaign
+     *  was left OUT of this plan rather than planned off a stale copy. */
     status: string;
     detail?: string;
     ready?: number;
     run_id?: number;
   }>;
+  /** Campaign ids this pass found paused in Formi and stopped here — the one
+   *  fact only a `resync` prepare can learn, and the reason "Re-check now"
+   *  exists. Absent unless the pass re-read Formi (`api/day.py`'s `prepare_day`
+   *  always sends it; a backend too old not to). */
+  stopped_in_formi?: number[];
 }
 
 export interface ApproveResult {
