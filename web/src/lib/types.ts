@@ -254,8 +254,11 @@ export interface DayView {
   kind: string;
   wave: string;
   /** What this answer is narrowed to. Null when the day is not scoped to one
-   *  agent, in which case every list here spans every armed campaign. */
-  agent_id: number | null;
+   *  agent, in which case every list here spans every armed campaign. Absent
+   *  from a server that predates per-agent scoping — which cannot narrow, so an
+   *  absent field and a null one say the same thing and must be read the same
+   *  way. `scopeMismatch` is the only reader; see the note there. */
+  agent_id?: number | null;
   /** Server clock, IST HH:MM. */
   now: string;
   dry_run: boolean;

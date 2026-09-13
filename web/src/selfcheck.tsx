@@ -760,6 +760,21 @@ ok(
   ok('and so is an unscoped panel reading an unscoped day',
      scopeMismatch(approveArgs(null, wholeDay, []), wholeDay) === null);
 
+  // A server that predates per-agent scoping omits the echo entirely. Compared
+  // un-normalised, `null === undefined` is false and the guard refuses EVERY
+  // panel for ever — the unscoped one included, which is the one state where
+  // there is nothing to disagree about — while telling the operator to reload a
+  // day that comes back identical. A safety check that fires in a state it was
+  // never meant to judge stops the phones as surely as a broken dial.
+  const silent = { ...wholeDay, agent_id: undefined };
+  ok('an unscoped panel still dials when the server never said what it narrowed to',
+     scopeMismatch(approveArgs(null, silent, []), silent) === null);
+  // The other half: absent is not permission. That plan really does span the
+  // roster, so a one-agent button over it is still refused.
+  const silentScoped = scopeMismatch(approveArgs(labelled(125, 'Hindi'), silent, []), silent);
+  ok('but a one-agent button over a plan the server never narrowed is still refused',
+     silentScoped !== null && has(silentScoped, 'plan for every agent'));
+
   const dialsWider = scopeMismatch(approveArgs(null, hindiDay, []), hindiDay);
   ok('one agent’s plan under a whole-roster dial is refused, not sent',
      dialsWider !== null && has(dialsWider, 'plan for agent 125') &&

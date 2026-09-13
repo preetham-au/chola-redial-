@@ -234,9 +234,17 @@ export const dialQueue = (args: ApproveArgs, day: DayView) =>
  *  do is decline a dial, which no phone ever rings for. */
 export const scopeMismatch = (args: ApproveArgs, day: DayView): string | null => {
   const who = (id: number | null | undefined) => (id == null ? 'every agent' : `agent ${id}`);
-  return (args[4] ?? null) === day.agent_id
+  // Both sides through `?? null`, or the two spellings of "no agent" stop being
+  // equal: a server that predates this branch omits the field, `null ===
+  // undefined` is false, and EVERY panel — unscoped ones included — refuses for
+  // ever, under advice (reload the day) that brings back the same answer. An
+  // absent echo means a server that cannot narrow, which is the same fact as a
+  // plan narrowed to nobody; a scoped panel over it is still refused, and
+  // rightly, because that plan really does span the whole roster.
+  const echo = day.agent_id ?? null;
+  return (args[4] ?? null) === echo
     ? null
-    : `This panel is showing the plan for ${who(day.agent_id)}, but approving it would dial ` +
+    : `This panel is showing the plan for ${who(echo)}, but approving it would dial ` +
       `${who(args[4])}. Nothing will be dialled until the two agree — reload the day.`;
 };
 
