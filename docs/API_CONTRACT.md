@@ -93,9 +93,12 @@ enforced server-side.
   "lead_name": "…", "disposition": "did_not_pick", "disposition_class": "dnp",
   "dte": 5, "bucket": "F5", "bucket_label": "Critical window", "priority": 2,
   "slot_no": 1, "scheduled_time": "2026-08-28T09:34:00",
-  // planned | simulated | posted | failed | skipped
+  // planned | simulated | posted | failed | skipped | expired
   // expired = its slot fell inside Formi's 5-minute floor by the time the day was
   // approved, so it was retired instead of posted. Not an error, and not a call.
+  // skipped  = its time sat outside the wave the run belongs to by the time the
+  // run was dialled (a hand-edited time can leave the band), so the dial path
+  // left it alone rather than sending an 18:45 call from a morning run.
   "status": "planned",
   "http_status": null, "response": null }
 
@@ -206,8 +209,16 @@ One page for the whole day across every campaign in the plan, and one approval.
 | `POST` | `/api/day/approve` | `{date?, kind?, buckets?[], campaign_ids?[], agent_id?}` → **dials.** Empty `buckets` means every bucket; empty `campaign_ids` means every campaign with a plan waiting. |
 
 `status` is one of `no_campaigns` · `not_prepared` · `awaiting_approval` ·
-`approved`, so the screen has one thing to switch on rather than four counters to
-interpret.
+`nothing_to_dial` · `approved`, so the screen has one thing to switch on rather
+than four counters to interpret.
+
+`nothing_to_dial` is a wave that HAS been planned and holds nothing ready — every
+run `planned`, every one of them empty, which is what an afternoon looks like
+after a morning that booked every lead. It used to be reported as `approved`,
+which said somebody had dialled it and hid both Build and Approve; the leads a
+later re-sync pulls in then have no way onto the clock. Offer Build (re-prepare,
+usually with `resync`) on it. Same word `_approve_one` uses for one campaign in
+the same state.
 
 **`agent_id` narrows the day to one agent — one language.** Omitted, every
 endpoint here answers for every armed campaign, exactly as it did before scoping
@@ -285,6 +296,12 @@ nothing to list anywhere. An agent with nothing armed answers `200` with
   // morning's queued plan as abandoned.
   "stranded": [ { "campaign_id": 1650, "name": "…", "run_date": "2026-09-12",
                   "kind": "auto", "slots": 214 } ],
+  // How many distinct LEADS those runs hold, across all of them. Show this, not
+  // the sum of `slots`: an unapproved plan is rebuilt for the same leads the
+  // next morning, so summing the rows multiplies one backlog by the days it sat
+  // — 544 leads over a fortnight read as "7,616 calls never dialled". Each row
+  // keeps its own `slots`, which is true of that run.
+  "stranded_leads": 544,
   "dial_log": { "dialled": 88, "queued": 12, "missing": 1 },
   // WHICH HOURS the calls actually landed in, against the band they were
   // approved against. The honest answer to "is it scheduling properly": on
@@ -292,7 +309,8 @@ nothing to list anywhere. An agent with nothing armed answers `200` with
   // `auto_pm`'s across 13:00-20:00 — the same evening twice, under two names —
   // and no screen said so. Keys are the hour with no leading zero ("9".."19");
   // only `posted` and `simulated` slots are counted, since a `planned` one has
-  // not been scheduled anywhere yet and an `expired` one never will be. Scoped
+  // not been scheduled anywhere yet and a `failed`, `expired` or `skipped` one
+  // never was — counting those would put an hour on the chart nobody dialled. Scoped
   // with the rest of the page when `agent_id` is supplied.
   "spread": { "band": { "start": "09:00", "end": "13:30" },
               "hours": { "9": 120, "10": 240, "13": 8 } } }
@@ -309,6 +327,14 @@ from there to the campaign's own close — clipped, never widened, so a campaign
 that shuts at 13:00 has no afternoon at all and says so. Without a band the wave
 name meant nothing on the clock: on 12 Sep 2026 the `auto` wave's calls landed
 between 12:00 and 20:00 and `auto_pm`'s between 13:00 and 20:00.
+
+**A dial window is half-open, and `WAVE_BOUNDARY` itself belongs to the
+afternoon.** `end` is the minute a window SHUTS on; no call is placed there. Read
+inclusively, the minute the two bands meet belonged to both of them, so a
+campaign capped at ten calls a minute put twenty on 13:30 the moment it ran both
+waves — with neither run over its own ceiling. It also makes the capacity
+arithmetic true: `end - start` minutes are dialable, which is what
+`capacity_before_close` has always counted.
 
 **Approving late does not dial into the night.** `approve` RE-PLANS each campaign
 from the current minute with the buckets the operator ticked, then commits it, so
@@ -375,7 +401,7 @@ moment it is sent — never from an inference afterwards. Rows are pruned after
 ### Planning & review
 | Method | Path | Notes |
 |---|---|---|
-| `POST` | `/api/campaigns/{id}/plan` | body `{ "date": "YYYY-MM-DD" }` (default today). Runs the engine, writes a run + items with status `planned`. **Never dials.** Idempotent per (campaign, date, kind) — re-planning replaces the existing `planned` run; refuses if already `committed`. |
+| `POST` | `/api/campaigns/{id}/plan` | body `{ "date": "YYYY-MM-DD", "buckets"?[], "start"?, "end"? }` (default today, the campaign's own window). Runs the engine, writes a run + items with status `planned`. **Never dials.** Idempotent per (campaign, date, kind) — re-planning replaces the existing `planned` run; refuses if already `committed`. |
 | `GET` | `/api/campaigns/{id}/buckets?date=` | the bucket × disposition matrix — see below |
 | `GET` | `/api/runs?campaign_id=&limit=` | history |
 | `GET` | `/api/runs/{id}` | run + counts |
@@ -385,6 +411,26 @@ moment it is sent — never from an inference afterwards. Rows are pruned after
 | `POST` | `/api/runs/{id}/resume` | puts a `paused` run's remainder back on Formi's clock, edits included. 409 if not `paused`, or if the campaign is paused. **Dials.** |
 | `POST` | `/api/runs/{id}/retry` | sends the slots Formi refused a second time. 409 if the run is not `committed`, if the campaign is paused, or if nothing in the run is `failed`. **Dials.** |
 | `DELETE` | `/api/runs/{id}` | discard a plan. 409 for anything not `planned` — a committed run is dial history and is kept. |
+
+**A per-campaign plan files itself under the wave it dials in, and is banded to
+it.** `POST /api/campaigns/{id}/plan` does not choose a `kind`; the kind is the
+wave that owns the first minute the plan can dial — the 5-minute floor today, the
+window's own opening on any other date — and the window is then clipped to that
+wave's band, exactly as `POST /api/day/prepare` does it. The response's `kind`
+says which. Both halves matter together: `_write_run` replaces the `planned` run
+for the KIND it is given, so a plan filed as `auto` with an all-day window did
+not merely mislabel itself — it deleted the day screen's banded morning plan and
+put 19:5x calls there under the morning's name. A `manual` run has no band and
+keeps the window it was scheduled with.
+
+**The dial path is the last gate: a slot outside its run's wave is not sent.**
+`approve`, `resume` and `retry` all commit through the same code, and a slot can
+leave the band after the plan was written — `PATCH /api/runs/{id}/items/{item}`
+validates a hand-edited time against the campaign's own window, which is wider
+than the band by construction. Those slots are marked `skipped`, counted in
+`dropped`, and reported as `out_of_band` in the response; the rest of the wave
+goes out. If a run has nothing BUT out-of-band slots left it is a **409** asking
+for a re-plan, rather than a silent no-op.
 
 `retry` is an approve over a smaller set, not a second dial path: it puts the
 `failed` items back to `planned` and calls the same commit every other dial goes
@@ -486,10 +532,17 @@ applied when 12 were.
 
 ### Agents
 
-Campaigns belong to an `agent_id` and the console is always scoped to one agent.
-Two agents are in use: **125** and **127**. Mixing their campaigns in one view is
-how you dial a Hindi script at a Tamil cohort, so the agent is a first-class
-selector, not a filter chip.
+Campaigns belong to an `agent_id`, and every campaign shown is shown under its
+own agent. Two agents are in use: **125** and **127**. Mixing their campaigns in
+one view is how you dial a Hindi script at a Tamil cohort, so the agent is a
+first-class selector, not a filter chip.
+
+That is not the same as the console only ever seeing one agent at a time. Every
+endpoint here takes `agent_id` as an **optional** narrowing: omitted, it answers
+for every armed campaign, which is what an unscoped console has always dialled
+(see `GET /api/day` above). The day screen renders one panel per agent, each
+fetched scoped, so nothing is mixed — but the page as a whole covers both, and a
+client that assumed a single global agent would have to hide half the day.
 
 `language` is the label for that voice, and it comes from the **`AGENT_LANGUAGES`
 env var** (`AGENT_LANGUAGES=125:Hindi,127:Tamil`), never from a constant in the

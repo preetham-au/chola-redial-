@@ -523,8 +523,11 @@ def _spread(conn: sqlite3.Connection, runs: dict[int, sqlite3.Row],
     operator approved makes a wave that dialled outside its half of the day
     visible at a glance instead of needing a database query.
 
-    Only `posted` and `simulated` items count: a `planned` slot has not been
-    scheduled anywhere yet, and an `expired` one never will be.
+    Only `posted` and `simulated` items count -- the two statuses that mean a
+    call really went onto Formi's clock (or would have, outside DRY_RUN). Every
+    other status is left out, and for the same reason: a `planned` slot has not
+    been scheduled anywhere yet, and `failed`, `expired` and `skipped` ones never
+    were. Counting any of them would put an hour on this chart that nobody dialled.
 
     `runs` arrives already narrowed to the scope of the page (`_plan_rows` over
     the armed campaigns, get_day), so there is no agent filter here -- a second
