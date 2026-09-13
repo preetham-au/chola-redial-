@@ -55,8 +55,15 @@ def restore_campaigns():
         conn.commit()
 
 
-def _seed_run(campaign_id: int, run_date: str, kind: str, status: str, slots: int) -> int:
-    """A run with `slots` planned items, exactly as _write_run would leave it."""
+def _seed_run(campaign_id: int, run_date: str, kind: str, status: str, slots: int,
+              leads: list[str] | None = None) -> int:
+    """A run with `slots` planned items, exactly as _write_run would leave it.
+
+    `leads` names the lead uuids to plan, for a test that needs two runs to hold
+    the SAME people -- the default keys them to the run id, which no two runs can
+    share, and a re-planned backlog is the same leads on a later day.
+    """
+    assert leads is None or len(leads) == slots, "one uuid per slot"
     with session() as conn:
         cur = conn.execute(
             "INSERT INTO runs (campaign_id, run_date, kind, status, config_version, "
@@ -68,7 +75,7 @@ def _seed_run(campaign_id: int, run_date: str, kind: str, status: str, slots: in
             "INSERT INTO plan_items (run_id, lead_uuid, policy_no, phone, disposition, "
             "disposition_class, dte, bucket, bucket_label, priority, slot_no, "
             "scheduled_time, status) VALUES (?,?,?,?,'','',0,'M0','M0',0,1,?,'planned')",
-            [(run_id, f"lead-{run_id}-{i}", f"P{run_id}{i}", "9" * 10,
+            [(run_id, leads[i] if leads else f"lead-{run_id}-{i}", f"P{run_id}{i}", "9" * 10,
               f"{run_date}T10:0{i % 10}:00") for i in range(slots)])
         conn.commit()
     return run_id
@@ -247,6 +254,35 @@ def test_stranded_still_looks_back_when_a_far_future_day_is_requested(client):
     assert any(s["run_date"] == yesterday for s in body["stranded"]
                if s["campaign_id"] == campaign_id), \
         "yesterday's undialled plan is stranded whatever date the screen asks for"
+
+
+def test_stranded_counts_a_lead_once_however_many_days_it_sat(client):
+    """544 people never called, not 7,616 calls.
+
+    An unapproved plan is rebuilt for the same leads the next morning, and the
+    one after that, so summing `slots` across the stranded runs multiplied one
+    backlog by the number of days it sat -- 544 leads over a fortnight rendered
+    as "7,616 calls never dialled". The number the operator has to act on is how
+    many PEOPLE were not called.
+    """
+    campaign_id = _arm()[0]
+    day = now_ist().date()
+    leads = ["stuck-a", "stuck-b"]
+    # Read before seeding: `stranded_leads` is the page's total and other armed
+    # campaigns carry their own backlog, so the assertion is on the delta. `_arm`
+    # goes first for the same reason -- it changes the roster that total covers.
+    before = client.get("/api/day").json()
+    for back in (1, 2, 3):
+        _seed_run(campaign_id, (day - timedelta(days=back)).isoformat(),
+                  "auto", "planned", len(leads), leads=leads)
+
+    body = client.get("/api/day").json()
+
+    mine = [s for s in body["stranded"] if s["campaign_id"] == campaign_id]
+    assert sum(s["slots"] for s in mine) == 6, \
+        "each run still reports the slots it holds; only the total is de-duplicated"
+    assert body["stranded_leads"] - before["stranded_leads"] == 2, \
+        "the same two leads on three days are two people, not six calls"
 
 
 # ---------------------------------------------------------------------------

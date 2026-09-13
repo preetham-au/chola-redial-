@@ -406,14 +406,21 @@ def _dialled_today(conn: sqlite3.Connection, day: date,
 
 
 def _stranded(conn: sqlite3.Connection, day: date,
-              agent_id: Optional[int] = None) -> list[dict[str, Any]]:
-    """Runs prepared on an EARLIER day and never dialled.
+              agent_id: Optional[int] = None) -> tuple[list[dict[str, Any]], int]:
+    """Runs prepared on an EARLIER day and never dialled, and how many leads that is.
 
     A run stays `planned` until somebody approves it. On 12 Sep 2026 eight
     campaigns holding 491 slots sat like that until the day ended, and no screen
     in this console said so -- the day view only ever looked at the date it was
     asked about. Those leads were not dropped, re-queued or reported; they simply
     did not get called.
+
+    The second return value counts PEOPLE, not slots. An unapproved plan is built
+    again for the same leads the next morning, so summing `slots` over the runs
+    multiplies one backlog by the days it sat: 544 leads over a fortnight read as
+    "7,616 calls never dialled". The rows keep their own `slots` -- that is what
+    each run holds, and it is true per row -- but the headline is the distinct
+    count, because 544 people is the thing an operator can act on.
 
     Bounded to the last STRANDED_DAYS days.
     """
@@ -435,14 +442,20 @@ def _stranded(conn: sqlite3.Connection, day: date,
     # first of the four left the rest to SQLite's search across the join.
     where, params = _armed(agent_id)
     rows = conn.execute(
-        f"SELECT r.campaign_id, c.name, r.run_date, r.kind, r.slots "
+        f"SELECT r.id, r.campaign_id, c.name, r.run_date, r.kind, r.slots "
         f"FROM runs r JOIN campaigns c ON c.id=r.campaign_id "
         f"WHERE r.status='planned' AND r.run_date < ? AND r.run_date >= ? "
         f"AND r.slots > 0 "
         f"AND r.campaign_id IN (SELECT id FROM campaigns WHERE {where}) "
         f"ORDER BY r.run_date DESC, r.campaign_id", (upper, since, *params)).fetchall()
+    leads = 0
+    if rows:
+        marks = ",".join("?" * len(rows))
+        leads = int(conn.execute(
+            f"SELECT COUNT(DISTINCT lead_uuid) FROM plan_items WHERE run_id IN ({marks})",
+            [r["id"] for r in rows]).fetchone()[0])
     return [{"campaign_id": r["campaign_id"], "name": r["name"], "run_date": r["run_date"],
-             "kind": r["kind"], "slots": r["slots"]} for r in rows]
+             "kind": r["kind"], "slots": r["slots"]} for r in rows], leads
 
 
 def _plan_facts(conn: sqlite3.Connection, runs: dict[int, sqlite3.Row],
@@ -582,7 +595,7 @@ def get_day(date: Optional[str] = Query(None), kind: str = Query(MORNING),
         runs = _plan_rows(conn, [c["id"] for c in campaigns], day, kind)
         counts = _slot_counts(conn, [r["id"] for r in runs.values()])
         log = _dialled_today(conn, day, agent_id)
-        stranded_runs = _stranded(conn, day, agent_id)
+        stranded_runs, stranded_leads = _stranded(conn, day, agent_id)
         facts = _plan_facts(conn, runs, [c["id"] for c in campaigns])
         spread = _spread(conn, runs, kind)
 
@@ -691,6 +704,9 @@ def get_day(date: Optional[str] = Query(None), kind: str = Query(MORNING),
         # Plans from earlier days that nobody ever approved. Not history: those
         # leads were never called and nothing else in this console says so.
         "stranded": stranded_runs,
+        # How many distinct leads those runs hold. Summing the rows' `slots`
+        # counts the same lead once per day it waited; this is the headline.
+        "stranded_leads": stranded_leads,
         # Which hours the calls actually landed in, against the band approved.
         "spread": spread,
     }
