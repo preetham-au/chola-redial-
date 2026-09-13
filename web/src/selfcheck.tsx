@@ -1583,6 +1583,34 @@ ok(
      && has(nothing, queue[0].name) && has(nothing, 'no longer in the daily plan'));
   retryLive();
 
+  // --- and a campaign whose request never came back is on that list too -------
+  //
+  // A 502 from the proxy, a timeout, a commit that lost a SQLite lock: the POST
+  // throws before there is any body to read. The campaign was started, so it has
+  // a progress row — and the progress list is REPLACED by the result modal, so
+  // without a part of its own it is named nowhere afterwards: absent from the
+  // totals, from the problem rows and from the Retry, under a bar reading
+  // "11 approved". The stub below throws for every campaign in the queue.
+  (globalThis as { fetch?: unknown }).fetch = async () => ({
+    ok: false, status: 500, statusText: 'error',
+    json: async () => ({ error: 'gateway blew up' }),
+  });
+  retryLive();
+  const blew = mergeResults(await runQueue(queue, () => {}, () => false), tamil);
+  ok('a campaign whose approve threw still contributes a row to the result',
+     blew.campaigns.length === queue.length
+     && blew.campaigns.every((c) => c.status === 'request_failed')
+     && blew.campaigns.map((c) => c.name).join() === queue.map((c) => c.name).join());
+  const thrown = renderToStaticMarkup(
+    <DialResult res={blew} args={approveArgs(A127, tamil, [])} onChange={() => {}} />,
+  );
+  // Named, with what went wrong, and offered again — the operator's standing
+  // rule is that a failure is logged where it can be triggered a second time.
+  ok('and is named, with what went wrong, where it can be sent again',
+     has(thrown, queue[0].name) && has(thrown, 'gateway blew up')
+     && has(thrown, 'Retry') && !has(thrown, 'Every selected lead is on the clock'));
+  retryLive();
+
   console.log('\nall checks passed');
 })();
 // A thrown ok() inside the async block surfaces as an unhandled rejection,

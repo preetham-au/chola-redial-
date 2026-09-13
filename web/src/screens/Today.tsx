@@ -1579,13 +1579,21 @@ function Stopped({ day }: { day: DayView }) {
   );
 }
 
+/** One campaign's share of the day: everything the merge below actually adds up.
+ *
+ *  Narrower than `ApproveResult` because a campaign whose request threw has no
+ *  date, wave or dry-run flag of its own — and never needed one, since all four
+ *  are read off the day rather than off a part. */
+export type ResultPart =
+  Pick<ApproveResult, 'buckets' | 'approved' | 'posted' | 'failed' | 'not_dialled' | 'campaigns'>;
+
 /** Fold the per-campaign approves back into the one result the bar expects.
  *
  *  Every request covered a different campaign, so the totals are pure addition
  *  and no campaign can appear twice. An empty list — every campaign stopped
  *  before it started — still has to produce a valid result, or the modal has
  *  nothing to show. */
-export function mergeResults(parts: ApproveResult[], day: DayView): ApproveResult {
+export function mergeResults(parts: ResultPart[], day: DayView): ApproveResult {
   const base: ApproveResult = {
     date: day.date,
     kind: day.kind,
@@ -1598,7 +1606,7 @@ export function mergeResults(parts: ApproveResult[], day: DayView): ApproveResul
     not_dialled: 0,
     campaigns: [],
   };
-  return parts.reduce(
+  return parts.reduce<ApproveResult>(
     (acc, p) => ({
       ...acc,
       buckets: p.buckets,
@@ -1627,6 +1635,27 @@ export function mergeResults(parts: ApproveResult[], day: DayView): ApproveResul
 const noResult = (c: ReturnType<typeof dialQueue>[number]): ApproveResult['campaigns'][number] =>
   ({ campaign_id: c.campaign_id, name: c.name, status: 'no_result' });
 
+/** The part a campaign contributes when its request never came back at all.
+ *
+ *  A 502 from the proxy, a timeout, a `conn.commit()` that lost a SQLite lock.
+ *  The campaign WAS started, so it has a progress row and `stoppedShort` counts
+ *  it as reached — without a part of its own it is absent from the result, from
+ *  `problems` and from the Retry, and the modal reads "11 approved" over a
+ *  twelfth campaign nothing anywhere names. The counts stay zero because a
+ *  request that threw never said what it did; retrying is safe either way, as a
+ *  campaign that did commit answers the retry `already_committed` rather than
+ *  dialling twice. */
+const threw = (c: ReturnType<typeof dialQueue>[number], err: string): ResultPart => ({
+  buckets: c.args[2],
+  approved: 0,
+  posted: 0,
+  failed: 0,
+  not_dialled: 0,
+  campaigns: [
+    { campaign_id: c.campaign_id, name: c.name, status: 'request_failed', detail: err },
+  ],
+});
+
 /** Walk the queue, one request at a time, reporting each campaign as it goes.
  *
  *  The loop itself, lifted out of the click handler that used to hold it. A
@@ -1643,8 +1672,8 @@ export async function runQueue(
   queue: ReturnType<typeof dialQueue>,
   on: (c: ReturnType<typeof dialQueue>[number], state: ProgressRow['state'], err?: string) => void,
   stopped: () => boolean,
-): Promise<ApproveResult[]> {
-  const merged: ApproveResult[] = [];
+): Promise<ResultPart[]> {
+  const merged: ResultPart[] = [];
   for (const c of queue) {
     if (stopped()) break;
     on(c, 'running');
@@ -1656,7 +1685,9 @@ export async function runQueue(
       merged.push({ ...out, campaigns: rows });
       on(c, rows.every((r) => r.status === 'approved' && !r.failed) ? 'done' : 'failed');
     } catch (e) {
-      // One campaign failing must not end the day for the rest.
+      // One campaign failing must not end the day for the rest — and must not
+      // vanish from it either: the progress list dies with the modal.
+      merged.push(threw(c, (e as Error).message));
       on(c, 'failed', (e as Error).message);
     }
   }
