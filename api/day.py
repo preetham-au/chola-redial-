@@ -431,6 +431,60 @@ def _stranded(conn: sqlite3.Connection, day: date,
              "kind": r["kind"], "slots": r["slots"]} for r in rows]
 
 
+def _plan_facts(conn: sqlite3.Connection, runs: dict[int, sqlite3.Row],
+                campaign_ids: list[int]) -> dict[int, dict[str, Any]]:
+    """Per campaign: when the plan was built, when it last dialled, what was booked.
+
+    All three answer the same operator question -- "has a call already been
+    placed for these leads, by me or by anybody?" The engine does check: it skips
+    every lead with `queued_today > 0` (red_engine.SKIP_ALREADY_SCHEDULED). But
+    it checks at PLAN time, and on 12 Sep 2026 the plans were built in the
+    morning and approved six hours later, so anything booked in Formi in between
+    was invisible to the approval.
+
+    `already_booked` is therefore both a count and a clock: N leads were already
+    on Formi's clock when this plan was built, and the older the plan the less
+    that number can be trusted. `last_dialled` is the other half -- a campaign
+    that dialled two hours ago reads very differently from one last called on
+    Tuesday.
+
+    `plan_built_at` is `runs.created_at`, which is `now_iso()` -- naive IST, no
+    offset (see the note on IST in api/db.py). The client must not hand that
+    string to a bare `new Date(...)`: an ISO date-TIME with no offset is parsed
+    as the BROWSER's local time, so on a laptop in UTC a plan reads 5h30m
+    YOUNGER than it is -- a six-hour-old plan looks half an hour old and raises
+    nothing, which is the exact failure of 12 Sep 2026 wearing a timezone.
+    `planAge` in web/src/screens/Today.tsx pins the +05:30 back on; anything
+    else reading this field owes the same.
+    """
+    facts = {cid: {"plan_built_at": None, "last_dialled": None, "already_booked": 0}
+             for cid in campaign_ids}
+    if not campaign_ids:
+        return facts
+
+    for campaign_id, run in runs.items():
+        if campaign_id in facts:
+            facts[campaign_id]["plan_built_at"] = run["created_at"]
+
+    marks = ",".join("?" * len(campaign_ids))
+    for row in conn.execute(
+            f"SELECT campaign_id, MAX(run_date) AS last FROM runs "
+            f"WHERE campaign_id IN ({marks}) AND posted > 0 GROUP BY campaign_id",
+            campaign_ids):
+        facts[row["campaign_id"]]["last_dialled"] = row["last"]
+
+    run_ids = [r["id"] for r in runs.values()]
+    if run_ids:
+        marks = ",".join("?" * len(run_ids))
+        owner = {r["id"]: cid for cid, r in runs.items()}
+        for row in conn.execute(
+                f"SELECT run_id, COUNT(*) AS n FROM decisions "
+                f"WHERE run_id IN ({marks}) AND reason LIKE 'ALREADY_SCHEDULED_TODAY%' "
+                f"GROUP BY run_id", run_ids):
+            facts[owner[row["run_id"]]]["already_booked"] = row["n"]
+    return facts
+
+
 @router.get("/api/day")
 def get_day(date: Optional[str] = Query(None), kind: str = Query(MORNING),
             agent_id: Optional[int] = Query(None)) -> dict[str, Any]:
@@ -482,6 +536,7 @@ def get_day(date: Optional[str] = Query(None), kind: str = Query(MORNING),
         counts = _slot_counts(conn, [r["id"] for r in runs.values()])
         log = _dialled_today(conn, day, agent_id)
         stranded_runs = _stranded(conn, day, agent_id)
+        facts = _plan_facts(conn, runs, [c["id"] for c in campaigns])
 
         from .db import current_config                  # noqa: PLC0415 — avoids a cycle
         # Every armed campaign's own config. There is no campaign whose settings
@@ -522,6 +577,7 @@ def get_day(date: Optional[str] = Query(None), kind: str = Query(MORNING),
             "posted": run["posted"] if run is not None else 0,
             "failed": run["failed"] if run is not None else 0,
             "dropped": run["dropped"] if run is not None else 0,
+            **facts[campaign["id"]],
         })
 
     ready = sum(c["ready"] for c in listed)

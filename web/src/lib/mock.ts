@@ -93,6 +93,14 @@ export const mockDay = (date: string, kind: string, agent_id?: number): DayView 
   const scoped = mockCampaigns.filter((c) => agent_id === undefined || c.agent_id === agent_id);
   const armed = scoped.filter((c) => c.enabled && !c.paused).slice(0, 4);
   const per = [312, 184, 96, 41];
+  // `runs.created_at` exactly as the server writes it: naive IST, no offset
+  // (api/db.py's `now_iso`). Ten minutes back rather than a fixed date, so the
+  // offline console shows a plan that is FRESH — a hardcoded timestamp would
+  // put the "this plan is Nh old" warning on screen permanently.
+  const builtAt = new Date(Date.now() + 330 * 60000 - 10 * 60000).toISOString().slice(0, 19);
+  const lastDialled = new Date(Date.parse(`${date}T00:00:00Z`) - 86400000)
+    .toISOString()
+    .slice(0, 10);
   const campaigns: DayCampaign[] = armed.map((c, i) => ({
     ...c,
     autopilot: true,
@@ -104,6 +112,9 @@ export const mockDay = (date: string, kind: string, agent_id?: number): DayView 
     posted: 0,
     failed: 0,
     dropped: 0,
+    plan_built_at: builtAt,
+    last_dialled: lastDialled,
+    already_booked: [18, 7, 3, 0][i],
   }));
   const ready = campaigns.reduce((s, c) => s + c.ready, 0);
   return {

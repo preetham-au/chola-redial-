@@ -1140,3 +1140,71 @@ def test_a_malformed_agent_language_stops_the_api_at_boot(client, tmp_path):
 
     assert good.returncode == 0, (
         f"the documented form must still boot: {good.stderr}")
+
+
+# ---------------------------------------------------------------------------
+# Has a call already been placed?
+# ---------------------------------------------------------------------------
+
+def test_already_booked_counts_leads_formi_had_already_queued(client):
+    """The engine skips them at plan time; the screen has to say how many."""
+    campaign_id = _arm()[0]
+    today = now_ist().date().isoformat()
+    run_id = _seed_run(campaign_id, today, "auto", "planned", 2)
+    with session() as conn:
+        conn.executemany(
+            "INSERT INTO decisions (run_id, lead_uuid, action, reason, scheduled, created_at) "
+            "VALUES (?,?,'SKIP',?,0,?)",
+            [(run_id, f"booked-{i}", "ALREADY_SCHEDULED_TODAY queued_today=1", f"{today}T09:00:00")
+             for i in range(3)]
+            + [(run_id, "waited", "CADENCE_WAIT", f"{today}T09:00:00")])
+        conn.commit()
+
+    body = client.get("/api/day").json()
+    # `_campaign_json` names it `id`; `campaign_id` is what the APPROVE response
+    # calls the same identity.
+    row = next(c for c in body["campaigns"] if c["id"] == campaign_id)
+
+    assert row["already_booked"] == 3, "only the ALREADY_SCHEDULED_TODAY rows count"
+    assert row["plan_built_at"], "the age of the plan is what makes the count meaningful"
+
+
+def test_last_dialled_is_the_most_recent_day_that_posted(client):
+    # A campaign with NO run history, not `_arm()`'s first-per-agent pick.
+    # `last_dialled` is a MAX over a campaign's WHOLE history and the `client`
+    # fixture is session-scoped (tests/conftest.py:21), so one database serves
+    # every file: by the time this one runs, tests/test_autopilot.py has already
+    # committed a real run for TODAY against campaigns 1-11. Those rows are not
+    # tagged 'seeded', so `clean_runs` rightly leaves them alone -- and today
+    # beats every date seeded below, which would answer this test with somebody
+    # else's approve.
+    with session() as conn:
+        free = conn.execute(
+            "SELECT id FROM campaigns WHERE id NOT IN "
+            "(SELECT campaign_id FROM runs) ORDER BY id LIMIT 1").fetchone()
+        if free is None:
+            pytest.skip("every campaign already carries a run; nothing to own a history")
+        campaign_id = int(free["id"])
+        conn.execute("UPDATE campaigns SET autopilot=1, enabled=1, paused=0, hidden=0 "
+                     "WHERE id=?", (campaign_id,))
+        conn.commit()
+    today = now_ist().date()
+    older = (today - timedelta(days=4)).isoformat()
+    newer = (today - timedelta(days=2)).isoformat()
+    with session() as conn:
+        for run_date, posted in ((older, 5), (newer, 9),
+                                 ((today - timedelta(days=1)).isoformat(), 0)):
+            conn.execute(
+                "INSERT INTO runs (campaign_id, run_date, kind, status, config_version, "
+                "created_at, dry_run, evaluated, planned, slots, posted, failed, dropped, note) "
+                "VALUES (?,?,'auto','committed',1,?,1,0,0,0,?,0,0,'seeded')",
+                (campaign_id, run_date, f"{run_date}T09:00:00", posted))
+        conn.commit()
+
+    body = client.get("/api/day").json()
+    # `_campaign_json` names it `id`; `campaign_id` is what the APPROVE response
+    # calls the same identity.
+    row = next(c for c in body["campaigns"] if c["id"] == campaign_id)
+
+    assert row["last_dialled"] == newer, \
+        "a run that posted nothing did not dial, however recent it is"

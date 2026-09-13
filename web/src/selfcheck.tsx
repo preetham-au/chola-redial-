@@ -26,9 +26,11 @@ import {
   panelDay,
   panelPrepare,
   panelsFor,
+  planAge,
   retryArgs,
   runQueue,
   scopeMismatch,
+  STALE_MIN,
   wireBuckets,
 } from './screens/Today';
 import { Row as LogRow } from './screens/CallLog';
@@ -55,7 +57,9 @@ import {
   narrowedBuckets,
   passState,
 } from './lib/domain';
-import type { Agent, ApproveResult, Campaign, Config, TestCallResult } from './lib/types';
+import type {
+  Agent, ApproveResult, Campaign, Config, DayCampaign, TestCallResult,
+} from './lib/types';
 
 const ROWS = configurableBuckets(mockConfig.frequency_table);
 let cfg: Config = structuredClone(mockConfig);
@@ -391,6 +395,85 @@ ok(
   const none = modal({}, [], []);
   ok('unticking every bucket blocks the approve button rather than dialling all of them',
      has(none, 'disabled=""') && has(none, 'nothing to dial'));
+}
+
+// --- has a call already been placed for these leads? ------------------------
+//
+// The engine does skip every lead Formi has already queued — but it checks at
+// PLAN time. On 12 Sep 2026 the plans were built in the morning and approved six
+// hours later, so every call booked in Formi in between was invisible to the
+// approval. `already_booked` is therefore only as good as the plan's age, which
+// makes that age arithmetic this screen has to get right.
+{
+  const base = mockDay('2026-09-09', 'auto');
+  // `runs.created_at` written the way the server writes it: naive IST, no
+  // offset (api/db.py's `now_iso`).
+  const ist = (ms: number) => new Date(ms + 330 * 60000).toISOString().slice(0, 19);
+  const built = (...ago: (number | null)[]) =>
+    ago.map((m) => ({ plan_built_at: m === null ? null : ist(Date.now() - m * 60000) })) as
+      DayCampaign[];
+
+  ok('a plan built minutes ago is not stale', !planAge(built(5), Date.now()).stale);
+  ok('and one past the threshold is', planAge(built(STALE_MIN + 1), Date.now()).stale);
+  ok('a plan the server gave no build time for warns about nothing — a backend '
+     + 'too old to send the field must not cry wolf on every approval',
+     !planAge(built(null, null), Date.now()).stale
+     && planAge(built(null, null), Date.now()).minutes === 0);
+  ok('the OLDEST plan on the panel decides, not the freshest one beside it',
+     planAge(built(5, STALE_MIN + 1, 2), Date.now()).stale);
+
+  // The half that cannot be proved on a machine already on IST, and the half
+  // that bites hardest: `plan_built_at` carries no offset, and ECMA-262 reads an
+  // ISO date-TIME without one as the BROWSER'S LOCAL time. From a browser in UTC
+  // a bare `new Date(builtAt)` makes every plan 5h30m YOUNGER than it is, so a
+  // plan built six hours ago reads as half an hour old and the stale warning
+  // never appears at all; east of IST it reads older instead and a plan built a
+  // minute ago cries wolf. node re-reads process.env.TZ per call, so the non-IST
+  // browser is reachable from here rather than only from a CI box abroad.
+  const under = (tz: string, f: () => number) => {
+    const before = process.env.TZ;
+    process.env.TZ = tz;
+    try {
+      return f();
+    } finally {
+      if (before === undefined) delete process.env.TZ;
+      else process.env.TZ = before;
+    }
+  };
+  // 09:00 IST IS 03:30Z. Both sides written out, so neither reads a clock.
+  const age = () =>
+    planAge([{ plan_built_at: '2026-09-13T09:00:00' }] as DayCampaign[],
+            Date.parse('2026-09-13T03:30:00Z') + 45 * 60000).minutes;
+  ok('the plan’s age is read in the IST the server wrote it in', age() === 45);
+  ok('and is the same age from a browser that is not on IST, either side of it',
+     under('UTC', age) === 45 && under('Pacific/Auckland', age) === 45
+     && under('America/New_York', age) === 45);
+
+  const modal = (over: Partial<typeof base>) =>
+    renderToStaticMarkup(
+      <ApproveDay agent={null} day={{ ...base, ...over }} buckets={[]} shown={['M0']}
+                  onClose={() => {}} onDone={() => {}} />,
+    );
+  const every = (over: Partial<DayCampaign>) =>
+    ({ campaigns: base.campaigns.map((c) => ({ ...c, ...over })) });
+
+  ok('the fixture ships a FRESH plan, or neither check below proves anything',
+     !planAge(base.campaigns, Date.now()).stale);
+  const fresh = modal({});
+  ok('a fresh plan is approved with no staleness warning in the way',
+     !has(fresh, 'Re-check now'));
+  ok('and still says how many leads Formi had already booked when it was built',
+     has(fresh, 'already on Formi'));
+
+  const old = modal(every({ plan_built_at: ist(Date.now() - 6 * 60 * 60000) }));
+  ok('a plan built six hours ago says so, in hours, before anybody dials it',
+     has(old, 'This plan is 6h 0m old'));
+  ok('and offers the re-check rather than only complaining', has(old, 'Re-check now'));
+
+  ok('nothing already booked says nothing, rather than "0 leads were"',
+     !has(modal(every({ already_booked: 0 })), 'already on Formi'));
+  ok('a campaign that has never dialled reads as never, not as a blank',
+     has(modal(every({ last_dialled: null })), 'never'));
 }
 
 // --- one panel per agent: two languages, two decisions ----------------------
@@ -890,6 +973,16 @@ ok(
      !sent[2].includes('agent_id'));
   await panelPrepare(null, '2026-09-13', 'auto');
   ok('and still builds the whole day’s plan', !sent[3].includes('"agent_id":'));
+
+  // The approve modal's "Re-check now" is the same prepare pass with `resync`
+  // on, and it runs from an async click handler the static renderer never
+  // reaches. Routed through `panelPrepare` so the scope comes from the PANEL's
+  // agent — `day.agent_id` is the server's echo, and sourcing scope from it is
+  // the defect a770682 took out of the dial path. Rebuilding the whole roster's
+  // plan from a panel headed "Tamil" is that defect wearing a different button.
+  await panelPrepare(A127, '2026-09-13', 'auto', true);
+  ok('the re-check re-reads Formi for the panel’s own agent alone, never the roster',
+     sent[4].includes('"agent_id":127') && sent[4].includes('"resync":true'));
   retryLive();
 
   // --- and the day actually goes out one campaign at a time -------------------

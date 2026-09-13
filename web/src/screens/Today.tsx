@@ -30,7 +30,7 @@ import { bandRange, bucketColor, friendlyBucket, n } from '../lib/domain';
 import { navigate, useAsync, useStore } from '../lib/store';
 import { Card, Empty, Fact, Modal, TypeToConfirm } from '../components/ui';
 import { DayProgress, type ProgressRow } from '../components/DayProgress';
-import type { Agent, ApproveResult, Campaign, DayBucket, DayView } from '../lib/types';
+import type { Agent, ApproveResult, Campaign, DayBucket, DayCampaign, DayView } from '../lib/types';
 
 const WAVES = [
   { kind: 'auto', label: 'Morning' },
@@ -65,8 +65,15 @@ export const agentLabel = (agent: Agent | null) =>
 export const panelDay = (agent: Agent | null, date: string, kind: string) =>
   api.day(date, kind, agent?.agent_id);
 
-export const panelPrepare = (agent: Agent | null, date: string, kind: string) =>
-  api.prepareDay(date, kind, false, agent?.agent_id);
+/** `resync` re-reads Formi before planning, which is what the approve modal's
+ *  "Re-check now" needs and what the panel's own Prepare does not: the hourly
+ *  sync keeps the local copy fresh enough to press a button against, but a plan
+ *  built six hours ago is being re-checked precisely because Formi has moved
+ *  since. The scope is the panel's agent either way — that is the whole reason
+ *  the re-check goes through here rather than calling `api.prepareDay` with
+ *  `day.agent_id`, which is the server's echo and not the panel's identity. */
+export const panelPrepare = (agent: Agent | null, date: string, kind: string, resync = false) =>
+  api.prepareDay(date, kind, resync, agent?.agent_id);
 
 /** Exactly what `api.approveDay` takes, named so the approve and its Retry can
  *  pass one value between them instead of five. */
@@ -186,6 +193,48 @@ export const pickable = (c: Campaign) => c.enabled !== false && !c.hidden;
  *  envelope across them and no campaign necessarily shuts at its end. */
 export const closesAt = (day: DayView) =>
   day.window_varies ? 'their campaigns close' : day.window.end;
+
+/** How old a plan may get before its `already_booked` count stops meaning
+ *  anything. 90 minutes is well inside the six-hour gap of 12 Sep 2026 and well
+ *  outside the few minutes between a prepare pass and a prompt approval. */
+export const STALE_MIN = 90;
+
+/** How old this panel's plan is, in minutes, and whether that is old enough to
+ *  stop trusting what it says was already booked.
+ *
+ *  The OLDEST plan on the panel decides. A panel holds one plan per campaign and
+ *  they are not built at the same instant — one re-prepared at 14:00 beside one
+ *  built at 09:00 is a screen whose `already_booked` is five hours stale for
+ *  half of it, and a warning about the newest of them would be a warning about
+ *  the half that is fine.
+ *
+ *  `plan_built_at` is `runs.created_at`: naive IST, no offset on the string
+ *  (api/db.py's `now_iso`, "2026-09-13T09:00:00"). ECMA-262 parses an ISO
+ *  date-TIME with no offset as the BROWSER's LOCAL time — only a browser that
+ *  happens to be on IST gets the right answer from `new Date(builtAt)`. West of
+ *  IST every plan reads 5h30m YOUNGER than it is — in UTC a plan built six
+ *  hours ago reads as half an hour old and this warning never appears, which is
+ *  12 Sep 2026 happening again with a timezone as the excuse. East of IST it
+ *  reads older instead and a plan built a minute ago cries wolf. The offset the
+ *  server wrote in is pinned back on here, and this is the only place in the
+ *  client that parses the field.
+ *
+ *  `now` is passed in rather than read, so this stays a pure function of its
+ *  arguments and the check can drive it at a fixed instant. */
+export const planAge = (campaigns: DayCampaign[], now: number) => {
+  // ISO strings sort chronologically, so the first is the oldest.
+  const builtAt = campaigns
+    .map((c) => c.plan_built_at)
+    .filter((t): t is string => !!t)
+    .sort()[0];
+  const minutes = builtAt
+    ? Math.round((now - new Date(`${builtAt}+05:30`).getTime()) / 60000)
+    : 0;
+  // A plan nothing knows the age of is not a plan known to be fresh, but it is
+  // also not evidence of anything — warning on it would cry wolf on every
+  // backend too old to send the field.
+  return { builtAt, minutes, stale: !!builtAt && minutes >= STALE_MIN };
+};
 
 /** Which campaigns to arm and which to disarm — the only thing this screen puts
  *  on the wire that changes who gets called.
@@ -1207,6 +1256,33 @@ export function ApproveDay({
   // the progress bar's denominator — so both count the same campaigns.
   const queue = dialQueue(args, day);
 
+  // Has a call already been placed for these leads? The engine answered that at
+  // PLAN time; these two say how long ago that was and how many it caught.
+  const { builtAt, minutes: ageMin, stale } = planAge(day.campaigns, Date.now());
+  const booked = day.campaigns.reduce((s, c) => s + c.already_booked, 0);
+  const [rechecking, setRechecking] = useState(false);
+
+  /** Re-read Formi and rebuild the plan, so leads booked since it was built drop
+   *  out of it. This is the existing prepare pass, not a new one.
+   *
+   *  Scoped through `panelPrepare` from this modal's OWN `agent` — the panel's
+   *  identity — and never from `day.agent_id`. The echo is what a770682 took out
+   *  of the dial path, and rebuilding the whole roster's plan from a panel headed
+   *  "Hindi" is the same defect wearing a different button. */
+  const recheck = async () => {
+    setRechecking(true);
+    try {
+      const out = await panelPrepare(agent, day.date, day.kind, true);
+      toast('ok', `Re-checked: ${n(out.ready)} still ready across ${out.prepared} campaigns.`);
+      onDone();
+      onClose();
+    } catch (e) {
+      toast('bad', (e as Error).message);
+    } finally {
+      setRechecking(false);
+    }
+  };
+
   /** Everything the queue reports, turned back into screen. The only part of the
    *  dial that needs React, and so the only part the static check cannot run. */
   const onCampaign = (
@@ -1338,7 +1414,37 @@ export function ApproveDay({
           k="Window"
           v={`${day.window.start}–${day.window.end} IST${day.window_varies ? ' · varies by campaign' : ''}`}
         />
+        <Fact k="Plan built" v={builtAt ? `${Math.floor(ageMin / 60)}h ${ageMin % 60}m ago` : '—'} />
+        <Fact
+          k="Last dialled"
+          v={day.campaigns.map((c) => c.last_dialled).filter(Boolean).sort().reverse()[0] ?? 'never'}
+        />
       </div>
+
+      {booked > 0 && (
+        <p className="hero-sub">
+          {n(booked)} {booked === 1 ? 'lead was' : 'leads were'} already on Formi’s clock when
+          this plan was built and {booked === 1 ? 'was' : 'were'} left out of it.
+        </p>
+      )}
+
+      {stale && (
+        <div className="warnbox">
+          <AlertTriangle />
+          <span>
+            <b>This plan is {Math.floor(ageMin / 60)}h {ageMin % 60}m old.</b> Any call placed in
+            Formi since it was built — by you or by anyone — is not accounted for in it.
+            <button
+              className="btn btn-ghost btn-sm"
+              style={{ marginLeft: 8 }}
+              disabled={rechecking || busy}
+              onClick={recheck}
+            >
+              {rechecking ? <Loader2 className="spin" /> : <RefreshCw />} Re-check now
+            </button>
+          </span>
+        </div>
+      )}
 
       {shown.length === 0 && (
         <div className="warnbox">

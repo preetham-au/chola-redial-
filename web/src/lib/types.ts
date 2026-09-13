@@ -206,6 +206,19 @@ export interface DayCampaign extends Campaign {
   posted: number;
   failed: number;
   dropped: number;
+  /** When this plan was built. The older it is, the less `already_booked` can
+   *  be trusted — leads booked in Formi since are not in it.
+   *
+   *  `runs.created_at`, which the server writes as naive IST with NO offset on
+   *  it (api/db.py's `now_iso`). Never hand it to a bare `new Date(...)`: that
+   *  reads it as the browser's local time. `planAge` in screens/Today.tsx is
+   *  the one place that parses it. */
+  plan_built_at: string | null;
+  /** The most recent date this campaign actually posted calls. */
+  last_dialled: string | null;
+  /** Leads Formi had already queued when the plan was built, which the engine
+   *  skipped. */
+  already_booked: number;
 }
 
 export interface StrandedRun {
