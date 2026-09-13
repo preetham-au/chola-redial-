@@ -65,6 +65,10 @@ WAVE_LABEL = {MORNING: "morning", AFTERNOON: "afternoon"}
 # dialled after it was taken out. Widening the roster means editing this line.
 ARMED = "autopilot=1 AND enabled=1 AND paused=0 AND hidden=0"
 
+# How far back `_stranded` looks. Older than this the leads have been re-planned
+# several times over and the row is history, not a thing to act on.
+STRANDED_DAYS = 14
+
 
 class PrepareBody(BaseModel):
     date: Optional[str] = None
@@ -249,16 +253,25 @@ def _stranded(conn: sqlite3.Connection, day: date) -> list[dict[str, Any]]:
     asked about. Those leads were not dropped, re-queued or reported; they simply
     did not get called.
 
-    Bounded to the last 14 days: older than that the leads have been re-planned
-    several times over and the row is history, not a thing to act on.
+    Bounded to the last STRANDED_DAYS days.
     """
-    since = (day - timedelta(days=14)).isoformat()
+    # "Earlier" means earlier than TODAY, not earlier than the day asked about.
+    # The date input has no upper bound, so tomorrow is one click away -- and
+    # bounded by the requested day, this morning's `planned` run would be
+    # reported as never dialled while it is in fact queued and awaiting
+    # approval. A plan for a day that has not arrived is waiting, not abandoned.
+    upper = min(day, now_ist().date()).isoformat()
+    since = (day - timedelta(days=STRANDED_DAYS)).isoformat()
+    # The roster predicate is scoped to its own SELECT so every bare column in
+    # ARMED resolves against `campaigns` by construction -- qualifying only the
+    # first of the four left the rest to SQLite's search across the join.
     rows = conn.execute(
         f"SELECT r.campaign_id, c.name, r.run_date, r.kind, r.slots "
         f"FROM runs r JOIN campaigns c ON c.id=r.campaign_id "
         f"WHERE r.status='planned' AND r.run_date < ? AND r.run_date >= ? "
-        f"AND r.slots > 0 AND c.{ARMED} "
-        f"ORDER BY r.run_date DESC, r.campaign_id", (day.isoformat(), since)).fetchall()
+        f"AND r.slots > 0 "
+        f"AND r.campaign_id IN (SELECT id FROM campaigns WHERE {ARMED}) "
+        f"ORDER BY r.run_date DESC, r.campaign_id", (upper, since)).fetchall()
     return [{"campaign_id": r["campaign_id"], "name": r["name"], "run_date": r["run_date"],
              "kind": r["kind"], "slots": r["slots"]} for r in rows]
 

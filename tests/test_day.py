@@ -5,7 +5,8 @@ from datetime import date, timedelta
 
 import pytest
 
-from api.db import session
+from api.day import STRANDED_DAYS
+from api.db import now_ist, session
 
 
 @pytest.fixture(autouse=True)
@@ -105,16 +106,45 @@ def test_stranded_lists_a_past_planned_run(client):
 
 
 def test_stranded_ignores_today_and_committed_runs(client):
-    """Today's plan is awaiting approval, not stranded; a committed run dialled."""
+    """One seeded run per predicate the query is made of, each of which must fall out.
+
+    Scanned per (date, kind) and filtered to the campaign under test: `_arm`
+    leaves other campaigns armed and `clean_runs` only removes note='seeded'
+    rows, so a bare `all(...)` over every stranded row would be answering about
+    somebody else's campaign.
+    """
     campaign_id = _arm()[0]
     today = date.today().isoformat()
     yesterday = (date.today() - timedelta(days=1)).isoformat()
+    two_days_ago = (date.today() - timedelta(days=2)).isoformat()
+    long_ago = (date.today() - timedelta(days=20)).isoformat()
     _seed_run(campaign_id, today, "auto", "planned", 5)
     _seed_run(campaign_id, yesterday, "auto_pm", "committed", 7)
+    _seed_run(campaign_id, long_ago, "auto", "planned", 9)
+    _seed_run(campaign_id, two_days_ago, "auto", "planned", 0)
 
-    stranded = client.get("/api/day").json()["stranded"]
+    seen = {(s["run_date"], s["kind"]) for s in client.get("/api/day").json()["stranded"]
+            if s["campaign_id"] == campaign_id}
 
-    assert all(s["run_date"] != today for s in stranded), \
+    assert (today, "auto") not in seen, "today's plan is awaiting approval, not abandoned"
+    assert (yesterday, "auto_pm") not in seen, "a committed run did dial"
+    assert (long_ago, "auto") not in seen, \
+        f"older than the {STRANDED_DAYS}-day bound is history, not a thing to act on"
+    assert (two_days_ago, "auto") not in seen, "a plan holding no slots dialled nothing"
+
+
+def test_stranded_ignores_today_when_a_future_day_is_requested(client):
+    """Asking for tomorrow must not report this morning's queued plan as abandoned.
+
+    The date input has no upper bound, so this is one click away. `now_ist`
+    rather than `date.today`: the clamp is against the server's IST today.
+    """
+    campaign_id = _arm()[0]
+    today = now_ist().date()
+    _seed_run(campaign_id, today.isoformat(), "auto", "planned", 4)
+
+    body = client.get(f"/api/day?date={(today + timedelta(days=1)).isoformat()}").json()
+
+    assert all(s["run_date"] != today.isoformat() for s in body["stranded"]
+               if s["campaign_id"] == campaign_id), \
         "today's plan is awaiting approval, not abandoned"
-    assert all(not (s["run_date"] == yesterday and s["kind"] == "auto_pm")
-               for s in stranded), "a committed run did dial"
