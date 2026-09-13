@@ -182,8 +182,15 @@ export interface AutopilotStatus {
  *  nobody approved anything, and the screen that believed it offered neither
  *  Build nor Approve, so leads a later re-sync pulled in could not be planned at
  *  all. It is what `_approve_one` already calls this state for one campaign. */
+/** `part_prepared` is the same defect one state over: some campaigns acted on and
+ *  at least one with no run at all — a campaign whose prepare failed, or one
+ *  armed after the wave was approved. `{committed, not_prepared}` is a SET that
+ *  matched no arm of the server's ladder and fell through to `approved`, whose
+ *  hero offers only the call log; the picker's Save is greyed out for a campaign
+ *  that is already armed, so those leads had no route onto the clock at all. */
 export type DayStatus =
-  | 'no_campaigns' | 'not_prepared' | 'awaiting_approval' | 'nothing_to_dial' | 'approved';
+  | 'no_campaigns' | 'not_prepared' | 'awaiting_approval' | 'nothing_to_dial'
+  | 'part_prepared' | 'approved';
 
 /** A RED priority band, best first. `dte` is (RED date − today): positive means
  *  the renewal is still ahead, negative means the policy is past its RED date.

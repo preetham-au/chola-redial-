@@ -1777,6 +1777,45 @@ def test_a_planned_wave_with_nothing_ready_is_not_reported_as_approved(client):
             conn.commit()
 
 
+def test_a_wave_holding_one_unbuilt_campaign_is_not_reported_as_approved(client):
+    """Eight committed runs and one campaign that never built is not an approval.
+
+    `statuses` is a SET over the whole panel, so {committed, not_prepared} matched
+    no arm of the ladder and fell through to `approved` -- the hero then read
+    "this wave has been approved", offered only the call log, and the unbuilt
+    campaign's leads had no route onto the clock at all: the picker's Save is
+    greyed out for a campaign that is already armed.
+
+    Two campaigns on one agent, one committed and one with no run, scoped to that
+    agent for the same reason as the test above: `status` is a statement about the
+    whole page.
+    """
+    committed_id, unbuilt_id, agent_id = 90004, 90005, 90127
+    with session() as conn:
+        conn.executemany(
+            "INSERT INTO campaigns (id, agent_id, warehouse_id, name, autopilot) VALUES (?,?,?,?,1)",
+            [(committed_id, agent_id, 99004, "built fixture"),
+             (unbuilt_id, agent_id, 99005, "unbuilt fixture")])
+        conn.commit()
+    today = now_ist().date().isoformat()
+    try:
+        _seed_run(committed_id, today, "auto", "committed", 2)
+        body = client.get(f"/api/day?agent_id={agent_id}").json()
+
+        assert sorted(c["run_status"] for c in body["campaigns"]) == ["committed", "not_prepared"]
+        assert body["status"] == "part_prepared", \
+            "a wave holding a campaign with no plan has not been approved"
+    finally:
+        # Same four deletes, in the same order, for both fixture campaigns.
+        with session() as conn:
+            for cid in (committed_id, unbuilt_id):
+                conn.execute("DELETE FROM config WHERE campaign_id=?", (cid,))
+                conn.execute("DELETE FROM runs WHERE campaign_id=?", (cid,))
+                conn.execute("DELETE FROM leads WHERE campaign_id=?", (cid,))
+                conn.execute("DELETE FROM campaigns WHERE id=?", (cid,))
+            conn.commit()
+
+
 # ---------------------------------------------------------------------------
 # A rehearsal to your own handset has no hours
 # ---------------------------------------------------------------------------

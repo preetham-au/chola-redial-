@@ -303,6 +303,18 @@ export const pickable = (c: Campaign) => c.enabled !== false && !c.hidden;
 export const closesAt = (day: DayView) =>
   day.window_varies ? 'their campaigns close' : day.window.end;
 
+/** Campaigns on this panel with no run at all for this wave.
+ *
+ *  The whole of the `part_prepared` headline: how many campaigns were left
+ *  behind while the rest of the wave was acted on. Read off `run_status`, which
+ *  is the same field the Campaigns card badges "not built" with, so the hero and
+ *  the list below it cannot disagree.
+ *
+ *  Pure and exported because a number written inline into the hero is a number
+ *  no check can reach without a DOM runner. */
+export const unbuilt = (day: DayView) =>
+  day.campaigns.filter((c) => c.run_status === 'not_prepared').length;
+
 /** How old a plan may get before its `already_booked` count stops meaning
  *  anything. 90 minutes is well inside the six-hour gap of 12 Sep 2026 and well
  *  outside the few minutes between a prepare pass and a prompt approval. */
@@ -770,6 +782,42 @@ export function Headline({
           onClick={() => onPrepare(true)}
         >
           {busy === 'prepare' ? <Loader2 className="spin" /> : <RefreshCw />} Re-check and build
+        </button>
+      </section>
+    );
+  }
+
+  if (day.status === 'part_prepared') {
+    const missing = unbuilt(day);
+    return (
+      <section className="hero">
+        <div className="hero-body">
+          <span className="eyebrow">{day.date} · {day.wave} · {day.totals.campaigns} campaigns</span>
+          <h2 className="hero-h">
+            {n(missing)}{' '}
+            <span className="hero-h-dim">
+              {missing === 1 ? 'campaign has' : 'campaigns have'} no plan for this wave.
+            </span>
+          </h2>
+          <p className="hero-sub">
+            The rest of the wave has been dialled — {n(day.totals.posted)} calls went on the clock.
+            These have no plan at all, so nothing of theirs can be approved. Building writes one and
+            dials nothing; the campaigns that already went out answer “already ran” and are left
+            exactly as they are, note included.
+          </p>
+        </div>
+        {/* Plain build, not a re-check: the usual way into this state is one
+            campaign whose prepare failed on a warehouse read, and the local copy
+            is what it needs to be planned off. `() => onPrepare()` for the reason
+            the `not_prepared` branch gives — a bare handler passes the click
+            event as `resync`, and a MouseEvent is truthy. */}
+        <button
+          className="btn btn-primary btn-hero"
+          disabled={busy !== ''}
+          onClick={() => onPrepare()}
+        >
+          {busy === 'prepare' ? <Loader2 className="spin" /> : <ClipboardList />}
+          {` Build the missing ${missing === 1 ? 'plan' : 'plans'}`}
         </button>
       </section>
     );

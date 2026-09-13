@@ -661,6 +661,15 @@ def get_day(date: Optional[str] = Query(None), kind: str = Query(MORNING),
         # all. `nothing_to_dial` is what `_approve_one` already calls this exact
         # state for one campaign; the day says it in the same words.
         status = "nothing_to_dial"
+    elif "not_prepared" in statuses:
+        # The same lie as the branch above, one state over: a day of eight
+        # committed runs and one campaign that never built answered `approved`,
+        # and the approved hero offers only "Open the call log" -- no Build
+        # anywhere on the panel, and the picker's Save is greyed out because that
+        # campaign is already armed. Its leads had no route onto the clock at all.
+        # `_prepare_one` answers `already_ran` for the committed ones and writes
+        # them no note, so building from here costs them nothing.
+        status = "part_prepared"
     else:
         status = "approved"
 

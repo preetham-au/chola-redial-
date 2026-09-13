@@ -41,6 +41,7 @@ import {
   scopeMismatch,
   stoppedShort,
   straddlesBand,
+  unbuilt,
   STALE_MIN,
   wireBuckets,
 } from './screens/Today';
@@ -318,6 +319,27 @@ ok(
   // The way back. Without it the panel is a dead end until the wave rolls over.
   ok('and offers to re-read Formi and build again, rather than only a call log',
      has(blank, 'Re-check and build') && !has(blank, 'Open the call log'));
+
+  // The same defect one state over: eight campaigns committed and one that never
+  // built. `{committed, not_prepared}` matched no arm of the server's ladder and
+  // fell through to `approved`, so the hero read "This wave has been approved.
+  // 2,140 calls on the clock." over a campaign whose ~250 leads were on no clock
+  // at all — and offered the call log and nothing else. The picker is not the way
+  // back either: that campaign is already armed, so `autopilotDiff` returns two
+  // empty lists and Save is greyed out.
+  const partlyBuilt = day({
+    status: 'part_prepared',
+    campaigns: base.campaigns.map((c, i) =>
+      (i === 0 ? { ...c, run_status: 'not_prepared' as const, ready: 0 } : { ...c, run_status: 'committed' as const })),
+  });
+  ok('one campaign left unbuilt is counted off run_status, not guessed',
+     unbuilt(partlyBuilt) === 1 && unbuilt(base) === 0);
+  const mixedHero = head(partlyBuilt);
+  ok('a wave holding an unbuilt campaign never says it has been approved',
+     !has(mixedHero, 'has been approved') && has(mixedHero, 'no plan for this wave'));
+  // The way back, and the only one: Build is on no other branch of this hero.
+  ok('and offers to build the campaigns that have none',
+     has(mixedHero, 'Build the missing plan') && !has(mixedHero, 'Open the call log'));
 
   // Both of those hand Headline the status by hand; this pins the fixture that
   // produces it. An unscoped `mockDay` always has campaigns, so nothing else

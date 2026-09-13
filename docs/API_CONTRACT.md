@@ -209,8 +209,16 @@ One page for the whole day across every campaign in the plan, and one approval.
 | `POST` | `/api/day/approve` | `{date?, kind?, buckets?[], campaign_ids?[], agent_id?}` → **dials.** Empty `buckets` means every bucket; empty `campaign_ids` means every campaign with a plan waiting. |
 
 `status` is one of `no_campaigns` · `not_prepared` · `awaiting_approval` ·
-`nothing_to_dial` · `approved`, so the screen has one thing to switch on rather
-than four counters to interpret.
+`nothing_to_dial` · `part_prepared` · `approved`, so the screen has one thing to
+switch on rather than four counters to interpret.
+
+`part_prepared` is a wave where some campaigns have been acted on and at least
+one has no run at all — a campaign whose `_prepare_one` failed, or one armed
+after the wave was approved. It answered `approved` until 14 Sep 2026, which is
+the same lie `nothing_to_dial` was: the approved hero offers only the call log,
+so that campaign's leads had no route onto the clock. Offer Build on it;
+`_prepare_one` answers `already_ran` for the campaigns that already dialled and
+leaves their `autopilot_note` alone.
 
 `nothing_to_dial` is a wave that HAS been planned and holds nothing ready — every
 run `planned`, every one of them empty, which is what an afternoon looks like
