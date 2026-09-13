@@ -11,7 +11,7 @@ from engine.dispatcher import (
 )
 from engine.red_engine import (
     DEFAULT_CONFIG, SCHEDULE, SKIP_CADENCE, SKIP_DAILY_CAP, SKIP_MANUAL_ONLY,
-    SKIP_REACHED, Decision, decide,
+    SKIP_REACHED, DNP, EXCLUDED, HOLD, UNKNOWN, Decision, classify_disposition, decide,
 )
 
 # The config the live console actually ships, as opposed to the engine's bare
@@ -850,3 +850,86 @@ def test_a_third_call_is_refused_by_the_daily_cap():
     decision = decide(_afternoon(stage="did_not_pick", calls_today=2),
                       AFTERNOON, SHIPPED)
     assert decision.action == SKIP_DAILY_CAP
+
+
+# ---------------------------------------------------------------------------
+# chola_v137 taxonomy coverage
+# ---------------------------------------------------------------------------
+# The live disposition engine (taxonomy `chola_v137`, engine `cascade_v4`) emits
+# the leaf codes below. An unmapped slug classifies as UNKNOWN, and UNKNOWN is
+# the one class that vetoes a dial even on RED−1 and RED -- so a code this table
+# does not know is a lead that silently stops being called altogether. That is
+# what these two tests exist to catch, the day the taxonomy grows again.
+
+CHOLA_V137_LEAVES = (
+    "did_not_pick", "hung_up", "hung_up_intro", "voicemail_ivr", "agent_number",
+    "wrong_number", "other_language", "lost", "not_interested", "do_not_call",
+    "others", "call_back", "positive_followup", "lead_appointment_fixed",
+    "lead_cmrl_interested", "lead_directed_to_branch", "lead_premium_quotation",
+    "lead_link_sent_online", "already_paid_to_chola",
+    "requested_human_agent_connect", "needs_human_review",
+    # Not in the taxonomy JSON, but production `decisions` proves the pipeline
+    # emits them: the level-0 GROUP names as well as the leaves, plus two slugs
+    # the JSON does not mention at all.
+    "not_contacted", "review", "contacted", "policy_expired",
+    "telephony_failed", "redial_required", "follow_up_required",
+)
+
+
+@pytest.mark.parametrize("slug", CHOLA_V137_LEAVES)
+def test_every_live_disposition_is_mapped(slug):
+    """No leaf the classifier can emit may fall through to UNKNOWN."""
+    klass, _rule = classify_disposition(slug, DEFAULT_CONFIG)
+    assert klass != UNKNOWN, (
+        f"{slug!r} is unmapped, so leads carrying it are never dialled -- "
+        f"not even on RED−1 or RED. Add a DispositionRule for it.")
+
+
+@pytest.mark.parametrize("slug, expected, why", [
+    ("hung_up_intro", DNP,
+     "dropped during the intro: nothing was discussed, so chase it like its parent"),
+    ("others", DNP,
+     "the catch-all settles nothing, so it must not retire a live lead"),
+    # `needs_human_review` is chola_v137's `abstain` target and means exactly what
+    # the older `human_review` slug means. Sharing the class is the point: the
+    # same lead must not be dialled or held depending only on which pipeline
+    # version wrote the row.
+    ("needs_human_review", HOLD, "same state as human_review, so the same class"),
+    ("contacted", DNP, "reached, nothing committed -- the follow_up_required shape"),
+    ("not_contacted", DNP, "the group over did_not_pick/Hung_Up/Voicemail_IVR"),
+    ("review", HOLD, "the group whose only leaf is Needs_Human_Review"),
+    ("policy_expired", EXCLUDED, "the renewal window has closed"),
+])
+def test_the_codes_that_used_to_be_unmapped(slug, expected, why):
+    klass, _rule = classify_disposition(slug, DEFAULT_CONFIG)
+    assert klass == expected, why
+    assert klass == classify_disposition(
+        {"hung_up_intro": "hung_up", "others": "follow_up_required",
+         "needs_human_review": "human_review", "contacted": "follow_up_required",
+         "not_contacted": "did_not_pick", "review": "human_review",
+         "policy_expired": "lost"}[slug], DEFAULT_CONFIG)[0]
+
+
+def test_an_expired_policy_is_not_called_even_on_its_red_date():
+    """The operator's rule is "not called, and not on RED either".
+
+    EXCLUDED alone does not deliver that: RED−1 and RED override an exclusion
+    by design. Only `never_dial` survives them, so this pins both halves --
+    drop `policy_expired` from NEVER_DIAL and this test is what notices.
+    """
+    assert "policy_expired" in DEFAULT_CONFIG.never_dial
+    decision = decide(lead(stage="policy_expired", red=TODAY.isoformat()),
+                      NOW, SHIPPED)
+    assert decision.schedule is False
+
+
+def test_an_abstained_lead_is_still_called_on_its_red_date():
+    """The two mandatory days override a hold. They do not override UNKNOWN.
+
+    This is the whole reason `needs_human_review` had to be mapped: while it was
+    unmapped, a lead the classifier could not place lost its RED−1 and RED calls
+    -- the last two chances to save the policy.
+    """
+    decision = decide(lead(stage="needs_human_review", red=TODAY.isoformat()),
+                      NOW, SHIPPED)
+    assert decision.action == SCHEDULE and decision.schedule is True
