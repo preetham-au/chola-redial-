@@ -29,7 +29,7 @@ import { api } from '../lib/api';
 import { bandRange, bucketColor, friendlyBucket, n } from '../lib/domain';
 import { navigate, useAsync, useStore } from '../lib/store';
 import { Card, Empty, Fact, Modal, TypeToConfirm } from '../components/ui';
-import type { ApproveResult, Campaign, DayBucket, DayCampaign, DayView } from '../lib/types';
+import type { Agent, ApproveResult, Campaign, DayBucket, DayView } from '../lib/types';
 
 const WAVES = [
   { kind: 'auto', label: 'Morning' },
@@ -41,6 +41,16 @@ const WAVES = [
  *  would dial the ones the operator just excluded. */
 export const wireBuckets = (chosen: string[], all: string[]) =>
   chosen.length === all.length ? [] : chosen;
+
+/** What the Approve button sends. Split out because the button cannot be clicked
+ *  by the static check, and the agent is the one argument that must never be
+ *  wrong: approving the Hindi panel must not dial Tamil. `agent_id` is null on an
+ *  unscoped panel, which sends nothing and approves the whole day as before. */
+export const approveArgs = (
+  day: DayView,
+  buckets: string[],
+): [string, string, string[], number[], number | undefined] =>
+  [day.date, day.kind, buckets, [], day.agent_id ?? undefined];
 
 /** A campaign the server will accept into the daily plan. Disabled and hidden
  *  are both refused with a 409, so they are shown and not offered rather than
@@ -70,50 +80,30 @@ export function autopilotDiff(all: Campaign[], chosen: Set<number>) {
   };
 }
 
+/** One panel per agent that has campaigns. Falling back to a single unscoped
+ *  panel keeps this screen working on a backend without /api/agents, and on a
+ *  deployment that only ever had one agent. */
+export const panelsFor = (agents: Agent[] | null): (Agent | null)[] =>
+  agents?.length ? agents : [null];
+
 export function Today() {
   const date = useStore((s) => s.date);
   const setDate = useStore((s) => s.setDate);
-  const toast = useStore((s) => s.toast);
   const agentId = useStore((s) => s.agentId);
   const [kind, setKind] = useState('auto');
-  const day = useAsync(() => api.day(date, kind), [date, kind]);
-  const [picked, setPicked] = useState<string[] | null>(null);
-  const [approving, setApproving] = useState(false);
   const [picking, setPicking] = useState(false);
-  const [busy, setBusy] = useState('');
-
-  const d = day.data;
-
-  // Ticked buckets default to every bucket in the plan and follow it when the
-  // plan changes. Null means "not touched yet" so a re-plan cannot silently
-  // resurrect a bucket the operator just unticked.
-  const all = useMemo(() => (d?.buckets ?? []).map((b) => b.bucket), [d]);
-  useEffect(() => {
-    setPicked((p) => (p === null ? null : p.filter((b) => all.includes(b))));
-  }, [all]);
-  const chosen = picked ?? all;
-
-  const prepare = async () => {
-    setBusy('prepare');
-    try {
-      const res = await api.prepareDay(date, kind);
-      toast('ok', `Plan built: ${n(res.ready)} leads ready across ${res.prepared} campaigns. Nothing has been dialled.`);
-      day.reload();
-    } catch (e) {
-      toast('bad', (e as Error).message);
-    } finally {
-      setBusy('');
-    }
-  };
+  // Bumped when the picker re-plans the day. Every panel loads independently,
+  // so the one action that changes all of them has to reach all of them —
+  // otherwise saving the picker leaves each panel showing the plan it replaced.
+  const [rev, setRev] = useState(0);
+  const agents = useAsync(() => api.agents(), []);
 
   return (
     <div className="page grid" style={{ gap: 18 }}>
       <div className="page-head">
         <div>
           <span className="eyebrow">
-            Server clock {d?.now ?? '—'} IST · window {d?.window.start ?? '09:00'}–
-            {d?.window.end ?? '20:00'}
-            {d?.window_varies && ' · varies by campaign'}
+            {kind === 'auto' ? 'Morning band' : 'Afternoon band'}
           </span>
           <h1>The day</h1>
         </div>
@@ -139,11 +129,125 @@ export function Today() {
           <button className="btn btn-ghost" onClick={() => setPicking(true)}>
             <ListChecks /> Campaigns
           </button>
-          <button className="btn btn-ghost" onClick={() => day.reload()} aria-label="Refresh">
-            <RefreshCw /> Refresh
-          </button>
         </div>
       </div>
+
+      {panelsFor(agents.data).map((a) => (
+        <DayPanel
+          key={a?.agent_id ?? 'all'}
+          agent={a}
+          date={date}
+          kind={kind}
+          rev={rev}
+          onPick={() => setPicking(true)}
+        />
+      ))}
+
+      {picking && (
+        <PickCampaigns
+          // Keyed by agent: switching scope is a different picking session, and
+          // `ticked` is seeded once from what is armed. Without the remount it
+          // would carry the previous agent's ticks into the new list.
+          key={agentId}
+          date={date}
+          kind={kind}
+          onClose={() => setPicking(false)}
+          onDone={() => setRev((r) => r + 1)}
+        />
+      )}
+    </div>
+  );
+}
+
+/** The panel's own header: whose day this is, how many of THEIR leads are ready,
+ *  and the button that re-reads this one panel.
+ *
+ *  There is no screen-wide Refresh any more — one button cannot honestly reload
+ *  two panels that load independently of each other.
+ *
+ *  The heading is the label the SERVER gave the agent (AGENT_LANGUAGES). An
+ *  agent the deployment never labelled is headed by its name: "125 is Hindi" is
+ *  a fact about one deployment, and this client must never claim to know it. */
+export function PanelHead({
+  agent,
+  day,
+  onReload,
+}: {
+  agent: Agent | null;
+  day: DayView | null;
+  onReload: () => void;
+}) {
+  const who = agent ? agent.language ?? agent.name : null;
+  return (
+    <div className="row" style={{ gap: 8, alignItems: 'baseline' }}>
+      {who && <h2 style={{ margin: 0 }}>{who}</h2>}
+      <span className="eyebrow">
+        {agent?.language ? `${agent.name} · ` : ''}
+        {n(day?.totals.ready ?? 0)} ready
+      </span>
+      <button
+        className="btn btn-sm btn-ghost"
+        style={{ marginLeft: 'auto' }}
+        onClick={onReload}
+        aria-label={who ? `Refresh ${who}` : 'Refresh'}
+      >
+        <RefreshCw /> Refresh
+      </button>
+    </div>
+  );
+}
+
+/** One agent's half of the day. Each panel owns its own plan, its own bucket
+ *  ticks and its own Approve — two languages that used to be added together
+ *  into one number are now two decisions. */
+export function DayPanel({
+  agent,
+  date,
+  kind,
+  rev,
+  onPick,
+}: {
+  agent: Agent | null;
+  date: string;
+  kind: string;
+  /** Bumped by the shell when the picker re-plans the day. */
+  rev: number;
+  onPick: () => void;
+}) {
+  const toast = useStore((s) => s.toast);
+  const agentId = agent?.agent_id;
+  const day = useAsync(() => api.day(date, kind, agentId), [date, kind, agentId, rev]);
+  const [picked, setPicked] = useState<string[] | null>(null);
+  const [approving, setApproving] = useState(false);
+  const [busy, setBusy] = useState('');
+
+  const d = day.data;
+
+  // Ticked buckets default to every bucket in the plan and follow it when the
+  // plan changes. Null means "not touched yet" so a re-plan cannot silently
+  // resurrect a bucket the operator just unticked.
+  const all = useMemo(() => (d?.buckets ?? []).map((b) => b.bucket), [d]);
+  useEffect(() => {
+    setPicked((p) => (p === null ? null : p.filter((b) => all.includes(b))));
+  }, [all]);
+  const chosen = picked ?? all;
+
+  const prepare = async () => {
+    setBusy('prepare');
+    try {
+      const res = await api.prepareDay(date, kind, false, agentId);
+      toast('ok', `Plan built: ${n(res.ready)} leads ready across ${res.prepared} campaigns. Nothing has been dialled.`);
+      day.reload();
+    } catch (e) {
+      toast('bad', (e as Error).message);
+    } finally {
+      setBusy('');
+    }
+  };
+
+  return (
+    <div className="grid" style={{ gap: 18 }}>
+      <PanelHead agent={agent} day={d} onReload={() => day.reload()} />
 
       {day.error && (
         <div className="warnbox">
@@ -159,7 +263,7 @@ export function Today() {
         busy={busy}
         onPrepare={prepare}
         onApprove={() => setApproving(true)}
-        onPick={() => setPicking(true)}
+        onPick={onPick}
       />
 
       {d && d.status !== 'no_campaigns' && (
@@ -170,23 +274,10 @@ export function Today() {
         </>
       )}
 
+      {/* Outside the guard above, deliberately: an agent whose every campaign is
+          paused IS a day with no campaigns, and "held back" is the only thing on
+          the panel that says why. */}
       {d && d.stopped.length > 0 && <Stopped day={d} />}
-
-      {picking && (
-        <PickCampaigns
-          // Keyed by agent: switching scope is a different picking session, and
-          // `ticked` is seeded once from what is armed. Without the remount it
-          // would carry the previous agent's ticks into the new list.
-          key={agentId}
-          date={date}
-          kind={kind}
-          // What is armed right now across BOTH agents. The picker is scoped to
-          // one, so this is how it can still say what the other one is running.
-          planned={d?.campaigns ?? []}
-          onClose={() => setPicking(false)}
-          onDone={() => day.reload()}
-        />
-      )}
 
       {approving && d && (
         <ApproveDay
@@ -499,13 +590,11 @@ function PickCampaigns({
   kind,
   onClose,
   onDone,
-  planned,
 }: {
   date: string;
   kind: string;
   onClose: () => void;
   onDone: () => void;
-  planned: DayCampaign[];
 }) {
   const toast = useStore((s) => s.toast);
   const agentId = useStore((s) => s.agentId);
@@ -522,16 +611,13 @@ function PickCampaigns({
     () => (agentId === null ? Promise.resolve([]) : api.campaigns(agentId, true)),
     [agentId],
   );
-  // The other agent's campaigns that are armed for today, straight from the day
-  // view the parent already loaded — no second request to ask the same thing.
-  const elsewhere = useMemo(
-    () => planned.filter((c) => c.agent_id !== agentId),
-    [planned, agentId],
-  );
-  const elsewhereAgents = useMemo(
-    () => [...new Set(elsewhere.map((c) => c.agent_id))].sort((a, b) => a - b),
-    [elsewhere],
-  );
+  // What is armed right now across EVERY agent. Read here rather than handed
+  // down: the day screen no longer holds one plan spanning both languages, it
+  // holds one per panel, and the warning below is about the ones this picker
+  // cannot see. Only fetched while the modal is open.
+  const plan = useAsync(() => api.day(date, kind), [date, kind]);
+  const elsewhere = (plan.data?.campaigns ?? []).filter((c) => c.agent_id !== agentId);
+  const elsewhereAgents = [...new Set(elsewhere.map((c) => c.agent_id))].sort((a, b) => a - b);
   const [ticked, setTicked] = useState<Set<number> | null>(null);
   const [filter, setFilter] = useState('');
   const [saving, setSaving] = useState(false);
@@ -927,7 +1013,7 @@ export function ApproveDay({
   const submit = async () => {
     setBusy(true);
     try {
-      setRes(await api.approveDay(day.date, day.kind, buckets));
+      setRes(await api.approveDay(...approveArgs(day, buckets)));
     } catch (e) {
       toast('bad', (e as Error).message);
     } finally {
@@ -947,7 +1033,7 @@ export function ApproveDay({
         onClose={done}
         footer={<button className="btn btn-primary" onClick={done}>Done</button>}
       >
-        <DialResult res={res} buckets={buckets} onChange={setRes} />
+        <DialResult res={res} buckets={buckets} agentId={day.agent_id ?? undefined} onChange={setRes} />
       </Modal>
     );
   }
@@ -1048,10 +1134,13 @@ const WHY: Record<string, string> = {
 export function DialResult({
   res,
   buckets,
+  agentId,
   onChange,
 }: {
   res: ApproveResult;
   buckets: string[];
+  /** The panel this result came from. A retry must stay inside it. */
+  agentId?: number;
   onChange: (next: ApproveResult) => void;
 }) {
   const toast = useStore((s) => s.toast);
@@ -1073,7 +1162,7 @@ export function DialResult({
   const retryCampaigns = async () => {
     setBusy('day');
     try {
-      const again = await api.approveDay(res.date, res.kind, buckets, restartable);
+      const again = await api.approveDay(res.date, res.kind, buckets, restartable, agentId);
       // Every campaign being re-run returned before `_commit`, so it contributed
       // nothing to these totals the first time: the merge is pure addition.
       const byId = new Map(again.campaigns.map((c) => [c.campaign_id, c]));

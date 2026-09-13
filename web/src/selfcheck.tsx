@@ -9,7 +9,18 @@ import { AgentChip, AgentPauseConfirm, AgentSwitcher } from './components/AgentB
 import { CampaignPicker } from './App';
 import { BucketOffWhy } from './screens/Dashboard';
 import { TestCallResultView, TestNumberTable, TriggerConfirm } from './screens/TestCall';
-import { ApproveDay, DialResult, Headline, autopilotDiff, closesAt, wireBuckets } from './screens/Today';
+import {
+  ApproveDay,
+  DialResult,
+  Headline,
+  PanelHead,
+  Today,
+  approveArgs,
+  autopilotDiff,
+  closesAt,
+  panelsFor,
+  wireBuckets,
+} from './screens/Today';
 import { Row as LogRow } from './screens/CallLog';
 import { selectionSplit } from './screens/CampaignVisibility';
 import { ApiError, api, isOffline, retryLive } from './lib/api';
@@ -30,10 +41,11 @@ import {
   BUCKET_ORDER,
   configurableBuckets,
   effectiveDispositions,
+  n,
   narrowedBuckets,
   passState,
 } from './lib/domain';
-import type { ApproveResult, Campaign, Config, TestCallResult } from './lib/types';
+import type { Agent, ApproveResult, Campaign, Config, TestCallResult } from './lib/types';
 
 const ROWS = configurableBuckets(mockConfig.frequency_table);
 let cfg: Config = structuredClone(mockConfig);
@@ -369,6 +381,75 @@ ok(
   const none = modal({}, [], []);
   ok('unticking every bucket blocks the approve button rather than dialling all of them',
      has(none, 'disabled=""') && has(none, 'nothing to dial'));
+}
+
+// --- one panel per agent: two languages, two decisions ----------------------
+//
+// Agents 125 and 127 used to share one plan, one "ready" number and one Approve
+// button, so approving one language approved the other with it. Each panel now
+// reads its own agent's day. Its heading is the label the SERVER gave that
+// agent (AGENT_LANGUAGES) — a language name written into this client would be a
+// fact about one deployment dressed up as a fact about the console.
+{
+  const DATE = '2026-09-13';
+  const labelled = (id: number, language: string | null): Agent => ({
+    ...agentsFrom(mockCampaigns).find((a) => a.agent_id === id)!,
+    language,
+  });
+  const head = (agent: Agent | null, day = agent ? mockDay(DATE, 'auto', agent.agent_id) : null) =>
+    renderToStaticMarkup(<PanelHead agent={agent} day={day} onReload={() => {}} />);
+
+  // The fixture arms the same first two campaigns for every agent, so the two
+  // counts would coincide by accident and "its own, not the sum" would prove
+  // nothing. Pausing one of 127's makes them differ; restored straight after,
+  // so every check below this one still sees the fixture it was written for.
+  const six = mockCampaigns.find((c) => c.id === 6)!;
+  six.paused = true;
+  const hindi = head(labelled(125, 'Hindi'));
+  const tamil = head(labelled(127, 'Tamil'));
+  const hin = mockDay(DATE, 'auto', 125).totals.ready;
+  const tam = mockDay(DATE, 'auto', 127).totals.ready;
+  six.paused = false;
+
+  ok('the two agents really are having different days, or nothing below is tested',
+     hin > 0 && tam > 0 && hin !== tam);
+  ok('each agent gets its own panel, headed by the label the server gave it',
+     has(hindi, '>Hindi</h2>') && has(tamil, '>Tamil</h2>'));
+  ok('a panel counts its own agent’s leads…',
+     has(hindi, `${n(hin)} ready`) && has(tamil, `${n(tam)} ready`));
+  ok('…and never the two languages added together',
+     !has(hindi + tamil, `${n(hin + tam)} ready`));
+  ok('the heading is whatever the server labelled the agent, not a name this client knows',
+     has(head(labelled(125, 'Kannada')), '>Kannada</h2>'));
+  ok('an agent the deployment never labelled is headed by its name, not an invented language',
+     has(head(labelled(125, null)), '>Agent 125</h2>') && !has(head(labelled(125, null)), 'Hindi'));
+
+  ok('one panel per agent, from the server’s list and nowhere else',
+     panelsFor(agentsFrom(mockCampaigns)).length === agents.length);
+  ok('a backend without /api/agents still gets a day — one unscoped panel, not none',
+     panelsFor(null).length === 1 && panelsFor(null)[0] === null);
+  ok('and so does a deployment whose agent list comes back empty',
+     panelsFor([]).length === 1 && panelsFor([])[0] === null);
+  ok('that unscoped panel invents no heading at all', !has(head(null), '<h2'));
+
+  // Each panel's Refresh re-reads that panel. A single screen-wide one could
+  // not honestly reload two panels that load independently, so there is none.
+  ok('every panel carries its own Refresh, named for the agent it reloads',
+     has(hindi, 'aria-label="Refresh Hindi"') && has(tamil, 'aria-label="Refresh Tamil"'));
+
+  // The button itself cannot be clicked here, so what it would SEND is checked
+  // instead. This is the only call that reaches Formi: getting the agent wrong
+  // dials a language nobody approved.
+  ok('approving a panel dials that agent and nobody else',
+     approveArgs(mockDay(DATE, 'auto', 127), [])[4] === 127);
+  ok('an unscoped panel still approves the whole day, exactly as before scoping',
+     approveArgs(mockDay(DATE, 'auto'), [])[4] === undefined);
+
+  const screen = renderToStaticMarkup(<Today />);
+  ok('the day screen renders its panels before any plan has arrived',
+     has(screen, '<h1>The day</h1>') && has(screen, 'Reading today’s plan'));
+  ok('and holds no Approve button of its own — approving is per agent',
+     !has(screen, 'Approve'));
 }
 
 // --- the dial result: what went out, and what did not -----------------------
