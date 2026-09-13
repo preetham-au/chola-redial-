@@ -862,6 +862,11 @@ def approve_day(body: ApproveBody = Body(default_factory=ApproveBody)) -> dict[s
             "dry_run": dry_run(), "buckets": buckets or "all",
             "approved": sum(1 for r in results if r["status"] == "approved"),
             "posted": posted, "failed": sum(r.get("failed", 0) for r in results),
+            # `dropped` is on every row now, not just the approved ones: a
+            # campaign that never reached `_commit` still held leads, and scoring
+            # it zero is what made a wave of 12 closed windows read "0 scheduled ·
+            # 0 not scheduled" over 2,000 leads. See `_unspent`.
+            #
             # `dropped` is already the whole of it. `_commit` adds the slots it
             # retired for being in the past and the strays it refused for leaving
             # the band to the count `_write_run` left behind for the leads
@@ -873,6 +878,21 @@ def approve_day(body: ApproveBody = Body(default_factory=ApproveBody)) -> dict[s
             # reason a slot does not go out.
             "not_dialled": sum(r.get("dropped", 0) for r in results),
             "campaigns": results}
+
+
+def _unspent(run: Optional[sqlite3.Row]) -> int:
+    """Leads this run was owed a call for and did not send.
+
+    Only a run still `planned` has any: its `slots` plan items are all undialled
+    and its `dropped` is the leads the plan itself shed, which is the same
+    "did not dial" `_commit` reports on the approved path. A run in any other
+    state was acted on by an earlier approve that reported its own numbers, and a
+    run that does not exist holds no leads to count -- an unprepared campaign is
+    visible as `ready` on the day view, not here.
+    """
+    if run is None or run["status"] != "planned":
+        return 0
+    return int(run["slots"]) + int(run["dropped"])
 
 
 def _approve_one(conn: sqlite3.Connection, campaign: sqlite3.Row, day: date, kind: str,
@@ -901,11 +921,19 @@ def _approve_one(conn: sqlite3.Connection, campaign: sqlite3.Row, day: date, kin
         if status != "already_committed":
             _note(conn, campaign["id"],
                   f"{day} {kind}: NOT dialled — {status}" + (f": {detail}" if detail else ""))
+        # `dropped` is the day's "not scheduled" number, and only the approved
+        # return ever carried one -- so a 19:45 wave where every campaign answers
+        # `window_closed` told the operator 0 leads had missed out over 2,000 that
+        # had. Wrong in the reassuring direction, which is the worst of the two.
+        extra.setdefault("dropped", _unspent(plan))
         return {**out, "status": status, **({"detail": detail} if detail else {}), **extra}
 
     run = conn.execute(
         "SELECT * FROM runs WHERE campaign_id=? AND run_date=? AND kind=? ORDER BY id DESC",
         (campaign["id"], day.isoformat(), kind)).fetchone()
+    # The plan `failing` should answer for. `_write_run` below replaces the row,
+    # and a failure after that point is about the FRESH plan, not the shelved one.
+    plan = run
     if run is None:
         return failing("not_prepared")
     if run["status"] != "planned":
@@ -934,6 +962,7 @@ def _approve_one(conn: sqlite3.Connection, campaign: sqlite3.Row, day: date, kin
         run_id = _write_run(conn, campaign, day, kind, cfg["version"], pairs, red, dcfg,
                             evaluated=len(leads), note=note, floor_min=floor, buckets=buckets)
         fresh = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+        plan = fresh
         if not fresh["slots"]:
             return failing("nothing_to_dial", run_id=run_id, posted=0)
         result = _commit(conn, fresh, campaign, "approving", source="approve")

@@ -1674,11 +1674,18 @@ def test_a_day_approve_counts_each_lead_it_did_not_dial_exactly_once(client, pin
                        json={"date": today, "campaign_ids": [campaign_id]}).json()
 
     one = next(c for c in body["campaigns"] if c["campaign_id"] == campaign_id)
-    if one["status"] != "approved":
-        # Every remaining slot in the past is a 409 by design; a plan that fits
-        # entirely before the cutoff has none to spare, and that is not this test.
-        pytest.skip(f"the fresh plan held nothing still dialable: {one}")
     try:
+        if one["status"] != "approved":
+            # Every remaining slot in the past is a 409 by design; a plan that
+            # fits entirely before the cutoff has none to spare. This branch used
+            # to `pytest.skip`, which is how the count came to be asserted ONLY
+            # for a campaign that dialled -- and the campaigns that dial are the
+            # only ones it was ever right for. A campaign that dialled nothing is
+            # holding its whole plan, and the day has to say so.
+            assert one["dropped"] == body["not_dialled"] > 0, (
+                f"a campaign that never reached the dialler still has to be "
+                f"counted: not_dialled={body['not_dialled']}, {one}")
+            return
         items = _items(client, one["run_id"])
         missed = [i for i in items if i["status"] in ("expired", "skipped")]
         dialled = [i for i in items if i["status"] == "simulated"]
@@ -1688,7 +1695,40 @@ def test_a_day_approve_counts_each_lead_it_did_not_dial_exactly_once(client, pin
             f"the day says {body['not_dialled']} leads were not scheduled, but only "
             f"{len(missed)} of its {len(items)} slots did not dial")
     finally:
-        _drop_run(one["run_id"])
+        if one.get("run_id"):
+            _drop_run(one["run_id"])
+
+
+def test_a_day_approve_counts_the_leads_of_a_campaign_that_never_dialled(client, pin_clock,
+                                                                         monkeypatch):
+    """A closed window is not zero leads; it is every lead, un-dialled.
+
+    `not_dialled` summed `dropped`, which only the APPROVED return carried. Every
+    other outcome -- `window_closed`, `not_prepared`, `already_*`, `error` --
+    answered with no such key, so `.get(..., 0)` scored it zero however many
+    leads it was holding. A 19:45 afternoon wave is past every campaign's
+    `end_min`, so all twelve answer `window_closed` and the status bar the
+    operator asked for read "0 scheduled · 0 not scheduled" over 2,000 leads that
+    were never called.
+
+    The morning band shuts at 13:30, so approving the morning wave at 14:00 is
+    that state exactly, with nothing else pushed: `_approve_one` returns before
+    it re-plans and before it dials.
+    """
+    monkeypatch.setitem(day_module.WAVE_BAND, "auto", (None, parse_hhmm("13:30")))
+    today = pin_clock(14).date().isoformat()
+    campaign_id = _arm(1)[0]
+    _seed_run(campaign_id, today, "auto", "planned", 7)
+
+    body = client.post("/api/day/approve",
+                       json={"date": today, "campaign_ids": [campaign_id]}).json()
+
+    one = next(c for c in body["campaigns"] if c["campaign_id"] == campaign_id)
+    assert one["status"] == "window_closed", one
+    assert body["posted"] == 0 and body["approved"] == 0
+    assert body["not_dialled"] == 7, (
+        f"7 planned leads went nowhere and the day says {body['not_dialled']} "
+        f"were not scheduled: {one}")
 
 
 # ---------------------------------------------------------------------------
