@@ -212,6 +212,18 @@ def _agent_languages() -> dict[int, str]:
         if not (agent.strip().isdigit() and label.strip()):
             raise ValueError(f"AGENT_LANGUAGES entry {part!r} is not `id:Language`")
         agent_id, label = int(agent), label.strip()
+        # The LABEL has to look like a language, not merely be non-empty. Only
+        # the comma splits entries, so a semicolon -- the likeliest hand-edit slip
+        # in this variable -- swallows the rest of the line: `125:Hindi;127:Tamil`
+        # booted clean as `{125: 'Hindi;127:Tamil'}`, labelling Hindi's agent with
+        # the whole string and leaving 127 unlabelled, silently. Letters, spaces
+        # and hyphens carry every language name a two-agent console can need
+        # ("Tamil", "Brazilian Portuguese", "Serbo-Croatian"); a separator or a
+        # digit inside a label means the operator typed the list wrong.
+        if not label.replace(" ", "").replace("-", "").isalpha():
+            raise ValueError(f"AGENT_LANGUAGES gives agent {agent_id} the label "
+                             f"{label!r}, which is not a language name -- entries are "
+                             f"separated by COMMAS, as `125:Hindi,127:Tamil`")
         # A repeated id is a contradiction, not an override. `125:Hindi,125:Tamil`
         # last-wins into "125 is Tamil" and boots clean -- on the one variable
         # whose whole justification is that a wrong label means a script read to

@@ -116,7 +116,13 @@ export const mockDay = (date: string, kind: string, agent_id?: number): DayView 
     window: { start: '09:00', end: '20:00' },
     window_varies: false,
     window_open: true,
-    status: 'awaiting_approval',
+    // What the server answers, not a constant: `no_campaigns` when the scope
+    // matches nothing (api/day.py's first branch) and `awaiting_approval`
+    // otherwise, since every campaign here is `planned` with leads ready. Task 4
+    // builds one panel per agent, so the empty panel is a state it renders on
+    // day one -- offline it was showing as a day awaiting an approval that has
+    // nothing to approve.
+    status: campaigns.length ? 'awaiting_approval' : 'no_campaigns',
     totals: { campaigns: campaigns.length, ready, posted: 0, failed: 0, dropped: 0 },
     capacity_before_close: ready,
     buckets: [

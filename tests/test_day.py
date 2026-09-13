@@ -472,10 +472,17 @@ def test_wave_boundary_set_in_the_env_file_reaches_the_band_logic(client, tmp_pa
 
 
 # WAVE_BOUNDARY -> may the API boot on it? `None` is the variable unset.
-# Unpadded is legal and has always booted; only a minute field outside 00-59 or a
-# boundary outside the dialling hours is impossible.
+# Unpadded is legal and has always booted. Everything else here is a time nobody
+# typed: `int()` eats a sign, leading zeros and any Unicode digit, so `+13:30`,
+# `013:30` and `13:3` ending in an Arabic-Indic zero all used to boot as 13:30
+# and `13:005` as 13:05 -- the operator sets one boundary and the day runs on
+# another. `09:00`/`20:00` sit ON the dialling edges, which gives one wave the
+# whole day and the other an empty band.
 BOUNDARY_BOOTS = ((None, True), ("13:30", True), ("9:30", True), ("13:5", True),
-                  ("13:70", False), ("00:00", False), ("25:00", False))
+                  ("13:70", False), ("00:00", False), ("25:00", False),
+                  ("+13:30", False), ("013:30", False), ("13:005", False),
+                  ("13:3٠", False), ("1330", False), ("13.30", False),
+                  ("13:30:00", False), ("09:00", False), ("20:00", False))
 
 
 def test_the_wave_boundary_guard_refuses_only_impossible_times(client, tmp_path):
@@ -520,10 +527,13 @@ def test_the_wave_boundary_guard_refuses_only_impossible_times(client, tmp_path)
     # A .env that does not exist, so the unset case is genuinely unset: `load_env`
     # uses setdefault, and a file carrying WAVE_BOUNDARY would answer for it.
     env = {k: v for k, v in os.environ.items() if k != "WAVE_BOUNDARY"}
-    env.update(REDIAL_ENV_FILE=str(tmp_path / "absent.env"), PYTHONPATH=str(root))
+    # UTF-8 on both ends of the pipe: one case is a non-ASCII digit, and on a
+    # Windows console the child would die encoding its own answer.
+    env.update(REDIAL_ENV_FILE=str(tmp_path / "absent.env"), PYTHONPATH=str(root),
+               PYTHONIOENCODING="utf-8")
 
     out = subprocess.run([sys.executable, str(probe)], cwd=str(root), env=env,
-                         capture_output=True, text=True)
+                         capture_output=True, text=True, encoding="utf-8")
 
     assert out.returncode == 0, out.stderr
     seen = dict(line.split("\t", 1) for line in out.stdout.splitlines() if "\t" in line)
@@ -677,11 +687,22 @@ def test_day_scopes_a_hidden_campaign_that_is_still_dialling(client, pin_clock):
         conn.commit()
 
     scoped = {c["id"] for c in client.get(f"/api/day?agent_id={first}").json()["stopped"]}
+    own = {c["id"] for c in client.get(f"/api/day?agent_id={second}").json()["stopped"]}
     whole = {c["id"] for c in client.get("/api/day").json()["stopped"]}
 
     assert second_c in whole, "an unscoped day must still warn about it"
     assert second_c not in scoped, \
         "a scoped panel must not warn about another agent's hidden campaign"
+    # The half that actually holds the warning up. Absence from the OTHER panel
+    # is also what a warning that reaches NO panel looks like: bind `agent_id=?`
+    # to the timestamp instead of the agent and this query returns nothing for
+    # every scoped fetch, with the whole suite still green. Task 4's UI is always
+    # scoped, so that is live calls with nothing on any screen -- the one thing
+    # this warning exists to prevent.
+    assert second_c in own, (
+        f"campaign {second_c} is hidden and still putting calls on Formi's clock, "
+        f"and agent {second}'s own panel does not warn about it -- scoped is the "
+        f"only way Task 4 ever asks")
 
 
 def test_day_scopes_the_stranded_warning_to_the_agent(client):
@@ -807,12 +828,17 @@ def test_armed_helper_leaves_the_unscoped_clause_exactly_as_it_was(client):
     for, so a helper that quietly appended `AND agent_id=?` with nothing to bind
     would fail at the driver rather than return the wrong rows.
     """
-    from api.day import _armed
+    from api.day import _armed, _scope
 
     assert _armed() == (ARMED, [])
     assert _armed(None) == (ARMED, [])
     where, params = _armed(125)
-    assert where == f"{ARMED} AND agent_id=?" and params == [125]
+    assert where == f"({ARMED}) AND agent_id=?" and params == [125]
+    # The brackets are the point, not decoration: `a=1 OR b=1 AND agent_id=?`
+    # binds the AND to the last branch alone, so scoping a clause with a
+    # top-level OR would WIDEN it -- the opposite of what this helper is for.
+    assert _scope("a=1 OR b=1", 125)[0] == "(a=1 OR b=1) AND agent_id=?", \
+        "_scope must parenthesise the clause it narrows"
 
 
 # ---------------------------------------------------------------------------
@@ -876,6 +902,38 @@ def test_a_malformed_agent_language_is_refused_rather_than_guessed(client, monke
 
     monkeypatch.setenv("AGENT_LANGUAGES", "125:Hindi,127")
     with pytest.raises(ValueError, match="127"):
+        core.list_agents()
+
+
+@pytest.mark.parametrize("value,label", [
+    # The whole tail of the line becomes one agent's label: 125 is labelled
+    # "Hindi;127:Tamil" and 127 is left unlabelled, silently. A semicolon for a
+    # comma is the likeliest hand-edit slip in this variable.
+    ("125:Hindi;127:Tamil", "Hindi;127:Tamil"),
+    ("125:Hindi:Extra", "Hindi:Extra"),
+])
+def test_a_label_that_is_not_a_language_is_refused(client, monkeypatch, value, label):
+    """Non-empty was not enough: the label has to LOOK like a language.
+
+    This is the variable whose entire justification is that a wrong label means a
+    script read to the wrong cohort of customers, and both of these booted clean.
+    """
+    import api.routes_core as core
+
+    monkeypatch.setenv("AGENT_LANGUAGES", value)
+    with pytest.raises(ValueError) as raised:
+        core.list_agents()
+
+    assert "125" in str(raised.value) and label in str(raised.value), \
+        f"the refusal must name the agent and the offending label: {raised.value}"
+
+
+def test_a_padded_duplicate_agent_id_is_still_a_duplicate(client, monkeypatch):
+    """`0125` and `125` are the same agent, and the label guard must not mask it."""
+    import api.routes_core as core
+
+    monkeypatch.setenv("AGENT_LANGUAGES", "0125:Tamil,125:Hindi")
+    with pytest.raises(ValueError, match="twice"):
         core.list_agents()
 
 
@@ -1046,3 +1104,19 @@ def test_a_malformed_agent_language_stops_the_api_at_boot(client, tmp_path):
 
     assert bad_id.returncode != 0, "a non-numeric agent id booted"
     assert "AGENT_LANGUAGES" in bad_id.stderr and "x:Hindi" in bad_id.stderr, bad_id.stderr
+
+    # Only the comma splits entries, so this labels 125 with the rest of the
+    # line and leaves 127 unlabelled -- the wrong-language failure this variable
+    # exists to prevent, reached by the likeliest typo in it.
+    separator = _boot(tmp_path, "AGENT_LANGUAGES=125:Hindi;127:Tamil")
+
+    assert separator.returncode != 0, (
+        "a semicolon-separated AGENT_LANGUAGES booted; agent 125 is now labelled "
+        "'Hindi;127:Tamil' and agent 127 has no language at all")
+    assert "AGENT_LANGUAGES" in separator.stderr and "Hindi;127:Tamil" in separator.stderr, \
+        separator.stderr
+
+    good = _boot(tmp_path, "AGENT_LANGUAGES=125:Hindi,127:Tamil")
+
+    assert good.returncode == 0, (
+        f"the documented form must still boot: {good.stderr}")

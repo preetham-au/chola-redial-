@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sqlite3
 from dataclasses import replace
 from datetime import date, timedelta
@@ -84,14 +85,25 @@ WAVE_BOUNDARY = parse_hhmm(_WAVE_BOUNDARY_RAW, "WAVE_BOUNDARY")
 # refusing it. A boundary quietly set to a time nobody typed is the same failure
 # as one set outside the hours, and it is the likelier typo of the two.
 #
-# The MINUTE FIELD is what has to be checked, not the round trip. Comparing
-# `hhmm(WAVE_BOUNDARY)` against the raw string also refused `9:30` and `13:5` --
-# unpadded, unambiguous, and booting fine before this guard existed. A guard that
-# stops a live dialler on a legal value is worse than the bug it prevents. The
-# hour needs no check of its own: `parse_hhmm` bounds the total at 24:00 and the
-# dialling-hours check below is stricter still.
-_WAVE_BOUNDARY_MM = _WAVE_BOUNDARY_RAW.partition(":")[2].strip()
-if not (_WAVE_BOUNDARY_MM.isdigit() and int(_WAVE_BOUNDARY_MM) < 60):
+# The SHAPE of the whole value is checked, in ASCII digits, because `int()` is
+# far more forgiving than an operator typing a clock time means it to be: it eats
+# a sign (`+13:30`), leading zeros (`013:30`, `13:005`) and any Unicode digit --
+# `13:3` ending in an Arabic-Indic zero is `isdigit()` to Python and 810 minutes
+# to `int()`. Every one of those booted as a time nobody typed. Checking only the
+# minute field left all four through.
+#
+# Unpadded stays legal: `9:30` and `13:5` name a real time and booted fine before
+# any of these guards existed. Comparing `hhmm(WAVE_BOUNDARY)` against the raw
+# string refused them, and a guard that stops a live dialler on a legal value is
+# worse than the bug it prevents. The hour needs no range check of its own:
+# `parse_hhmm` bounds the total at 24:00 and the dialling-hours check below is
+# stricter still.
+if not re.fullmatch(r"[0-9]{1,2}:[0-9]{1,2}", _WAVE_BOUNDARY_RAW):
+    raise ValueError(f"WAVE_BOUNDARY must be HH:MM in plain ASCII digits, got "
+                     f"{_WAVE_BOUNDARY_RAW!r} (it would be read as "
+                     f"{hhmm(WAVE_BOUNDARY)})")
+_WAVE_BOUNDARY_MM = _WAVE_BOUNDARY_RAW.partition(":")[2]
+if int(_WAVE_BOUNDARY_MM) >= 60:
     raise ValueError(f"WAVE_BOUNDARY must be HH:MM, got {_WAVE_BOUNDARY_RAW!r} "
                      f"(minutes {_WAVE_BOUNDARY_MM!r} are not 00-59; it would be "
                      f"read as {hhmm(WAVE_BOUNDARY)})")
@@ -146,8 +158,14 @@ ARMED = "autopilot=1 AND enabled=1 AND paused=0 AND hidden=0"
 def _scope(where: str, agent_id: Optional[int]) -> tuple[str, list[Any]]:
     """`where` narrowed to one agent, or left exactly as it was. One place, so a
     roster and the `stopped` list beside it cannot end up scoped differently.
+
+    `where` is PARENTHESISED before the AND. Both of today's callers are safe
+    without it -- ARMED is all-AND, STOPPED is already bracketed -- but a future
+    clause holding a top-level OR would bind the AND to its last branch only, and
+    the scoping call would WIDEN the roster instead of narrowing it, silently and
+    in the one direction this helper exists to make impossible.
     """
-    return (where, []) if agent_id is None else (f"{where} AND agent_id=?", [agent_id])
+    return (where, []) if agent_id is None else (f"({where}) AND agent_id=?", [agent_id])
 
 
 def _armed(agent_id: Optional[int] = None) -> tuple[str, list[Any]]:
