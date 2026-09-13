@@ -5,8 +5,9 @@ from datetime import timedelta
 
 import pytest
 
-from api.day import ARMED, STRANDED_DAYS
+from api.day import ARMED, STRANDED_DAYS, WAVE_BOUNDARY, _band
 from api.db import now_ist, session
+from engine.dispatcher import DispatchConfig
 
 
 @pytest.fixture(autouse=True)
@@ -205,3 +206,43 @@ def test_stranded_still_looks_back_when_a_far_future_day_is_requested(client):
     assert any(s["run_date"] == yesterday for s in body["stranded"]
                if s["campaign_id"] == campaign_id), \
         "yesterday's undialled plan is stranded whatever date the screen asks for"
+
+
+# ---------------------------------------------------------------------------
+# Wave bands
+# ---------------------------------------------------------------------------
+# `_band` is pure, but the autouse fixtures above are not: both open the DB, and
+# only the session-scoped `client` fixture creates it. These take `client` so the
+# section can be run on its own (`-k band`) rather than only after a test that
+# happens to have built the database first.
+
+def test_band_clips_morning_to_the_first_half_of_the_day(client):
+    dcfg = DispatchConfig(start_min=9 * 60, end_min=20 * 60)
+    band = _band("auto", dcfg)
+    assert band.start_min == 9 * 60, "morning keeps the campaign's own opening"
+    assert band.end_min == WAVE_BOUNDARY, "morning must stop at the boundary"
+
+
+def test_band_clips_afternoon_to_the_second_half_of_the_day(client):
+    dcfg = DispatchConfig(start_min=9 * 60, end_min=20 * 60)
+    band = _band("auto_pm", dcfg)
+    assert band.start_min == WAVE_BOUNDARY, "afternoon must not start before the boundary"
+    assert band.end_min == 20 * 60, "afternoon keeps the campaign's own close"
+
+
+def test_band_never_widens_a_narrow_campaign_window(client):
+    """A campaign that shuts at 13:00 has no afternoon at all."""
+    dcfg = DispatchConfig(start_min=10 * 60, end_min=13 * 60)
+    morning = _band("auto", dcfg)
+    assert (morning.start_min, morning.end_min) == (10 * 60, 13 * 60), \
+        "the band must never open earlier or close later than the campaign itself"
+    afternoon = _band("auto_pm", dcfg)
+    assert afternoon.start_min >= afternoon.end_min, \
+        "an empty band is how 'this wave cannot run here' is expressed"
+
+
+def test_band_leaves_other_config_untouched(client):
+    dcfg = DispatchConfig(start_min=9 * 60, end_min=20 * 60, max_per_minute=7, max_per_run=99)
+    band = _band("auto", dcfg)
+    assert band.max_per_minute == 7 and band.max_per_run == 99
+    assert band.red_priority == dcfg.red_priority

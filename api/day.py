@@ -24,14 +24,18 @@ scheduled; the rest is not dialled today and comes back in tomorrow's plan.
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
+from dataclasses import replace
 from datetime import date, timedelta
 from typing import Any, Optional
 
 from fastapi import APIRouter, Body, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from engine.dispatcher import DEFAULT_RED_PRIORITY, hhmm, parse_hhmm, red_rank
+from engine.dispatcher import (
+    DEFAULT_RED_PRIORITY, DispatchConfig, hhmm, parse_hhmm, red_rank,
+)
 
 from .db import dry_run, now_ist, session
 from .routes_core import (
@@ -58,6 +62,50 @@ MORNING, AFTERNOON = "auto", "auto_pm"
 KINDS = (MORNING, AFTERNOON)
 
 WAVE_LABEL = {MORNING: "morning", AFTERNOON: "afternoon"}
+
+# Where the morning stops and the afternoon starts. One boundary for the whole
+# console, not one per campaign: the screen has to be able to SAY which band it
+# is approving ("the morning band, 09:00-13:30"), and a per-campaign boundary
+# makes that sentence unwritable.
+#
+# Until 13 Sep 2026 the two waves were labels with no clock behind them. Approve
+# re-plans from the current minute, so the morning wave approved at noon dialled
+# into the evening -- on 12 Sep the `auto` wave's calls landed between 12:00 and
+# 20:00 and the `auto_pm` wave's between 13:00 and 20:00, which is the same day
+# twice. The band is what makes the name true.
+#
+# 13:30 sits between autopilot's own two preparation times (AUTOPILOT_AM 10:00,
+# AUTOPILOT_PM 15:00, see autopilot.py) so each wave is still prepared inside the
+# band it dials into.
+WAVE_BOUNDARY = parse_hhmm((os.environ.get("WAVE_BOUNDARY") or "13:30").strip())
+WAVE_BAND = {MORNING: (None, WAVE_BOUNDARY), AFTERNOON: (WAVE_BOUNDARY, None)}
+
+
+def _clip(start: int, end: int, kind: str) -> tuple[int, int]:
+    """(start, end) clipped to this wave's half of the day. Never widened.
+
+    `None` on a side of the band means "this wave does not move that edge", so
+    the campaign's own opening (morning) or close (afternoon) is kept.
+    """
+    lo, hi = WAVE_BAND[kind]
+    return (max(start, lo if lo is not None else 0),
+            min(end, hi if hi is not None else 24 * 60))
+
+
+def _band(kind: str, dcfg: DispatchConfig) -> DispatchConfig:
+    """The campaign's own dial window, clipped to this wave's half of the day.
+
+    Narrowing the config is the whole implementation: `dispatch` already receives
+    a DispatchConfig and honours start_min/end_min, so nothing in the dispatcher
+    or in `_write_run` needs to know a band exists.
+
+    CLIPPING, never widening. A campaign that shuts at 13:00 gets an afternoon
+    band whose start is at or past its end -- an empty band, which the existing
+    `floor >= end_min` guard already reports as `window_closed`.
+    """
+    start, end = _clip(dcfg.start_min, dcfg.end_min, kind)
+    return replace(dcfg, start_min=start, end_min=end)
+
 
 # Who is in today's plan. One string because the question is asked three times —
 # the day view, the prepare pass and the approve — and a campaign that answers
