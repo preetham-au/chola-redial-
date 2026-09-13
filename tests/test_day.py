@@ -107,21 +107,28 @@ def _arm(count: int = 1) -> list[int]:
     return ids
 
 
-def _seed_dial(campaign_id: int, agent_id: int, day: str, n: int) -> None:
+def _seed_dial(campaign_id: int, agent_id: int | None, day: str, n: int,
+               kind: str = "auto") -> int:
     """`n` dial-log rows for one campaign, as the dialler would have left them.
 
-    `agent_id` is written from the campaign at log time in `api/dial_log.py`, so
-    it is set here the same way -- a row whose agent is NULL is not a row this
-    console produces.
+    Every row this console writes comes off a plan item, so it carries the id of
+    the run it was dialled from (`api/dial_log.py`) -- the run is seeded here for
+    the same reason, and it is what says which wave those calls belonged to.
+
+    `agent_id` is written from the campaign at log time, and the column is
+    NULLABLE: passing None is the row this console wrote before that column
+    existed, which a day scoped through `dial_log.agent_id` would drop.
     """
+    run_id = _seed_run(campaign_id, day, kind, "committed", 0)
     with session() as conn:
         conn.executemany(
-            "INSERT INTO dial_log (created_at, campaign_id, agent_id, source, "
+            "INSERT INTO dial_log (created_at, campaign_id, agent_id, run_id, source, "
             "scheduled_time, dry_run, url, request_body, outcome, verified) "
-            "VALUES (?,?,?,'test',?,1,'','{}','simulated','dialled')",
-            [(f"{day}T10:00:00", campaign_id, agent_id, f"{day}T10:{i:02d}:00")
+            "VALUES (?,?,?,?,'test',?,1,'','{}','simulated','dialled')",
+            [(f"{day}T10:00:00", campaign_id, agent_id, run_id, f"{day}T10:{i:02d}:00")
              for i in range(n)])
         conn.commit()
+    return run_id
 
 
 def _arm_two_agents() -> list[tuple[int, int]]:
@@ -1080,6 +1087,57 @@ def test_dial_log_is_scoped_to_its_agent(client):
     assert dialled() - before[None] == 7, (
         f"an unscoped day must still count both agents: it moved by "
         f"{dialled() - before[None]}, not 7")
+
+
+def test_the_dial_log_is_scoped_to_its_wave(client):
+    """The afternoon card must not present the morning's calls as its own proof.
+
+    These counts are rendered inside the wave's proof card, under the wave's own
+    title, eyebrow and band. Scoped by date and agent but not by kind, a morning
+    that dialled 1,900 read as the afternoon's the moment the afternoon card was
+    opened -- a number that looks wave-scoped and is not.
+
+    A delta, not an absolute: `client` is session-scoped.
+    """
+    agent, campaign_id = _arm_two_agents()[0]
+    today = now_ist().date().isoformat()
+
+    def dialled(kind: str) -> int:
+        body = client.get(f"/api/day?kind={kind}&agent_id={agent}").json()
+        return body["dial_log"].get("dialled", 0)
+
+    before = {k: dialled(k) for k in ("auto", "auto_pm")}
+    _seed_dial(campaign_id, agent, today, 4, kind="auto")
+    _seed_dial(campaign_id, agent, today, 1, kind="auto_pm")
+
+    assert dialled("auto") - before["auto"] == 4, (
+        f"the morning dialled 4 and the afternoon 1; the morning card moved by "
+        f"{dialled('auto') - before['auto']} — it is counting the other wave")
+    assert dialled("auto_pm") - before["auto_pm"] == 1, (
+        f"the afternoon card moved by {dialled('auto_pm') - before['auto_pm']}, not 1")
+
+
+def test_a_dial_log_row_with_no_agent_still_counts_for_its_campaigns_agent(client):
+    """`dial_log.agent_id` is nullable, and a scoped panel dropped those rows.
+
+    Written from the campaign at log time, so every row this console writes today
+    has one -- but the column was added after the table, and a row from before it
+    was populated is a real call that really happened. Scoping on it made a
+    scoped panel under-report the one number the operator checks after approving.
+    The campaign's own agent is never null, so the narrowing goes through there.
+    """
+    agent, campaign_id = _arm_two_agents()[0]
+    today = now_ist().date().isoformat()
+
+    def dialled() -> int:
+        return client.get(f"/api/day?agent_id={agent}").json()["dial_log"].get("dialled", 0)
+
+    before = dialled()
+    _seed_dial(campaign_id, None, today, 3)
+
+    assert dialled() - before == 3, (
+        f"3 calls logged before dial_log.agent_id was stamped moved agent {agent}'s "
+        f"day by {dialled() - before} — they are its campaign's calls either way")
 
 
 def test_resync_status_is_scoped_to_its_agent(client, pin_clock, monkeypatch):

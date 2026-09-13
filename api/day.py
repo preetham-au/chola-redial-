@@ -385,23 +385,36 @@ def _slot_counts(conn: sqlite3.Connection, run_ids):
         f"GROUP BY run_id, bucket, bucket_label, dte", list(run_ids)).fetchall()
 
 
-def _dialled_today(conn: sqlite3.Connection, day: date,
+def _dialled_today(conn: sqlite3.Connection, day: date, kind: str,
                    agent_id: Optional[int] = None) -> dict[str, int]:
-    """What the log says actually happened, by verify state. Answers 'did it run?'.
+    """What the log says THIS WAVE actually did, by verify state. 'Did it run?'.
 
-    Scoped like every other field on this page. It is the ONE number that says
-    whether the day actually ran, so two language panels side by side both
-    reporting the whole day's dials is the exact confusion agent scoping exists
-    to remove -- and a scoped day that reported the other agent's calls would be
-    lying about the only figure the operator checks after approving.
+    Scoped like every other field on this page -- and that has to include the
+    wave. These counts are rendered inside the proof card, under the wave's own
+    title, eyebrow and band: an afternoon card reading "2,080 dialled" when the
+    afternoon posted 300 is the morning's work presented as this wave's proof,
+    which is the same confusion agent scoping exists to remove.
 
-    `dial_log` carries its own `agent_id` (written from the campaign when the row
-    is logged), so this is the same one-clause narrowing as every other list.
+    Both narrowings go through the run rather than through `dial_log`'s own
+    columns. `run_id` says which wave a call belonged to as a fact -- the run it
+    was dialled from -- where classifying `scheduled_time` by band would be a
+    guess for any row a hand-edit or a moved `WAVE_BOUNDARY` left straddling it.
+    The agent comes off the campaign for the plainer reason that
+    `dial_log.agent_id` is nullable, so scoping on it drops every row written
+    before that column was populated.
+
+    A row with no run is not this wave's: a test call belongs to no run and is
+    nobody's proof that the day ran.
     """
-    where, params = _scope("substr(scheduled_time,1,10)=?", agent_id)
+    where = ["substr(d.scheduled_time,1,10)=?", "r.kind=?"]
+    params: list[Any] = [day.isoformat(), kind]
+    if agent_id is not None:
+        where.append("c.agent_id=?")
+        params.append(agent_id)
     rows = conn.execute(
-        f"SELECT verified, COUNT(*) AS n FROM dial_log WHERE {where} "
-        f"GROUP BY verified", (day.isoformat(), *params)).fetchall()
+        "SELECT d.verified AS verified, COUNT(*) AS n FROM dial_log d "
+        "JOIN runs r ON r.id=d.run_id JOIN campaigns c ON c.id=r.campaign_id "
+        f"WHERE {' AND '.join(where)} GROUP BY d.verified", params).fetchall()
     return {r["verified"]: r["n"] for r in rows}
 
 
@@ -597,7 +610,7 @@ def get_day(date: Optional[str] = Query(None), kind: str = Query(MORNING),
              *hidden_params)).fetchall()
         runs = _plan_rows(conn, [c["id"] for c in campaigns], day, kind)
         counts = _slot_counts(conn, [r["id"] for r in runs.values()])
-        log = _dialled_today(conn, day, agent_id)
+        log = _dialled_today(conn, day, kind, agent_id)
         stranded_runs, stranded_leads = _stranded(conn, day, agent_id)
         facts = _plan_facts(conn, runs, [c["id"] for c in campaigns])
         spread = _spread(conn, runs, kind)

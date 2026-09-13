@@ -310,6 +310,11 @@ nothing to list anywhere. An agent with nothing armed answers `200` with
   // — 544 leads over a fortnight read as "7,616 calls never dialled". Each row
   // keeps its own `slots`, which is true of that run.
   "stranded_leads": 544,
+  // What the warehouse says happened to THIS WAVE's calls, by verify state.
+  // Counted through the run each row was dialled from (`dial_log.run_id` →
+  // `runs.kind`), so the afternoon card cannot report the morning's dials, and
+  // the agent comes off the campaign because `dial_log.agent_id` is nullable.
+  // A row with no run — a test call — belongs to no wave and is counted in none.
   "dial_log": { "dialled": 88, "queued": 12, "missing": 1 },
   // WHICH HOURS the calls actually landed in, against the band they were
   // approved against. The honest answer to "is it scheduling properly": on
