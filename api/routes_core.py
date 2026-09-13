@@ -194,15 +194,33 @@ def _agent_languages() -> dict[int, str]:
     Format: `AGENT_LANGUAGES=125:Hindi,127:Tamil`. A malformed entry raises
     rather than silently labelling an agent wrong -- a wrong language on a
     dialling console is a script read to the wrong cohort.
+
+    The raise is checked at IMPORT too (below), because raising from here alone
+    was not fail-fast: `/api/agents` answered 500, and the client catches that
+    and falls back to deriving the roster from the campaign list, which carries
+    no language at all. The operator saw every label quietly disappear with no
+    error anywhere on the screen -- the opposite of what a refusal is for.
     """
     raw = (os.environ.get("AGENT_LANGUAGES") or "").strip()
     out: dict[int, str] = {}
     for part in filter(None, (p.strip() for p in raw.split(","))):
         agent, _, label = part.partition(":")
-        if not label.strip():
+        # The id is checked here as well as the label: `int(agent)` on its own
+        # raised a bare ValueError naming neither the variable nor the entry, so
+        # the one line the operator gets to debug from said `invalid literal for
+        # int()` and nothing about AGENT_LANGUAGES.
+        if not (agent.strip().isdigit() and label.strip()):
             raise ValueError(f"AGENT_LANGUAGES entry {part!r} is not `id:Language`")
         out[int(agent)] = label.strip()
     return out
+
+
+# Parsed once at import, and the result thrown away: `list_agents` re-reads the
+# environment so a value changed at runtime is honoured. This call is here only
+# so a malformed one stops the API at BOOT, where the operator is looking, the
+# same way api.day's WAVE_BOUNDARY does. api.main loads the .env before it
+# imports the routers, so the file's value is in os.environ by now.
+_agent_languages()
 
 
 @router.get("/api/agents")

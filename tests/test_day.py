@@ -27,6 +27,11 @@ def clean_runs():
         conn.execute("DELETE FROM plan_items WHERE run_id IN "
                      "(SELECT id FROM runs WHERE note='seeded')")
         conn.execute("DELETE FROM runs WHERE note='seeded'")
+        # Seeded dial-log rows go the same way, and for the same reason: the
+        # `dial_log` counts on the day screen are a GROUP BY over the whole
+        # table, so a row left behind moves another test's total. Tagged
+        # source='test'; nothing in api/ or engine/ writes that value.
+        conn.execute("DELETE FROM dial_log WHERE source='test'")
         conn.commit()
 
 
@@ -90,6 +95,23 @@ def _arm(count: int = 1) -> list[int]:
                          "hidden=0 WHERE id=?", [(i,) for i in ids])
         conn.commit()
     return ids
+
+
+def _seed_dial(campaign_id: int, agent_id: int, day: str, n: int) -> None:
+    """`n` dial-log rows for one campaign, as the dialler would have left them.
+
+    `agent_id` is written from the campaign at log time in `api/dial_log.py`, so
+    it is set here the same way -- a row whose agent is NULL is not a row this
+    console produces.
+    """
+    with session() as conn:
+        conn.executemany(
+            "INSERT INTO dial_log (created_at, campaign_id, agent_id, source, "
+            "scheduled_time, dry_run, url, request_body, outcome, verified) "
+            "VALUES (?,?,?,'test',?,1,'','{}','simulated','dialled')",
+            [(f"{day}T10:00:00", campaign_id, agent_id, f"{day}T10:{i:02d}:00")
+             for i in range(n)])
+        conn.commit()
 
 
 def _arm_two_agents() -> list[tuple[int, int]]:
@@ -727,3 +749,172 @@ def test_a_malformed_agent_language_is_refused_rather_than_guessed(client, monke
     monkeypatch.setenv("AGENT_LANGUAGES", "125:Hindi,127")
     with pytest.raises(ValueError, match="127"):
         core.list_agents()
+
+
+def test_a_non_numeric_agent_id_names_the_variable_and_the_entry(client, monkeypatch):
+    """`int(agent)` alone raised `invalid literal for int()` and nothing else.
+
+    The operator's one line to debug from has to say WHICH variable and WHICH
+    entry; a bare int() failure says neither.
+    """
+    import api.routes_core as core
+
+    monkeypatch.setenv("AGENT_LANGUAGES", "x:Hindi")
+    with pytest.raises(ValueError, match="AGENT_LANGUAGES.*x:Hindi"):
+        core.list_agents()
+
+
+# ---------------------------------------------------------------------------
+# The dial log — "did it actually run?"
+# ---------------------------------------------------------------------------
+
+def test_dial_log_is_scoped_to_its_agent(client):
+    """A scoped day must not report the other agent's calls as its own.
+
+    `dial_log` was the one unscoped field left on a scoped page: one row logged
+    for a campaign owned by agent 127 showed up in `GET /api/day?agent_id=125`.
+    It is also the field that matters most, because it is the number the operator
+    checks after approving to find out whether the day actually ran -- and the
+    two languages sit in side-by-side panels, so both would show the same
+    whole-day figure.
+
+    Asserted as a DELTA rather than an absolute: `client` is session-scoped, so
+    other tests in this run may have logged dials of their own.
+    """
+    (first, first_c), (second, second_c) = _arm_two_agents()
+    today = now_ist().date().isoformat()
+
+    def dialled(agent=None) -> int:
+        url = "/api/day" + (f"?agent_id={agent}" if agent is not None else "")
+        return client.get(url).json()["dial_log"].get("dialled", 0)
+
+    before = {first: dialled(first), second: dialled(second), None: dialled()}
+    _seed_dial(first_c, first, today, 2)
+    _seed_dial(second_c, second, today, 5)
+
+    assert dialled(first) - before[first] == 2, (
+        f"agent {first} dialled 2 and agent {second} dialled 5; agent {first}'s day "
+        f"moved by {dialled(first) - before[first]} — it is counting the other "
+        f"agent's calls")
+    assert dialled(second) - before[second] == 5, (
+        f"agent {second}'s day moved by {dialled(second) - before[second]}, not 5")
+    assert dialled() - before[None] == 7, (
+        f"an unscoped day must still count both agents: it moved by "
+        f"{dialled() - before[None]}, not 7")
+
+
+def test_resync_status_is_scoped_to_its_agent(client, pin_clock, monkeypatch):
+    """A prepare scoped to one language must not re-sync — or stop — the other.
+
+    `_resync_status` selected DISTINCT agent_id across every armed campaign, so
+    `prepare_day(resync=True, agent_id=125)` could pause Tamil campaigns and
+    report them back in `stopped_in_formi`. No dialling risk, but it is the same
+    cross-language bleed the scoping exists to remove.
+
+    Both paths are covered: scoped sees one agent, unscoped still sees them all,
+    which is what the unattended autopilot pass sends.
+    """
+    import api.autopilot as autopilot_module
+    import api.day as day_module
+    from engine import metabase_source as ms
+    from engine import sync as sync_module
+
+    (first, _), (second, _) = _arm_two_agents()
+    now = pin_clock(15)
+    seen: list[list[int]] = []
+
+    def _capture(conn, agents, config, schema, today=None):
+        seen.append(list(agents))
+        return []
+
+    monkeypatch.setattr(ms, "load_config", lambda *a, **k: None)
+    monkeypatch.setattr(ms, "describe_schema", lambda *a, **k: None)
+    monkeypatch.setattr(sync_module, "refresh_campaign_status", _capture)
+    monkeypatch.setattr(autopilot_module, "_resync", lambda campaign_id, day: 0)
+
+    day_module.prepare_day(now.date(), "auto", True, first)
+    day_module.prepare_day(now.date(), "auto", True)
+
+    assert len(seen) == 2, (
+        f"_resync_status did not run on both passes (it is called inside a "
+        f"try/except that only logs): {seen}")
+    scoped, whole = seen
+    assert scoped == [first], f"a prepare scoped to agent {first} re-synced {scoped}"
+    assert {first, second} <= set(whole), (
+        f"an unscoped prepare must still re-sync every armed agent, it saw {whole}")
+
+
+# ---------------------------------------------------------------------------
+# Malformed schedule env vars stop the API at boot
+# ---------------------------------------------------------------------------
+
+def _boot(tmp_path, line: str) -> "object":
+    """Import the API in a subprocess with one line in its .env.
+
+    A subprocess because IMPORT is the thing under test and this session
+    imported `api.main` long ago. The value goes in the .env FILE rather than an
+    export, because the file is the path the operator actually uses and the one
+    `load_env` has to reach before the routers are imported. The variable is
+    stripped from the inherited environment first -- `load_env` uses setdefault,
+    so a key already present would shadow the file.
+    """
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    name = line.split("=", 1)[0]
+    env_file = tmp_path / f"{name.lower()}.env"
+    env_file.write_text(line + "\n", encoding="utf-8")
+    env = {k: v for k, v in os.environ.items() if k != name}
+    env.update(REDIAL_ENV_FILE=str(env_file), PYTHONPATH=str(root))
+    return subprocess.run([sys.executable, "-c", "import api.main"], cwd=str(root),
+                          env=env, capture_output=True, text=True)
+
+
+def test_a_wave_boundary_outside_the_dialling_hours_stops_the_api_at_boot(client, tmp_path):
+    """`WAVE_BOUNDARY=00:00` used to boot cleanly and shut the morning down.
+
+    `parse_hhmm` accepted it, nothing compared it against the dialling hours, and
+    every campaign got a morning band with no minutes in it -- a silent, total
+    morning shutdown on a box with DRY_RUN=0.
+    """
+    out = _boot(tmp_path, "WAVE_BOUNDARY=00:00")
+
+    assert out.returncode != 0, (
+        "WAVE_BOUNDARY=00:00 booted; every campaign now has an empty morning band "
+        "and nothing anywhere says so")
+    assert "WAVE_BOUNDARY" in out.stderr, out.stderr
+    assert "09:00" in out.stderr and "20:00" in out.stderr, (
+        f"the error must name the legal range, not just refuse: {out.stderr}")
+
+    # `parse_hhmm` bounds only the TOTAL minutes, so this one is INSIDE the
+    # range once read -- it is 14:10 -- and the range check alone lets it
+    # through. A boundary set to a time nobody typed is the same failure.
+    typo = _boot(tmp_path, "WAVE_BOUNDARY=13:70")
+
+    assert typo.returncode != 0, (
+        "WAVE_BOUNDARY=13:70 booted as 14:10; the operator typed one boundary and "
+        "got another, with no error")
+    assert "WAVE_BOUNDARY" in typo.stderr and "13:70" in typo.stderr, typo.stderr
+
+
+def test_a_malformed_agent_language_stops_the_api_at_boot(client, tmp_path):
+    """Raising only from the request was not fail-fast.
+
+    `/api/agents` answered 500, the client caught it and fell back to a roster
+    derived from the campaign list -- which carries no language -- so the labels
+    quietly vanished with no error anywhere on a live dialler.
+    """
+    missing = _boot(tmp_path, "AGENT_LANGUAGES=125:Hindi,127")
+
+    assert missing.returncode != 0, (
+        "a malformed AGENT_LANGUAGES booted; the labels will silently disappear")
+    assert "AGENT_LANGUAGES" in missing.stderr and "127" in missing.stderr, (
+        f"the error must name the variable and the offending entry: {missing.stderr}")
+
+    bad_id = _boot(tmp_path, "AGENT_LANGUAGES=x:Hindi")
+
+    assert bad_id.returncode != 0, "a non-numeric agent id booted"
+    assert "AGENT_LANGUAGES" in bad_id.stderr and "x:Hindi" in bad_id.stderr, bad_id.stderr

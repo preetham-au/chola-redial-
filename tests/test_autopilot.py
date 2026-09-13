@@ -87,7 +87,7 @@ def armed(monkeypatch):
     from api import autopilot
 
     monkeypatch.setattr(autopilot, "_resync", lambda campaign_id, day: 0)
-    monkeypatch.setattr(autopilot, "_resync_status", lambda day: [])
+    monkeypatch.setattr(autopilot, "_resync_status", lambda day, agent_id=None: [])
     monkeypatch.setattr(autopilot, "remaining_leads", lambda conn, campaign_id, day=None: 42)
     conn = _db()
     conn.execute("UPDATE campaigns SET autopilot=0")
@@ -273,7 +273,8 @@ def test_a_pause_in_formi_is_seen_before_the_next_wave_is_planned(client, armed,
     monkeypatch.setattr(sync.ms, "fetch_agent_campaigns",
                         lambda agent_id, config=None, schema=None, today=None: warehouse)
     monkeypatch.setattr("api.autopilot._resync_status",
-                        lambda day: refresh_campaign_status(_db(), [agent], None, None, day))
+                        lambda day, agent_id=None: refresh_campaign_status(
+                            _db(), [agent], None, None, day))
 
     assert run_pass(PM, TODAY)["campaigns"] == [], "a campaign paused in Formi was planned"
 
@@ -707,7 +708,7 @@ def armed_all(monkeypatch):
     from api import autopilot
 
     monkeypatch.setattr(autopilot, "_resync", lambda campaign_id, day: 0)
-    monkeypatch.setattr(autopilot, "_resync_status", lambda day: [])
+    monkeypatch.setattr(autopilot, "_resync_status", lambda day, agent_id=None: [])
     monkeypatch.setattr(autopilot, "remaining_leads", lambda conn, campaign_id, day=None: 42)
     conn = _db()
     conn.execute("UPDATE campaigns SET autopilot=1, paused=0, autopilot_latched=0 "

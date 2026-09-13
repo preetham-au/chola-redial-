@@ -202,7 +202,7 @@ One page for the whole day across every campaign in the plan, and one approval.
 | Method | Path | Notes |
 |---|---|---|
 | `GET` | `/api/day?date=&kind=&agent_id=` | the whole day. Cheap by construction — two `GROUP BY`s over rows the console already wrote, so a screen may poll it all day without costing a warehouse query. Never re-runs the engine. |
-| `POST` | `/api/day/prepare` | `{date?, kind?, resync?, agent_id?}` → builds `planned` runs for every campaign in the plan. **Dials nothing.** `resync: true` (what a pass sets) re-reads campaign status and re-pulls leads first. |
+| `POST` | `/api/day/prepare` | `{date?, kind?, resync?, agent_id?}` → builds `planned` runs for every campaign in the plan. **Dials nothing.** `resync: true` (what a pass sets) re-reads campaign status and re-pulls leads first — for the scoped agent only, so a Hindi prepare cannot stop a Tamil campaign and report it in `stopped_in_formi`. |
 | `POST` | `/api/day/approve` | `{date?, kind?, buckets?[], campaign_ids?[], agent_id?}` → **dials.** Empty `buckets` means every bucket; empty `campaign_ids` means every campaign with a plan waiting. |
 
 `status` is one of `no_campaigns` · `not_prepared` · `awaiting_approval` ·
@@ -212,8 +212,11 @@ interpret.
 **`agent_id` narrows the day to one agent — one language.** Omitted, every
 endpoint here answers for every armed campaign, exactly as it did before scoping
 existed. Supplied, `campaigns`, `stopped`, `stranded`, `totals`, `buckets`,
-`red_bands` and `capacity_before_close` all describe that agent alone, and the
-response echoes it back in `agent_id` (`null` when unscoped). Agents 125 and 127
+`red_bands`, `capacity_before_close` and `dial_log` all describe that agent
+alone, and the response echoes it back in `agent_id` (`null` when unscoped).
+`dial_log` is included because it is the one number that says whether the day
+actually ran — two language panels each reporting the whole day's dials is the
+confusion this scoping exists to remove. Agents 125 and 127
 hold mirrored campaigns in two languages and this screen used to sum them: 4,271
 Hindi slots and 481 Tamil ones were shown as one number with one Approve button
 that dialled both.
@@ -270,7 +273,8 @@ nothing to list anywhere. An agent with nothing armed answers `200` with
 ```
 
 **Each wave dials inside its own half of the day.** `auto` runs from each
-campaign's own opening to `WAVE_BOUNDARY` (env, default `13:30`) and `auto_pm`
+campaign's own opening to `WAVE_BOUNDARY` (env, default `13:30`, range-checked
+at import against the 09:00–20:00 dialling hours) and `auto_pm`
 from there to the campaign's own close — clipped, never widened, so a campaign
 that shuts at 13:00 has no afternoon at all and says so. Without a band the wave
 name meant nothing on the clock: on 12 Sep 2026 the `auto` wave's calls landed
@@ -461,7 +465,12 @@ selector, not a filter chip.
 env var** (`AGENT_LANGUAGES=125:Hindi,127:Tamil`), never from a constant in the
 UI — "125 is Hindi" is a fact about this deployment, and baking it into the build
 breaks the day a third agent lands. It is `null` for an agent the deployment has
-not labelled, and a malformed entry raises rather than labelling an agent wrong.
+not labelled, and a malformed entry (`127` with no label, a non-numeric id)
+raises **at import**, naming the variable and the offending entry, so the API
+refuses to boot rather than labelling an agent wrong. At boot and not only on the
+request: the console falls back to a roster derived from the campaign list when
+`/api/agents` fails, which carries no language, so a 500 here would have shown up
+as every label quietly disappearing.
 There is no `agents` table on purpose: an agent *is* the set of campaigns that
 carry its id, so the roster is derived and can never disagree with the data.
 

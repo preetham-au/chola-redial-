@@ -112,23 +112,31 @@ def _resync(campaign_id: int, day: date) -> int:
         return refresh_campaign_leads(conn, campaign_id, config, schema, today=day)
 
 
-def _resync_status(day: date) -> list[int]:
+def _resync_status(day: date, agent_id: Optional[int] = None) -> list[int]:
     """Re-read Formi's campaign status before a wave is planned. Raises on failure.
 
     Without this the console only learns about a pause on the next full sync: a
     campaign paused in Formi at 11:00 was still in the 15:00 plan, and approving
     that plan dialled customers of a campaign the client had stopped. Returns the
     campaign ids this call stopped.
+
+    `agent_id` narrows it to one agent, for the same reason every list on the day
+    screen is narrowed: a prepare scoped to Hindi that stops Tamil campaigns and
+    reports them in `stopped_in_formi` is the cross-language bleed the scoping
+    exists to remove. None -- what the unattended passes send -- re-syncs every
+    armed agent, exactly as before.
     """
     from engine import metabase_source as ms          # noqa: PLC0415 — heavy import
     from engine.sync import refresh_campaign_status   # noqa: PLC0415
 
+    from .day import _scope                           # noqa: PLC0415 — avoids a cycle
+
     config = ms.load_config()
     schema = ms.describe_schema(config)
+    where, params = _scope("autopilot=1 AND enabled=1 AND hidden=0", agent_id)
     with session() as conn:
         agents = [r["agent_id"] for r in conn.execute(
-            "SELECT DISTINCT agent_id FROM campaigns WHERE autopilot=1 AND enabled=1 "
-            "AND hidden=0")]
+            f"SELECT DISTINCT agent_id FROM campaigns WHERE {where}", params)]
         return refresh_campaign_status(conn, agents, config, schema, today=day)
 
 

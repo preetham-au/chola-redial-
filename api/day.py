@@ -34,7 +34,8 @@ from fastapi import APIRouter, Body, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from engine.dispatcher import (
-    DEFAULT_RED_PRIORITY, DispatchConfig, hhmm, parse_hhmm, red_rank,
+    DEFAULT_RED_PRIORITY, WINDOW_CEIL, WINDOW_FLOOR, DispatchConfig, hhmm, parse_hhmm,
+    red_rank,
 )
 
 from .db import dry_run, now_ist, session
@@ -77,7 +78,25 @@ WAVE_LABEL = {MORNING: "morning", AFTERNOON: "afternoon"}
 # 13:30 sits between autopilot's own two preparation times (AUTOPILOT_AM 10:00,
 # AUTOPILOT_PM 15:00, see autopilot.py) so each wave is still prepared inside the
 # band it dials into.
-WAVE_BOUNDARY = parse_hhmm((os.environ.get("WAVE_BOUNDARY") or "13:30").strip())
+_WAVE_BOUNDARY_RAW = (os.environ.get("WAVE_BOUNDARY") or "13:30").strip()
+WAVE_BOUNDARY = parse_hhmm(_WAVE_BOUNDARY_RAW, "WAVE_BOUNDARY")
+# `parse_hhmm` only bounds the TOTAL, so it reads `13:70` as 14:10 rather than
+# refusing it. Required to round-trip instead: a boundary quietly set to a time
+# nobody typed is the same failure as one set outside the hours, and it is the
+# likelier typo of the two.
+if hhmm(WAVE_BOUNDARY) != _WAVE_BOUNDARY_RAW:
+    raise ValueError(f"WAVE_BOUNDARY must be HH:MM, got {_WAVE_BOUNDARY_RAW!r} "
+                     f"(read as {hhmm(WAVE_BOUNDARY)})")
+# Inside the dialling hours, and strictly: a boundary ON or outside either edge
+# gives one wave the whole day and the other an empty band for EVERY campaign,
+# and nothing downstream says so -- `_clip` just returns a band with no minutes
+# in it. `WAVE_BOUNDARY=00:00` booted cleanly and shut the morning down across
+# the board. Raised here, at import, so a typo stops the API where the operator
+# can see it rather than on a box with DRY_RUN=0.
+if not WINDOW_FLOOR < WAVE_BOUNDARY < WINDOW_CEIL:
+    raise ValueError(
+        f"WAVE_BOUNDARY {hhmm(WAVE_BOUNDARY)} must be strictly between "
+        f"{hhmm(WINDOW_FLOOR)} and {hhmm(WINDOW_CEIL)}, the permitted dialling hours")
 WAVE_BAND = {MORNING: (None, WAVE_BOUNDARY), AFTERNOON: (WAVE_BOUNDARY, None)}
 
 
@@ -116,15 +135,11 @@ def _band(kind: str, dcfg: DispatchConfig) -> DispatchConfig:
 ARMED = "autopilot=1 AND enabled=1 AND paused=0 AND hidden=0"
 
 
-def _scope(where: str, agent_id: Optional[int],
-           column: str = "agent_id") -> tuple[str, list[Any]]:
+def _scope(where: str, agent_id: Optional[int]) -> tuple[str, list[Any]]:
     """`where` narrowed to one agent, or left exactly as it was. One place, so a
     roster and the `stopped` list beside it cannot end up scoped differently.
-
-    `column` is the qualified name where the clause lands in a join and a bare
-    `agent_id` would be left to SQLite to resolve.
     """
-    return (where, []) if agent_id is None else (f"{where} AND {column}=?", [agent_id])
+    return (where, []) if agent_id is None else (f"{where} AND agent_id=?", [agent_id])
 
 
 def _armed(agent_id: Optional[int] = None) -> tuple[str, list[Any]]:
@@ -330,11 +345,23 @@ def _slot_counts(conn: sqlite3.Connection, run_ids):
         f"GROUP BY run_id, bucket, bucket_label, dte", list(run_ids)).fetchall()
 
 
-def _dialled_today(conn: sqlite3.Connection, day: date) -> dict[str, int]:
-    """What the log says actually happened, by verify state. Answers 'did it run?'."""
+def _dialled_today(conn: sqlite3.Connection, day: date,
+                   agent_id: Optional[int] = None) -> dict[str, int]:
+    """What the log says actually happened, by verify state. Answers 'did it run?'.
+
+    Scoped like every other field on this page. It is the ONE number that says
+    whether the day actually ran, so two language panels side by side both
+    reporting the whole day's dials is the exact confusion agent scoping exists
+    to remove -- and a scoped day that reported the other agent's calls would be
+    lying about the only figure the operator checks after approving.
+
+    `dial_log` carries its own `agent_id` (written from the campaign when the row
+    is logged), so this is the same one-clause narrowing as every other list.
+    """
+    where, params = _scope("substr(scheduled_time,1,10)=?", agent_id)
     rows = conn.execute(
-        "SELECT verified, COUNT(*) AS n FROM dial_log WHERE substr(scheduled_time,1,10)=? "
-        "GROUP BY verified", (day.isoformat(),)).fetchall()
+        f"SELECT verified, COUNT(*) AS n FROM dial_log WHERE {where} "
+        f"GROUP BY verified", (day.isoformat(), *params)).fetchall()
     return {r["verified"]: r["n"] for r in rows}
 
 
@@ -418,7 +445,7 @@ def get_day(date: Optional[str] = Query(None), kind: str = Query(MORNING),
         hidden_where, hidden_params = _scope(
             "c.hidden=1 AND r.run_date=? AND r.status='committed' "
             "AND i.status IN ('posted','simulated') AND i.scheduled_time > ?",
-            agent_id, column="c.agent_id")
+            agent_id)
         dialling_while_hidden = conn.execute(
             "SELECT DISTINCT c.* FROM campaigns c "
             "JOIN runs r ON r.campaign_id=c.id JOIN plan_items i ON i.run_id=r.id "
@@ -427,7 +454,7 @@ def get_day(date: Optional[str] = Query(None), kind: str = Query(MORNING),
              *hidden_params)).fetchall()
         runs = _plan_rows(conn, [c["id"] for c in campaigns], day, kind)
         counts = _slot_counts(conn, [r["id"] for r in runs.values()])
-        log = _dialled_today(conn, day)
+        log = _dialled_today(conn, day, agent_id)
         stranded_runs = _stranded(conn, day, agent_id)
 
         from .db import current_config                  # noqa: PLC0415 — avoids a cycle
@@ -555,7 +582,7 @@ def prepare_day(day: Optional[date] = None, kind: str = MORNING,
         # per-campaign lead re-sync below fails loudly enough on its own.
         from .autopilot import _resync_status         # noqa: PLC0415 — avoids a cycle
         try:
-            stopped = _resync_status(day)
+            stopped = _resync_status(day, agent_id)
         except Exception as exc:                     # noqa: BLE001 — reported, not swallowed
             log.warning("could not re-read campaign status before the %s wave: %s", kind, exc)
 
