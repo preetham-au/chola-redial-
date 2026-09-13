@@ -1735,3 +1735,34 @@ def test_a_planned_wave_with_nothing_ready_is_not_reported_as_approved(client):
             conn.execute("DELETE FROM leads WHERE campaign_id=?", (campaign_id,))
             conn.execute("DELETE FROM campaigns WHERE id=?", (campaign_id,))
             conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# A rehearsal to your own handset has no hours
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("hour", [4, 23])
+def test_an_auto_timed_test_call_is_free_of_the_dial_window(client, pin_clock, hour):
+    """"Test call now" at 04:00 or 23:00 books THAT minute, not the next morning.
+
+    The operator's own constraint: the only number this endpoint will dial is one
+    they listed as their own handset, so the customer-protection window does not
+    apply to it. `_next_slot` in api/routes_core.py is already right; nothing held
+    it there. Clamping it to 09:00-20:00, or unconditionally to 09:00 tomorrow,
+    left the whole suite green -- so the answer is asserted here to the exact
+    minute, date included, which is the only form either clamp cannot survive.
+
+    tests/test_api.py's rehearsal test cannot see this: it runs on the real clock
+    and asserts `>= now`, which both clamps satisfy. The hour has to be pinned for
+    the question to mean anything.
+    """
+    from engine.seed import TEST_NUMBERS
+
+    now = pin_clock(hour)
+    body = client.post("/api/test-call/preview", json={"phone": TEST_NUMBERS[0]}).json()
+    assert body["found"], body
+
+    # Formi's five-minute floor is ours to respect; the dial window is not.
+    expected = (now + timedelta(minutes=FORMI_LEAD_MINUTES)).strftime("%Y-%m-%dT%H:%M:00")
+    assert body["would_post"]["body"]["scheduled_time"] == expected, \
+        f"a {hour:02d}:00 rehearsal must go out at {hour:02d}:{FORMI_LEAD_MINUTES:02d} today"
