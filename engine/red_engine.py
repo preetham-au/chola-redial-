@@ -271,6 +271,13 @@ DEFAULT_DISPOSITION_RULES: dict[str, DispositionRule] = _rules(
     # ~2.7k leads sit in human_review. They are mid-QA, so auto-dialling them
     # would act on a disposition that is not final yet.
     DispositionRule("human_review", HOLD, note="Awaiting human review — disposition not final"),
+    # chola_v137 spells the same state `Needs_Human_Review`, and it is that
+    # taxonomy's `abstain` target — the classifier could not place the call. It
+    # must share `human_review`'s class, or the same lead would be dialled or
+    # held depending only on which pipeline version wrote the row. HOLD also
+    # restores its RED−1/RED calls: those two days override a hold, and an
+    # unmapped slug is the one class that overrides nothing.
+    DispositionRule("needs_human_review", HOLD, note="Awaiting human review — disposition not final"),
     DispositionRule("alternate_contact_given", HOLD,
                     note="Number on file superseded — needs a data update before dialling"),
 
@@ -311,6 +318,9 @@ DEFAULT_DISPOSITION_RULES: dict[str, DispositionRule] = _rules(
     # --- did-not-pick family: follow the RED frequency table ---------------
     DispositionRule("hung_up", DNP, follow_red_frequency=True),
     DispositionRule("hung_up_no_contact", DNP, follow_red_frequency=True),
+    # chola_v137 level-2 child of Hung_Up: the customer dropped during the
+    # intro, so nothing was discussed. Follows its parent.
+    DispositionRule("hung_up_intro", DNP, follow_red_frequency=True),
     DispositionRule("did_not_pick", DNP, follow_red_frequency=True),
     DispositionRule("unreachable", DNP, follow_red_frequency=True, note="RNR"),
     DispositionRule("rnr", DNP, follow_red_frequency=True, note="Alias of unreachable"),
@@ -331,6 +341,11 @@ DEFAULT_DISPOSITION_RULES: dict[str, DispositionRule] = _rules(
                     note="Connected, no committed date — follows the RED ramp"),
     DispositionRule("follow_up_required", DNP, follow_red_frequency=True,
                     note="Connected, no committed date — follows the RED ramp"),
+    # chola_v137's catch-all leaf. It carries no outcome of its own, so the only
+    # safe reading is "nothing was settled" — keep chasing on the RED ramp
+    # rather than letting a catch-all silently retire a live lead.
+    DispositionRule("others", DNP, follow_red_frequency=True,
+                    note="Catch-all — nothing settled, follows the RED ramp"),
 
     # --- fresh leads -------------------------------------------------------
     DispositionRule("new", FRESH, follow_red_frequency=True),
