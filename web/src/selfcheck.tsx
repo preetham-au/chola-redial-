@@ -1314,6 +1314,12 @@ ok(
   const src = readFileSync('src/screens/Today.tsx', 'utf8');
   ok('and nothing in the day screen calls prepare outside those two scoped helpers',
      src.split('api.prepareDay(').length - 1 === 2);
+  // The picker's own comment used to assert the opposite of all of this — that
+  // `api/day.py` has no notion of an agent — which stopped being true when this
+  // branch landed. A comment that contradicts the checks above is how the next
+  // reader talks themselves into un-scoping one of these calls.
+  ok('and the picker no longer says the day API cannot tell agents apart',
+     !src.includes('has no notion of an agent'));
 
   // …and it has to SAY what the re-read found. Two facts come back that no other
   // call can learn, and the operator cannot see either one: the ready count

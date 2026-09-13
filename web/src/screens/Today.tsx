@@ -988,11 +988,14 @@ function PickCampaigns({
   // Scoped to the agent in the rail, like every other screen, and asking for
   // hidden campaigns because this is one of the two places they can be put back.
   //
-  // Scoping only narrows what is OFFERED. The day itself stays one plan across
-  // both agents -- `api/day.py` has no notion of an agent -- so the other one's
-  // armed campaigns keep running, and `planned` is here to say so out loud
-  // rather than let them dial off-screen. `autopilotDiff` reads this same list,
-  // so a campaign the picker cannot see is also one it can never disarm.
+  // Scoping narrows what is OFFERED here and what saving here re-plans:
+  // `pickerPrepare` builds this agent's half of the day and leaves every other
+  // agent's plan exactly as it was. Those other agents keep their armed
+  // campaigns and keep dialling them from their own panels, which is why
+  // `elsewhere` below is read from an UNSCOPED `api.day` — the campaigns this
+  // picker cannot see are named on screen rather than left to dial off it.
+  // `autopilotDiff` reads this same narrowed list, so a campaign the picker
+  // cannot see is also one it can never disarm.
   const list = useAsync(
     () => (agentId === null ? Promise.resolve([]) : api.campaigns(agentId, true)),
     [agentId],
