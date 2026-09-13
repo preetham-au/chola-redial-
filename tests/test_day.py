@@ -1491,6 +1491,73 @@ def test_approving_a_run_never_dials_a_slot_outside_its_own_wave(client, pin_clo
 
 
 # ---------------------------------------------------------------------------
+# Approving re-plans
+# ---------------------------------------------------------------------------
+
+def _arm_replannable(day: str, kind: str) -> int:
+    """Arm a campaign whose `kind` wave has not been acted on yet on `day`.
+
+    Not `_arm`: `client` is session-scoped, so by the time this file runs the
+    earlier ones have already committed today's morning wave for the campaign
+    `_arm` picks -- and `_write_run` rightly refuses to rewrite a run somebody
+    has dialled. A test about re-planning needs a campaign that can be re-planned.
+
+    It also needs one with leads: the re-plan runs the engine against the local
+    warehouse copy, and a campaign holding none of them would come back with an
+    empty plan, which is not the thing under test.
+    """
+    with session() as conn:
+        row = conn.execute(
+            "SELECT id FROM campaigns WHERE enabled=1 "
+            "AND id IN (SELECT campaign_id FROM leads) AND id NOT IN "
+            "(SELECT campaign_id FROM runs WHERE run_date=? AND kind=? AND status!='planned') "
+            "ORDER BY id", (day, kind)).fetchone()
+        if row is None:
+            pytest.skip(f"every campaign has already dialled its {kind} wave for {day}")
+        conn.execute("UPDATE campaigns SET autopilot=1, enabled=1, paused=0, hidden=0 "
+                     "WHERE id=?", (row["id"],))
+        conn.commit()
+    return int(row["id"])
+
+
+def test_approving_replans_from_the_current_minute_not_the_plan_on_file(client, pin_clock,
+                                                                        monkeypatch):
+    """Approve rebuilds the plan from NOW; the morning's slots are not re-dialled at noon.
+
+    This is `approve_day`'s central promise -- "approving late does not dial into
+    the night", because each campaign is re-planned from the current minute and
+    only what still fits goes out. The whole of it is `_approve_one`'s
+    `_write_run(...)` and the `fresh` row it reads back: drop those two lines for
+    `fresh = run` and the console dials the stale plan instead, sending this
+    morning's 10:0x slots at noon. Every other approve test was still green.
+    """
+    monkeypatch.setitem(day_module.WAVE_BAND, "auto", (None, parse_hhmm("13:30")))
+    today = pin_clock(9).date().isoformat()
+    campaign_id = _arm_replannable(today, "auto")
+    # The plan on file, built this morning: slots at 10:0x, all of them now past.
+    stale = _seed_run(campaign_id, today, "auto", "planned", 3)
+
+    # Noon. Inside the morning band (13:30) so the wave is still dialable, and
+    # two hours past every slot the plan on file holds.
+    pin_clock(12)
+    body = client.post("/api/day/approve",
+                       json={"date": today, "campaign_ids": [campaign_id]}).json()
+
+    one = next(c for c in body["campaigns"] if c["campaign_id"] == campaign_id)
+    assert one["status"] == "approved", f"approve did not dial: {one}"
+    run_id = one["run_id"]
+    try:
+        assert run_id != stale, "the plan on file was dialled as it stood"
+        times = sorted(i["scheduled_time"][11:16] for i in _items(client, run_id))
+        assert times, "an approved run with no slots is not an approval"
+        assert times[0] >= "12:00", \
+            f"approving at noon put a call at {times[0]} — that minute has gone"
+        assert one["posted"] == len(times), "every slot of the fresh plan goes out"
+    finally:
+        _drop_run(run_id)
+
+
+# ---------------------------------------------------------------------------
 # "Approved" has to mean somebody approved it
 # ---------------------------------------------------------------------------
 
