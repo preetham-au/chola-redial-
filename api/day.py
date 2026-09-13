@@ -636,6 +636,15 @@ def get_day(date: Optional[str] = Query(None), kind: str = Query(MORNING),
         status = "not_prepared"
     elif "planned" in statuses and ready:
         status = "awaiting_approval"
+    elif "planned" in statuses:
+        # Prepared, but the plans came back empty -- the afternoon wave after a
+        # morning that booked every lead reaching it. `approved` was the answer
+        # here until 14 Sep 2026, and it is a lie twice over: nobody approved
+        # anything, and the screen that believed it offered neither Build nor
+        # Approve, so the leads a later re-sync pulled in could not be planned at
+        # all. `nothing_to_dial` is what `_approve_one` already calls this exact
+        # state for one campaign; the day says it in the same words.
+        status = "nothing_to_dial"
     else:
         status = "approved"
 

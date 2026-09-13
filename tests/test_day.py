@@ -1452,3 +1452,49 @@ def test_approving_a_run_never_dials_a_slot_outside_its_own_wave(client, pin_clo
     assert done["counts"]["posted"] == len(before) - 1, "the rest of the wave still goes out"
     assert done["out_of_band"] == 1, "the operator has to be told a lead was left behind"
     assert all(i["status"] == "simulated" for i in after.values() if i["id"] != stray)
+
+
+# ---------------------------------------------------------------------------
+# "Approved" has to mean somebody approved it
+# ---------------------------------------------------------------------------
+
+def test_a_planned_wave_with_nothing_ready_is_not_reported_as_approved(client):
+    """Plans that came back empty are not an approval -- nobody dialled anything.
+
+    The afternoon wave after a morning that booked every lead: every run is
+    `planned` and every one holds zero slots. The ladder fell straight through to
+    `approved`, so the screen said "this wave has been approved" and offered
+    neither Build nor Approve -- and the leads a 16:00 re-sync pulled in could
+    then never be planned or approved at all. `_stranded` does not catch it
+    either: it only reports runs with `slots > 0`.
+
+    Its own campaign on its own agent, scoped to that agent: `status` is a
+    statement about the WHOLE page, so it can only be asserted on a page whose
+    contents this test decides. The `client` fixture is session-scoped and
+    earlier files leave real runs against campaigns 1-11.
+    """
+    campaign_id, agent_id = 90003, 90126
+    with session() as conn:
+        conn.execute("INSERT INTO campaigns (id, agent_id, warehouse_id, name, autopilot) "
+                     "VALUES (?, ?, 99003, 'empty wave fixture', 1)", (campaign_id, agent_id))
+        conn.commit()
+    today = now_ist().date().isoformat()
+    try:
+        _seed_run(campaign_id, today, "auto", "planned", 0)
+        body = client.get(f"/api/day?agent_id={agent_id}").json()
+
+        assert [c["id"] for c in body["campaigns"]] == [campaign_id], \
+            "the scope has to hold this campaign and nothing else"
+        assert body["totals"]["ready"] == 0 and body["campaigns"][0]["run_status"] == "planned"
+        assert body["status"] == "nothing_to_dial", \
+            "a plan nobody has approved must never be reported as approved"
+    finally:
+        # Every table that REFERENCES campaigns(id) first (api/schema.sql), or the
+        # FK refuses -- reading the day view wrote this campaign a default config
+        # row. Same four deletes as the fixtures above.
+        with session() as conn:
+            conn.execute("DELETE FROM config WHERE campaign_id=?", (campaign_id,))
+            conn.execute("DELETE FROM runs WHERE campaign_id=?", (campaign_id,))
+            conn.execute("DELETE FROM leads WHERE campaign_id=?", (campaign_id,))
+            conn.execute("DELETE FROM campaigns WHERE id=?", (campaign_id,))
+            conn.commit()
