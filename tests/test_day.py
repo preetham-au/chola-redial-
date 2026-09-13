@@ -1,6 +1,7 @@
 """The daily gate: stranded runs, wave bands, agent scoping, proof."""
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import timedelta
 
 import pytest
@@ -8,6 +9,7 @@ import pytest
 from api import day as day_module
 from api.day import ARMED, STRANDED_DAYS, WAVE_BOUNDARY, _band
 from api.db import now_ist, session
+from api.routes_core import FORMI_LEAD_MINUTES
 from engine.dispatcher import DispatchConfig, parse_hhmm
 
 
@@ -1600,6 +1602,91 @@ def test_a_day_approve_reports_the_slots_it_refused_for_leaving_the_band(client,
     try:
         assert one["out_of_band"] == 1, \
             "a slot refused for leaving its band has to reach the operator, not hide in `dropped`"
+        # And it is one lead, said once. `out_of_band` is a BREAKDOWN of
+        # `dropped`, not a number beside it, so the day's "not scheduled" total
+        # has to read 1 -- adding the detail back on top would charge this stray
+        # twice, which is what `expired` did until 14 Sep 2026.
+        assert body["not_dialled"] == 1, \
+            f"one stray, counted once: not_dialled={body['not_dialled']}"
+    finally:
+        _drop_run(one["run_id"])
+
+
+def test_a_day_approve_counts_each_lead_it_did_not_dial_exactly_once(client, pin_clock,
+                                                                     monkeypatch):
+    """`not_dialled` is the operator's only measure of how much of a day never went out.
+
+    It was `expired + dropped`, and `_commit` writes `dropped = dropped + stale +
+    strays` while ALSO reporting `expired = stale` -- so every slot retired for
+    being in the past was counted twice in the one number the approve modal shows
+    as "not scheduled". A wave with 340 stale slots reported 680: inflated by
+    exactly the commonest reason a slot does not go out.
+
+    Getting a stale slot into a day-level approve takes the same kind of push as
+    the stray above, because `_approve_one` RE-PLANS before it commits: the fresh
+    plan starts at `_floor_min`, so at the instant it is written no slot of it is
+    in the past. What makes one stale is the CLOCK MOVING between the write and
+    the post -- the operator reading the modal -- so that is what is staged here.
+
+    The clock is set from the plan's own LAST slot, five minutes before it: that
+    is Formi's lead time, so the last minute of the plan is the only one still
+    dialable and every earlier slot is retired. Anchored on the plan rather than
+    on an hour picked in advance, because which campaign `_arm_replannable` hands
+    over depends on what the rest of the suite has already dialled, and a plan of
+    6 leads and a plan of 461 land nothing alike -- any fixed hour retired either
+    all of one or none of the other.
+
+    `max_per_minute=1` for the same reason, and it is the only push at the plan's
+    shape: slots are rotated off each lead's last interaction, and six leads that
+    were all last called at the same time are all placed on ONE minute -- a plan
+    with no inside for the cutoff to fall in. One call a minute is a setting the
+    operator has, it is written nowhere (the config row is untouched), and it
+    guarantees what this test needs and nothing more: a run holding both kinds of
+    slot at once.
+    """
+    monkeypatch.setitem(day_module.WAVE_BAND, "auto", (None, parse_hhmm("13:30")))
+    today = pin_clock(9, 45).date().isoformat()
+    campaign_id = _arm_replannable(today, "auto")
+    # `_approve_one` approves a PLANNED run; with nothing on file it answers
+    # `not_prepared` and never reaches `_commit`.
+    _seed_run(campaign_id, today, "auto", "planned", 3)
+
+    real_evaluate, real_commit = day_module._evaluate, day_module._commit
+
+    def evaluate_one_call_a_minute(*args, **kwargs):
+        cfg, red, dcfg, now, leads, pairs = real_evaluate(*args, **kwargs)
+        return cfg, red, replace(dcfg, max_per_minute=1), now, leads, pairs
+
+    monkeypatch.setattr(day_module, "_evaluate", evaluate_one_call_a_minute)
+
+    def commit_with_one_dialable_minute_left(conn, run, campaign, *args, **kwargs):
+        last = conn.execute(
+            "SELECT MAX(scheduled_time) AS t FROM plan_items WHERE run_id=? "
+            "AND status='planned'", (run["id"],)).fetchone()["t"]
+        if last:
+            minute = int(last[11:13]) * 60 + int(last[14:16]) - FORMI_LEAD_MINUTES
+            pin_clock(minute // 60, minute % 60)
+        return real_commit(conn, run, campaign, *args, **kwargs)
+
+    monkeypatch.setattr(day_module, "_commit", commit_with_one_dialable_minute_left)
+
+    body = client.post("/api/day/approve",
+                       json={"date": today, "campaign_ids": [campaign_id]}).json()
+
+    one = next(c for c in body["campaigns"] if c["campaign_id"] == campaign_id)
+    if one["status"] != "approved":
+        # Every remaining slot in the past is a 409 by design; a plan that fits
+        # entirely before the cutoff has none to spare, and that is not this test.
+        pytest.skip(f"the fresh plan held nothing still dialable: {one}")
+    try:
+        items = _items(client, one["run_id"])
+        missed = [i for i in items if i["status"] in ("expired", "skipped")]
+        dialled = [i for i in items if i["status"] == "simulated"]
+        if not (missed and dialled):
+            pytest.skip(f"the fresh plan did not straddle the cutoff: {one}")
+        assert body["not_dialled"] == len(missed), (
+            f"the day says {body['not_dialled']} leads were not scheduled, but only "
+            f"{len(missed)} of its {len(items)} slots did not dial")
     finally:
         _drop_run(one["run_id"])
 

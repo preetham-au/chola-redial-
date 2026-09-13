@@ -862,7 +862,16 @@ def approve_day(body: ApproveBody = Body(default_factory=ApproveBody)) -> dict[s
             "dry_run": dry_run(), "buckets": buckets or "all",
             "approved": sum(1 for r in results if r["status"] == "approved"),
             "posted": posted, "failed": sum(r.get("failed", 0) for r in results),
-            "not_dialled": sum(r.get("expired", 0) + r.get("dropped", 0) for r in results),
+            # `dropped` is already the whole of it. `_commit` adds the slots it
+            # retired for being in the past and the strays it refused for leaving
+            # the band to the count `_write_run` left behind for the leads
+            # `max_per_run` shed, so the run row carries one number meaning "did
+            # not dial". `expired` and `out_of_band` are that number's BREAKDOWN,
+            # not extra to it: adding `expired` back on top charged every retired
+            # slot twice, and a wave with 340 stale slots told the operator 680
+            # leads were not scheduled -- inflated by exactly the commonest
+            # reason a slot does not go out.
+            "not_dialled": sum(r.get("dropped", 0) for r in results),
             "campaigns": results}
 
 
