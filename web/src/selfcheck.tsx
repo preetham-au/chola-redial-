@@ -299,6 +299,21 @@ ok(
   ok('and says picking campaigns places no call',
      has(head(day({ status: 'no_campaigns' })), 'places no call'));
 
+  // A plan that was built and came back EMPTY — the afternoon wave after a
+  // morning that booked every lead reaching it. `api/day.py` answered `approved`
+  // here until 14 Sep 2026 and this screen believed it: a headline reading "0
+  // calls on the clock. This wave has been approved." over a day nobody
+  // approved and nothing was dialled for, with the call log as the only button.
+  // Worse, the screen then offered neither Build nor Approve, so leads a later
+  // re-sync pulled in could not be planned at all.
+  const blank = head(day({ status: 'nothing_to_dial', totals: { ...base.totals, ready: 0 } }));
+  ok('a wave whose plan came back empty says nothing was approved',
+     has(blank, 'Nothing was approved') && !has(blank, 'has been approved'));
+  ok('and never reads as calls on the clock', !has(blank, 'calls on the clock'));
+  // The way back. Without it the panel is a dead end until the wave rolls over.
+  ok('and offers to re-read Formi and build again, rather than only a call log',
+     has(blank, 'Re-check and build') && !has(blank, 'Open the call log'));
+
   // Both of those hand Headline the status by hand; this pins the fixture that
   // produces it. An unscoped `mockDay` always has campaigns, so nothing else
   // here evaluates the empty-scope branch -- pausing an agent empties its

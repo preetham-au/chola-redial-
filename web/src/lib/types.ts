@@ -176,7 +176,14 @@ export interface AutopilotStatus {
    order, and whether it has been dialled. Nothing goes out until the day is
    approved, so `status` is the only thing an operator has to read. */
 
-export type DayStatus = 'no_campaigns' | 'not_prepared' | 'awaiting_approval' | 'approved';
+/** `nothing_to_dial` is a plan that was built and came back EMPTY — the
+ *  afternoon wave after a morning that booked every lead reaching it. `approved`
+ *  was the server's answer here until 14 Sep 2026, and it was wrong twice over:
+ *  nobody approved anything, and the screen that believed it offered neither
+ *  Build nor Approve, so leads a later re-sync pulled in could not be planned at
+ *  all. It is what `_approve_one` already calls this state for one campaign. */
+export type DayStatus =
+  | 'no_campaigns' | 'not_prepared' | 'awaiting_approval' | 'nothing_to_dial' | 'approved';
 
 /** A RED priority band, best first. `dte` is (RED date − today): positive means
  *  the renewal is still ahead, negative means the policy is past its RED date.

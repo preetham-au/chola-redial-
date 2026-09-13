@@ -507,10 +507,10 @@ export function DayPanel({
   }, [all]);
   const chosen = picked ?? all;
 
-  const prepare = async () => {
+  const prepare = async (resync = false) => {
     setBusy('prepare');
     try {
-      const res = await panelPrepare(agent, date, kind);
+      const res = await panelPrepare(agent, date, kind, resync);
       toast('ok', `Plan built: ${n(res.ready)} leads ready across ${res.prepared} campaigns. Nothing has been dialled.`);
       day.reload();
     } catch (e) {
@@ -573,7 +573,10 @@ export function Headline({
 }: {
   day: DayView | null;
   busy: string;
-  onPrepare: () => void;
+  /** `resync` re-reads Formi first. The `nothing_to_dial` build wants it — the
+   *  plan is empty precisely because what Formi holds has moved since — and the
+   *  `not_prepared` build does not, for the reason `panelPrepare` documents. */
+  onPrepare: (resync?: boolean) => void;
   onApprove: () => void;
   onPick: () => void;
 }) {
@@ -619,8 +622,44 @@ export function Headline({
             Building a plan writes it down and dials nothing. You approve it afterwards.
           </p>
         </div>
-        <button className="btn btn-primary btn-hero" disabled={busy !== ''} onClick={onPrepare}>
+        {/* `() => onPrepare()`, not `onPrepare`: passed bare, React hands the
+            click event straight into `resync`, and a MouseEvent is truthy. The
+            everyday Build would re-read Formi for every campaign. */}
+        <button
+          className="btn btn-primary btn-hero"
+          disabled={busy !== ''}
+          onClick={() => onPrepare()}
+        >
           {busy === 'prepare' ? <Loader2 className="spin" /> : <ClipboardList />} Build the plan
+        </button>
+      </section>
+    );
+  }
+
+  if (day.status === 'nothing_to_dial') {
+    return (
+      <section className="hero">
+        <div className="hero-body">
+          <span className="eyebrow">{day.date} · {day.wave} · {day.totals.campaigns} campaigns</span>
+          <h2 className="hero-h">
+            0 <span className="hero-h-dim">leads in this wave’s plan. Nothing was approved.</span>
+          </h2>
+          <p className="hero-sub">
+            A plan was built and came back empty — every lead that reaches this wave has already
+            been booked, or sits outside {day.window.start}–{day.window.end}. No call went out and
+            none is waiting to. Building again re-reads Formi first, so leads booked or freed since
+            this plan was built are counted properly.
+          </p>
+        </div>
+        {/* Build, not Approve. This state used to answer `approved`, which left
+            the screen offering neither — so leads a later re-sync pulled in
+            could not be planned at all without reloading into another wave. */}
+        <button
+          className="btn btn-primary btn-hero"
+          disabled={busy !== ''}
+          onClick={() => onPrepare(true)}
+        >
+          {busy === 'prepare' ? <Loader2 className="spin" /> : <RefreshCw />} Re-check and build
         </button>
       </section>
     );
