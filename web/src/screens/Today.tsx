@@ -42,6 +42,13 @@ const WAVES = [
 export const wireBuckets = (chosen: string[], all: string[]) =>
   chosen.length === all.length ? [] : chosen;
 
+/** How this screen names an agent, in ONE place: the label the server gave it,
+ *  falling back to its name. The panel heading and the approve confirmation both
+ *  read from here, so the cohort named on the button the operator presses is
+ *  worded exactly like the heading they pressed it under. */
+export const agentLabel = (agent: Agent | null) =>
+  agent ? agent.language ?? agent.name : null;
+
 /** A panel's own read of the day, and its own Prepare. The scope is the panel's
  *  AGENT and nothing else.
  *
@@ -89,6 +96,33 @@ export const approveArgs = (
  *  panel never approved. */
 export const retryArgs = (args: ApproveArgs, campaign_ids: number[]): ApproveArgs =>
   [args[0], args[1], args[2], campaign_ids, args[4]];
+
+/** The approve modal, wired from the panel that opens it — its agent, its plan,
+ *  its ticks.
+ *
+ *  A function rather than JSX written inline in `DayPanel`, for the same reason
+ *  `panelDay` and `panelPrepare` are functions: `ApproveDay` only mounts behind
+ *  `approving && d`, and a static render can reach neither, so inline the one
+ *  prop that decides WHICH LANGUAGE gets dialled could be nulled with the whole
+ *  gate green. As a function the check renders it with the agent a panel would
+ *  hand it and reads the cohort back out of the markup. */
+export const approveModal = (
+  agent: Agent | null,
+  day: DayView,
+  chosen: string[],
+  all: string[],
+  onClose: () => void,
+  onDone: () => void,
+) => (
+  <ApproveDay
+    agent={agent}
+    day={day}
+    buckets={wireBuckets(chosen, all)}
+    shown={chosen}
+    onClose={onClose}
+    onDone={onDone}
+  />
+);
 
 /** A campaign the server will accept into the daily plan. Disabled and hidden
  *  are both refused with a 409, so they are shown and not offered rather than
@@ -215,7 +249,7 @@ export function PanelHead({
   day: DayView | null;
   onReload: () => void;
 }) {
-  const who = agent ? agent.language ?? agent.name : null;
+  const who = agentLabel(agent);
   return (
     <div className="row" style={{ gap: 8, alignItems: 'baseline' }}>
       {who && <h2 style={{ margin: 0 }}>{who}</h2>}
@@ -316,16 +350,9 @@ export function DayPanel({
           the panel that says why. */}
       {d && d.stopped.length > 0 && <Stopped day={d} />}
 
-      {approving && d && (
-        <ApproveDay
-          agent={agent}
-          day={d}
-          buckets={wireBuckets(chosen, all)}
-          shown={chosen}
-          onClose={() => setApproving(false)}
-          onDone={() => day.reload()}
-        />
-      )}
+      {approving &&
+        d &&
+        approveModal(agent, d, chosen, all, () => setApproving(false), () => day.reload())}
     </div>
   );
 }
@@ -1120,6 +1147,22 @@ export function ApproveDay({
       )}
 
       <div className="confirm-facts">
+        {/* First fact, above the day itself: every other number here is the same
+            shape whichever cohort is being dialled, so this is the one line that
+            tells the operator WHOSE calls they are about to place. Worded by
+            `agentLabel`, the same rule as the heading on the panel whose button
+            opened this modal.
+
+            Which of the two wordings shows is decided by `args[4]` — the agent
+            id actually going on the wire — and not by a second reading of
+            `agent`. A fact the operator approves has to be a fact about the
+            request they are approving, so a scope lost between here and
+            `approveArgs` reads as "the whole roster" instead of quietly keeping
+            the language name above it. */}
+        <Fact
+          k="Who this dials"
+          v={args[4] === undefined ? 'every agent — the whole roster' : agentLabel(agent)}
+        />
         <Fact k="Day" v={`${day.date} · ${day.wave}`} />
         <Fact k="Campaigns" v={day.totals.campaigns} />
         <Fact k="Buckets" v={buckets.length === 0 ? 'all of them' : shown.join(', ')} />

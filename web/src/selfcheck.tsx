@@ -11,11 +11,13 @@ import { BucketOffWhy } from './screens/Dashboard';
 import { TestCallResultView, TestNumberTable, TriggerConfirm } from './screens/TestCall';
 import {
   ApproveDay,
+  DayPanel,
   DialResult,
   Headline,
   PanelHead,
   Today,
   approveArgs,
+  approveModal,
   autopilotDiff,
   closesAt,
   panelDay,
@@ -452,8 +454,12 @@ ok(
   const wholeDay = mockDay(DATE, 'auto');
   ok('the day fixture really is unscoped, or the two sources cannot be told apart',
      wholeDay.agent_id === null);
-  ok('approving a panel dials that panel’s agent and nobody else',
-     approveArgs(labelled(127, 'Tamil'), wholeDay, [])[4] === 127);
+  // The date/kind clause is not decoration: `ApproveArgs[0]` and `[1]` are both
+  // `string`, so transposing them type-checks and goes out on the wire as a
+  // request for the wrong day. `DATE` and `'auto'` cannot be swapped unnoticed.
+  const tamilArgs = approveArgs(labelled(127, 'Tamil'), wholeDay, []);
+  ok('approving a panel dials that panel’s agent and nobody else, on the day and wave it is showing',
+     tamilArgs[4] === 127 && tamilArgs[0] === DATE && tamilArgs[1] === 'auto');
   ok('and takes it from the panel, never from the agent the response echoed back',
      approveArgs(labelled(125, 'Hindi'), wholeDay, [])[4] === 125);
   ok('an unscoped panel still approves the whole day, exactly as before scoping',
@@ -465,10 +471,44 @@ ok(
   const dialled = approveArgs(labelled(125, 'Hindi'), wholeDay, ['M0']);
   ok('a retry dials the same agent the approve it is retrying dialled',
      retryArgs(dialled, [7])[4] === 125);
-  ok('with the same buckets, narrowed only to the campaigns that never started',
+  ok('with the same day, wave and buckets, narrowed only to the campaigns that never started',
+     retryArgs(dialled, [7])[0] === DATE && retryArgs(dialled, [7])[1] === 'auto' &&
      retryArgs(dialled, [7])[2].join() === 'M0' && retryArgs(dialled, [7])[3].join() === '7');
   ok('and an unscoped approve retries unscoped, exactly as before scoping',
      retryArgs(approveArgs(null, wholeDay, []), [7])[4] === undefined);
+
+  // The operator has to be told WHICH cohort the button in front of them dials.
+  // Everything else in that facts block — day, campaigns, buckets, selected,
+  // window — reads identically whether one language or both are about to go out.
+  //
+  // `ApproveDay` only mounts behind `approving && d`, neither of which a static
+  // render reaches, so the panel's wiring is `approveModal` and it is rendered
+  // here with the agent a panel would hand it. Nulling that agent inside
+  // `approveModal` is exactly the mis-scope Finding 2 named, and it now shows up
+  // in the markup as the wrong cohort.
+  const approveFor = (a: Agent | null) =>
+    renderToStaticMarkup(
+      approveModal(a, a ? mockDay(DATE, 'auto', a.agent_id) : wholeDay, ['M0'], ['M0', 'F5'],
+                   () => {}, () => {}),
+    );
+  const tamilApprove = approveFor(labelled(127, 'Tamil'));
+  ok('the approve confirmation names the cohort it is about to dial',
+     has(tamilApprove, '<b>Tamil</b>'));
+  ok('and the panel hands that modal its own agent, never a wider one',
+     !has(tamilApprove, 'whole roster'));
+  ok('the cohort is worded like the panel heading above it, not re-derived',
+     has(approveFor(labelled(125, null)), '<b>Agent 125</b>'));
+  ok('an unscoped approve says out loud that it dials every agent',
+     has(approveFor(null), 'every agent — the whole roster') &&
+     !has(approveFor(null), '<b>Tamil</b>'));
+
+  // The other end of the same thread: what `DayPanel` hands DOWN. Only the
+  // heading is reachable statically — `d` is null with no effects, so nothing
+  // below it renders — but that is one real call site pinned rather than none.
+  ok('a panel heads itself with the agent it was handed, not with nobody',
+     has(renderToStaticMarkup(
+       <DayPanel agent={labelled(127, 'Tamil')} date={DATE} kind="auto" rev={0} onPick={() => {}} />,
+     ), '>Tamil</h2>'));
 
   const screen = renderToStaticMarkup(<Today />);
   ok('the day screen renders its panels before any plan has arrived',
