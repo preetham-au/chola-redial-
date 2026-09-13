@@ -272,8 +272,15 @@ def dispatch(
             desired[index] = start + (base - start) % span
 
     blank = [i for i, m in enumerate(desired) if m is None]
+    # Across `span - 1`, not `span`: the window is half-open (see `_free_minute`),
+    # so the last minute anybody may be placed on is `end_min - 1`. Spreading onto
+    # `end_min` handed the last lead a minute the window had already shut on, and
+    # `_free_minute` answered None -- one lead silently unplaceable per plan, the
+    # one the spread had picked to go last. The rotation above already works in
+    # `span` modulo, so it never produced `end_min` in the first place.
     for k, index in enumerate(blank):
-        desired[index] = start if len(blank) < 2 else start + int(round(k * span / (len(blank) - 1)))
+        desired[index] = start if len(blank) < 2 else \
+            start + int(round(k * (span - 1) / (len(blank) - 1)))
 
     # --- rules 1 + 4: place the wave's call in priority order, staggered -----
     load: dict[int, int] = {}
@@ -314,11 +321,20 @@ def dispatch(
 
 def _free_minute(wanted: int, load: dict[int, int], dcfg: DispatchConfig,
                  floor_min: Optional[int] = None) -> Optional[int]:
-    """First minute >= `wanted` under the per-minute ceiling, or None."""
+    """First minute >= `wanted` under the per-minute ceiling, or None.
+
+    The window is half-open: `end_min` is when it SHUTS, so no call is placed on
+    it. Inclusive, the minute where two windows meet belonged to both of them --
+    the morning band ends at WAVE_BOUNDARY and the afternoon's begins there, so a
+    campaign capped at ten calls a minute put twenty on 13:30 the moment it ran
+    both waves, with neither run over its own ceiling. It also makes the capacity
+    arithmetic true: `end - start` minutes are dialable, which is what
+    `_day_window` has always counted.
+    """
     minute = max(wanted, dcfg.start_min if floor_min is None else floor_min)
     if not dcfg.max_per_minute:
-        return minute if minute <= dcfg.end_min else None
-    while minute <= dcfg.end_min:
+        return minute if minute < dcfg.end_min else None
+    while minute < dcfg.end_min:
         if load.get(minute, 0) < dcfg.max_per_minute:
             return minute
         minute += 1

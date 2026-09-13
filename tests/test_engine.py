@@ -268,7 +268,10 @@ def test_leads_with_no_history_are_spread_across_the_window():
     pairs = [_pair("F1", f"n{i}") for i in range(11)]
     result = dispatch(pairs, TODAY, DEFAULT_CONFIG, WIDE)
     minutes = sorted(s.minute for s in result.slots)
-    assert minutes[0] == WIDE.start_min and minutes[-1] == WIDE.end_min
+    # `end_min - 1`: the dial window is half-open, so `end_min` is the minute it
+    # SHUTS on and nothing may be placed there. Inclusive, the minute where the
+    # morning and afternoon bands meet belonged to both waves at once.
+    assert minutes[0] == WIDE.start_min and minutes[-1] == WIDE.end_min - 1
     assert len(set(minutes)) == 11
 
 

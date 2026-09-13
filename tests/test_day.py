@@ -289,6 +289,40 @@ def test_band_leaves_other_config_untouched(client):
     assert band.red_priority == dcfg.red_priority
 
 
+def test_the_boundary_minute_belongs_to_exactly_one_wave(client):
+    """13:30 is the afternoon's first minute, never also the morning's last.
+
+    The dial window was inclusive at both ends, so the minute the bands meet was
+    dialable by BOTH of them. `max_per_minute` is enforced per run, so a campaign
+    capped at 10 calls a minute put 20 on 13:30 the moment it ran both waves --
+    and no run had broken its own ceiling.
+
+    Half-open is the fix, and it is the only one that keeps `_clip` honest: the
+    alternative moves one band's edge off WAVE_BOUNDARY, so the two waves no
+    longer meet and half a minute of the day belongs to neither.
+    """
+    from api.day import AFTERNOON, MORNING, kind_for
+    from engine.dispatcher import _free_minute
+
+    window = DispatchConfig(start_min=9 * 60, end_min=20 * 60)
+    morning, afternoon = _band(MORNING, window), _band(AFTERNOON, window)
+
+    assert kind_for(WAVE_BOUNDARY) == AFTERNOON, "the minute has to belong to somebody"
+    assert _free_minute(WAVE_BOUNDARY, {}, morning) is None, \
+        "the morning is over at the boundary; it must not place a call on it"
+    assert _free_minute(WAVE_BOUNDARY, {}, afternoon) == WAVE_BOUNDARY, \
+        "the afternoon opens ON the boundary, or the minute belongs to nobody"
+    assert _free_minute(WAVE_BOUNDARY - 1, {}, morning) == WAVE_BOUNDARY - 1, \
+        "the minute before it is still the morning's, or the band lost a minute"
+
+    # The same both ways through the function: with no per-minute ceiling it
+    # answers from a different line, and only one of the two used to be fixed.
+    uncapped = _band(MORNING, DispatchConfig(start_min=9 * 60, end_min=20 * 60,
+                                             max_per_minute=0))
+    assert _free_minute(WAVE_BOUNDARY, {}, uncapped) is None, \
+        "an uncapped campaign must respect the same close"
+
+
 def test_prepare_reports_the_band_that_closed_not_the_whole_window(client, pin_clock):
     """Preparing the morning wave after the boundary must name the BAND.
 
@@ -1287,3 +1321,4 @@ def test_spread_names_the_afternoon_band_the_afternoon_is_judged_against(client,
     monkeypatch.setitem(day_module.WAVE_BAND, "auto_pm", (parse_hhmm("13:30"), None))
     spread = client.get("/api/day?kind=auto_pm").json()["spread"]
     assert spread["band"] == {"start": "13:30", "end": "20:00"}
+
