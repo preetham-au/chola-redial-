@@ -38,6 +38,7 @@ import {
   runQueue,
   scopeMismatch,
   stoppedShort,
+  straddlesBand,
   STALE_MIN,
   wireBuckets,
 } from './screens/Today';
@@ -1060,6 +1061,19 @@ ok(
   ok('the hours in the band are kept and only the strays are returned',
      out({ '8': 1, '9': 2, '13': 3, '20': 4 }, AM) === '8,20');
 
+  // The other side of the same arithmetic. `outsideBand` is right to let the
+  // 13:00 hour through, but letting it through SILENTLY leaves a half-hour
+  // escape hatch on the exact boundary the card polices: hour-sized buckets
+  // cannot say whether a 13:0x call belonged to the morning or the afternoon.
+  const cut = (hours: Record<string, number>, band: DialWindow) =>
+    straddlesBand({ band, hours }).map(([h]) => h).join();
+  ok('the hour a 13:30 boundary cuts in half is named as unjudgeable, under either wave',
+     cut({ '9': 1, '13': 4 }, AM) === '13' && cut({ '13': 4, '15': 2 }, PM) === '13');
+  ok('an hour the band opens or closes exactly ON is not ambiguous — nothing is split',
+     cut({ '9': 1, '20': 2 }, { start: '09:00', end: '20:00' }) === '');
+  ok('and an hour wholly outside the band is a stray, not an ambiguity — it is already judged',
+     cut({ '8': 1, '20': 2 }, AM) === '' && out({ '8': 1, '20': 2 }, AM) === '8,20');
+
   // The card itself: it is the one place an operator sees the verdict, and the
   // sentence under the bars is the only part of it that names a number.
   // `dry_run` is explicit on every render below: the fixture ships `true`, and
@@ -1113,6 +1127,18 @@ ok(
   ok('and its heading is in the conditional too',
      has(kept, 'Where the calls landed')
      && has(rehearsed, 'Where the calls would have landed'));
+  // On screen: the card has to SAY it cannot judge the boundary hour, not just
+  // decline to redden it. Silence there reads as a pass.
+  ok('the card says outright which hour it cannot answer for, and how many calls that is',
+     has(kept, '13:00 is')
+     && has(kept, 'cut in half by the 09:00–13:30 band')
+     && has(kept, 'which of those 12 calls kept the band'));
+  ok('and the unresolved bar is neither the green of a pass nor the red of an accusation',
+     has(kept, 'var(--warn)') && !has(kept, 'var(--bad)'));
+  const clear = proof({ band: { start: '09:00', end: '20:00' }, hours: { '9': 40, '13': 12 } });
+  ok('a band that opens and closes on the hour has nothing to disclaim',
+     !has(clear, 'cut in half') && !has(clear, 'var(--warn)'));
+
   const rehearsedStray = proof({ band: AM, hours: { '9': 40, '19': 12, '20': 3 } }, {}, true);
   ok('a rehearsed wave that strayed is told where it WOULD have strayed, not where it landed',
      has(rehearsedStray, '15 calls were scheduled outside the 09:00–13:30 band')

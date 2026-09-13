@@ -389,6 +389,28 @@ export const outsideBand = (spread: DaySpread): [string, number][] => {
   return Object.entries(spread.hours).filter(([h]) => +h * 60 + 59 < lo || +h * 60 >= hi);
 };
 
+/** The hours no bar can answer for: the ones a band edge cuts in half.
+ *
+ *  `_spread` groups by `substr(scheduled_time, 12, 2)` — whole hours — and the
+ *  morning/afternoon boundary is 13:30. So every call between 13:00 and 13:59
+ *  arrives in this card as one number, and which half of it kept the band is
+ *  information the answer no longer contains. `outsideBand` is right to leave
+ *  that hour alone: reddening it would accuse calls that were on time. But
+ *  leaving it green and silent is the same lie the other way round, and it lands
+ *  on exactly the thirty minutes the card exists to police.
+ *
+ *  So: name it. An hour the band edge passes through is drawn as unresolved and
+ *  said out loud, and the operator is sent to the call log, which keeps the
+ *  minute. Fixing this properly means minute-resolution buckets from
+ *  `api/day.py` — out of scope here, and the wrong trade for a chart. */
+export const straddlesBand = (spread: DaySpread): [string, number][] => {
+  const min = (t: string) => +t.slice(0, 2) * 60 + +t.slice(3, 5);
+  const edges = [min(spread.band.start), min(spread.band.end)];
+  // Strictly inside: an edge ON the hour (09:00, 20:00) splits nothing.
+  return Object.entries(spread.hours)
+    .filter(([h]) => edges.some((e) => +h * 60 < e && e < +h * 60 + 60));
+};
+
 /** Which campaigns to arm and which to disarm — the only thing this screen puts
  *  on the wire that changes who gets called.
  *
@@ -1334,6 +1356,7 @@ export function Proof({ day, onReload }: { day: DayView; onReload: () => void })
 
   const peak = Math.max(...hours.map(([, v]) => v));
   const outside = outsideBand(day.spread);
+  const unresolved = straddlesBand(day.spread);
   // The spread counts `simulated` rows beside `posted` ones, so under DRY_RUN
   // these bars are drawn entirely from calls that never left the building. The
   // shape is still worth showing — it is the schedule this wave WOULD have
@@ -1362,13 +1385,21 @@ export function Proof({ day, onReload }: { day: DayView; onReload: () => void })
     >
       <div className="row" style={{ gap: 4, alignItems: 'flex-end', height: 64 }}>
         {hours.map(([h, v]) => (
-          <div key={h} style={{ flex: 1, textAlign: 'center' }} title={`${h}:00 — ${n(v)} calls`}>
+          <div
+            key={h}
+            style={{ flex: 1, textAlign: 'center' }}
+            title={unresolved.some(([u]) => u === h)
+              ? `${h}:00 — ${n(v)} calls, split by the band edge; the call log has the minute`
+              : `${h}:00 — ${n(v)} calls`}
+          >
             <div
               style={{
                 height: `${(v / peak) * 48}px`,
                 background: outside.some(([o]) => o === h)
                   ? 'var(--bad)'
-                  : live ? 'var(--ok)' : 'var(--faint)',
+                  : unresolved.some(([u]) => u === h)
+                    ? 'var(--warn)'
+                    : live ? 'var(--ok)' : 'var(--faint)',
                 borderRadius: 2,
               }}
             />
@@ -1381,6 +1412,16 @@ export function Proof({ day, onReload }: { day: DayView; onReload: () => void })
         <p className="hero-sub" style={{ color: 'var(--bad)' }}>
           {n(outside.reduce((s, [, v]) => s + v, 0))} calls {live ? 'landed' : 'were scheduled'}
           {' '}outside the {day.spread.band.start}–{day.spread.band.end} band.
+        </p>
+      )}
+
+      {unresolved.length > 0 && (
+        <p className="hero-sub" style={{ color: 'var(--warn)' }}>
+          {unresolved.map(([h]) => `${h}:00`).join(' and ')} {unresolved.length === 1 ? 'is' : 'are'}
+          {' '}cut in half by the {day.spread.band.start}–{day.spread.band.end} band, and these bars
+          count whole hours — so this card cannot say which of those{' '}
+          {n(unresolved.reduce((s, [, v]) => s + v, 0))} calls kept the band. The call log keeps the
+          minute.
         </p>
       )}
 
