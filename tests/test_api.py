@@ -493,11 +493,10 @@ def test_plan_honours_a_narrowed_dial_window(client):
                        ).status_code == 422
 
 
-def test_todays_plan_refuses_a_window_that_has_already_closed(client):
-    from api.db import now_ist
-
-    if now_ist().hour < 11:
-        pytest.skip("the window used here has not closed yet")
+def test_todays_plan_refuses_a_window_that_has_already_closed(client, pin_clock):
+    # 12:00, so the 09:30-10:00 window below has genuinely closed at every hour
+    # the suite might run at. It used to skip itself before 11:00 real time.
+    pin_clock(12)
     r = client.post("/api/campaigns/1/plan",
                     json={"date": TODAY, "start": "09:30", "end": "10:00"})
     assert r.status_code == 422 and "already" in r.json()["error"]
@@ -517,12 +516,16 @@ def test_hand_edited_slot_obeys_the_same_rules_as_the_planner(client):
     assert ok.status_code == 200 and ok.json()["scheduled_time"] == "2026-08-28T15:07:00"
 
 
-def test_approving_a_stale_plan_retires_the_slots_that_have_passed(client):
+def test_approving_a_stale_plan_retires_the_slots_that_have_passed(client, pin_clock):
     """A plan left sitting must never post a time that has already gone."""
-    from api.db import db_path, now_ist
+    from api.db import db_path
 
-    if now_ist().hour < 12:
-        pytest.skip("needs a time of day with room to put slots behind the clock")
+    # 14:00, which is the room this test needs to put a slot behind the clock.
+    # It used to ask the wall clock for that room and skip itself before noon --
+    # and because it COMMITS campaign 3's run for today, whether it ran decided
+    # whether test_approve_under_dry_run_simulates_and_never_dials found a
+    # campaign it could still plan. That is the whole of the after-lunch flake.
+    pin_clock(14)
     run = _plan_today(client, 3)
     items = client.get(f"/api/runs/{run['id']}/items?page_size=500").json()["items"]
     if len(items) < 2:
@@ -918,10 +921,19 @@ def no_network(monkeypatch):
     return boom
 
 
-def test_approve_under_dry_run_simulates_and_never_dials(client, no_network):
+def test_approve_under_dry_run_simulates_and_never_dials(client, no_network, pin_clock):
     # TODAY, not a fixed date: approving a run whose slots are all in the past is
     # a 409, so a hardcoded date turns this into a failure the day after it lands.
-    run = client.post("/api/campaigns/3/plan", json={"date": TODAY}).json()
+    #
+    # `_fresh_plan`, not a bare plan post: `client` is session-scoped, and
+    # test_approving_a_stale_plan_retires_the_slots_that_have_passed COMMITS
+    # campaign 3's run for today earlier in this file. A committed run makes every
+    # later plan for that campaign a 409 -- `_write_run` refuses to rewrite a run
+    # that has been acted on -- so this test read `run['id']` off an error body and
+    # died with KeyError. It only did so after noon, because the test that commits
+    # the run skipped itself before then; both now run at every hour.
+    pin_clock(14)
+    run = _fresh_plan(client, 3)
     approved = client.post(f"/api/runs/{run['id']}/approve").json()
 
     assert approved["dry_run"] is True

@@ -107,17 +107,42 @@ def _first(result: dict) -> dict:
     return campaigns[0]
 
 
-def _skip_if_shut(entry: dict) -> None:
-    if entry.get("status") == "window_closed":
-        pytest.skip("today's dial window has already closed")
+@pytest.fixture
+def morning(pin_clock):
+    """10:00 IST, whatever hour the suite actually runs at.
+
+    Inside the morning band (each campaign's own opening to WAVE_BOUNDARY, 13:30)
+    with room to spare: Formi's five-minute floor puts the first dialable slot at
+    10:05, leaving three and a half hours of band behind it.
+    """
+    return pin_clock(10)
 
 
-def test_a_pass_prepares_a_plan_and_dials_nothing(armed):
+@pytest.fixture
+def afternoon(pin_clock):
+    """15:00 IST -- inside the afternoon band (13:30 to each campaign's own close)."""
+    return pin_clock(15)
+
+
+def _open(entry: dict) -> dict:
+    """The band is pinned open, so a shut one is a bug rather than a bad hour.
+
+    This was `_skip_if_shut`, and it is the whole reason this file needed
+    repairing: it let the wall clock decide whether a test ran, so once the
+    morning wave stopped at 13:30 every test below quietly stopped running after
+    lunch and the suite still reported green. With the hour pinned, `window_closed`
+    can only mean the band logic is wrong -- which is a failure, and says so.
+    """
+    assert entry.get("status") != "window_closed", \
+        f"the band must be open at the pinned hour: {entry}"
+    return entry
+
+
+def test_a_pass_prepares_a_plan_and_dials_nothing(morning, armed):
     """The whole of the approval gate: the clock plans, it never calls."""
     from api.autopilot import AM, run_pass
 
-    entry = _first(run_pass(AM, TODAY))
-    _skip_if_shut(entry)
+    entry = _open(_first(run_pass(AM, TODAY)))
     assert entry["status"] == "prepared"
     assert entry["ready"] > 0
 
@@ -132,7 +157,7 @@ def test_a_pass_prepares_a_plan_and_dials_nothing(armed):
     conn.close()
 
 
-def test_no_wave_books_both_calls_of_the_day_up_front(armed):
+def test_no_wave_books_both_calls_of_the_day_up_front(morning, armed):
     """"2nd call only if the 1st is not answered" — so one slot per lead per wave.
 
     Booking slot 2 in the morning commits the afternoon call before anyone has
@@ -140,7 +165,7 @@ def test_no_wave_books_both_calls_of_the_day_up_front(armed):
     """
     from api.autopilot import AM, run_pass
 
-    _skip_if_shut(_first(run_pass(AM, TODAY)))
+    _open(_first(run_pass(AM, TODAY)))
 
     conn = _db()
     slots = [r["slot_no"] for r in conn.execute(
@@ -152,10 +177,10 @@ def test_no_wave_books_both_calls_of_the_day_up_front(armed):
     assert set(slots) == {1}, f"morning pass pre-booked a second call: slots={set(slots)}"
 
 
-def test_a_second_pass_is_a_no_op_rather_than_a_second_plan(armed):
+def test_a_second_pass_is_a_no_op_rather_than_a_second_plan(morning, armed):
     from api.autopilot import AM, run_pass
 
-    _skip_if_shut(_first(run_pass(AM, TODAY)))
+    _open(_first(run_pass(AM, TODAY)))
     assert _first(run_pass(AM, TODAY))["status"] == "prepared", \
         "re-preparing an unapproved plan is allowed — it is still `planned`"
 
@@ -468,12 +493,13 @@ def test_autopilot_switch_endpoints(client, armed):
 # ---------------------------------------------------------------------------
 
 def _prepare(client, armed) -> dict:
+    """Prepare the morning wave. Callers must pin the clock into that band first."""
     body = client.post("/api/day/prepare", json={"date": TODAY.isoformat()}).json()
-    _skip_if_shut(_first(body))
+    _open(_first(body))
     return body
 
 
-def test_the_day_waits_for_an_approval_and_dials_nothing_before_it(client, armed):
+def test_the_day_waits_for_an_approval_and_dials_nothing_before_it(morning, client, armed):
     prepared = _prepare(client, armed)
     assert prepared["ready"] > 0
 
@@ -486,7 +512,7 @@ def test_the_day_waits_for_an_approval_and_dials_nothing_before_it(client, armed
     assert day["campaigns"][0]["run_status"] == "planned"
 
 
-def test_red_bands_lead_the_order_and_the_buckets_follow_them(client, armed):
+def test_red_bands_lead_the_order_and_the_buckets_follow_them(morning, client, armed):
     """Just-lapsed (RED+1..+3) first, then the run-up (RED-7..RED).
 
     Ahead of the bucket order, not inside it. The pair is the client's two
@@ -696,10 +722,9 @@ def armed_all(monkeypatch):
     return ids
 
 
-def test_approving_dials_only_the_ticked_buckets(client, armed_all):
+def test_approving_dials_only_the_ticked_buckets(morning, client, armed_all):
     prepared = client.post("/api/day/prepare", json={"date": TODAY.isoformat()}).json()
-    if not prepared["ready"]:
-        pytest.skip("today's dial window has already closed")
+    assert prepared["ready"], "the morning band is pinned open — an empty plan is the bug"
 
     day = client.get(f"/api/day?date={TODAY.isoformat()}").json()
     offered = [b["bucket"] for b in day["buckets"]]
@@ -719,11 +744,10 @@ def test_approving_dials_only_the_ticked_buckets(client, armed_all):
     assert outcomes == {"simulated"}, "DRY_RUN must never produce a real outcome"
 
 
-def test_an_unticked_bucket_is_not_dialled_today_and_is_not_lost(client, armed_all):
+def test_an_unticked_bucket_is_not_dialled_today_and_is_not_lost(morning, client, armed_all):
     """The un-ticked leads are still evaluated and recorded — just not called."""
     prepared = client.post("/api/day/prepare", json={"date": TODAY.isoformat()}).json()
-    if not prepared["ready"]:
-        pytest.skip("today's dial window has already closed")
+    assert prepared["ready"], "the morning band is pinned open — an empty plan is the bug"
     day = client.get(f"/api/day?date={TODAY.isoformat()}").json()
     pick = [day["buckets"][0]["bucket"]]
     dropped = sum(b["ready"] for b in day["buckets"][1:])
@@ -740,7 +764,7 @@ def test_an_unticked_bucket_is_not_dialled_today_and_is_not_lost(client, armed_a
     assert dropped > 0 and audited > len(pick)
 
 
-def test_approving_twice_does_not_dial_twice(client, armed):
+def test_approving_twice_does_not_dial_twice(morning, client, armed):
     _prepare(client, armed)
     first = client.post("/api/day/approve", json={"date": TODAY.isoformat()}).json()
     assert first["approved"] == 1
@@ -756,7 +780,7 @@ def test_approving_twice_does_not_dial_twice(client, armed):
     assert sent == first["posted"], "the second approval sent something"
 
 
-def test_a_hidden_campaign_is_neither_planned_nor_approved(client, armed):
+def test_a_hidden_campaign_is_neither_planned_nor_approved(morning, client, armed):
     """Hidden has to hold on the day path, not just in the picker.
 
     Un-ticking a campaign and hiding it look the same on screen; only one of them
@@ -785,7 +809,7 @@ def test_a_hidden_campaign_is_neither_planned_nor_approved(client, armed):
         client.post(f"/api/campaigns/{armed}/unhide")
 
 
-def test_a_hidden_campaign_still_dialling_today_is_never_off_screen(client, armed):
+def test_a_hidden_campaign_still_dialling_today_is_never_off_screen(morning, client, armed):
     """Hiding leaves today's queued calls running — so it stays listed while they run.
 
     Invisible everywhere plus still dialling is the one state this console must
@@ -797,12 +821,10 @@ def test_a_hidden_campaign_still_dialling_today_is_never_off_screen(client, arme
     run = conn.execute("SELECT id FROM runs WHERE campaign_id=? AND run_date=?",
                        (armed, TODAY.isoformat())).fetchone()["id"]
     conn.execute("UPDATE runs SET status='committed' WHERE id=?", (run,))
-    # An hour out, so this does not depend on what time the suite runs -- except
-    # after 23:00, when nothing can still be queued for today and the point is moot.
+    # An hour out. `morning` pins the clock at 10:00, so this lands at 11:00 the
+    # same day whatever hour the suite runs at -- the 23:00 rollover that used to
+    # need its own skip cannot be reached from a pinned morning.
     later = (now_ist() + datetime.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:00")
-    if later[:10] != TODAY.isoformat():
-        conn.close()
-        pytest.skip("past 23:00 IST: no slot can still be ahead of the clock today")
     conn.execute("UPDATE plan_items SET status='simulated', scheduled_time=? WHERE run_id=?",
                  (later, run))
     conn.commit()
@@ -824,7 +846,7 @@ def test_a_hidden_campaign_still_dialling_today_is_never_off_screen(client, arme
         conn.close()
 
 
-def test_a_paused_campaign_is_neither_planned_nor_approved(client, armed):
+def test_a_paused_campaign_is_neither_planned_nor_approved(morning, client, armed):
     _prepare(client, armed)
     assert client.post(f"/api/campaigns/{armed}/pause").status_code == 200
 
@@ -907,17 +929,20 @@ def _planned_pm(campaign_id: int) -> set[str]:
     ("", 300.0, False, "no disposition, but five minutes says they were reached"),
 ])
 def test_the_afternoon_wave_reconsiders_this_mornings_outcome(
-        armed, stage, duration, again, why):
+        afternoon, armed, stage, duration, again, why):
     """`armed` stubs `_resync`, so the outcome written above is what gets read.
 
     In production that re-sync is exactly what puts the morning's disposition and
     duration into these columns; here they are placed by hand and the warehouse
     is never reached.
+
+    Pinned to 15:00 -- the afternoon band, and late enough that the "four hours
+    ago" call `_dialled_this_morning` writes really is this morning.
     """
     from api.autopilot import PM, run_pass
 
     uuid = _dialled_this_morning(armed, stage, duration)
-    _skip_if_shut(_first(run_pass(PM, TODAY)))
+    _open(_first(run_pass(PM, TODAY)))
 
     planned = _planned_pm(armed)
     assert (uuid in planned) is again, f"{why} (planned={planned})"
