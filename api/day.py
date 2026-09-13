@@ -131,6 +131,20 @@ def _clip(start: int, end: int, kind: str) -> tuple[int, int]:
             min(end, hi if hi is not None else 24 * 60))
 
 
+def kind_for(minute: int) -> str:
+    """Which wave owns this minute of the day. Exactly one of them does.
+
+    Read off WAVE_BAND rather than WAVE_BOUNDARY so there is one source of truth
+    for where the day divides -- a test that pins the band gets this too.
+
+    The boundary minute belongs to the AFTERNOON: the morning's band ends at it
+    and `_free_minute` will not place a call on a window's closing minute, so
+    13:30 is dialled by one wave, not by both.
+    """
+    _, morning_ends = WAVE_BAND[MORNING]
+    return MORNING if minute < morning_ends else AFTERNOON
+
+
 def _band(kind: str, dcfg: DispatchConfig) -> DispatchConfig:
     """The campaign's own dial window, clipped to this wave's half of the day.
 

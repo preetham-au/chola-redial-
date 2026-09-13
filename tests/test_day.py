@@ -1322,3 +1322,133 @@ def test_spread_names_the_afternoon_band_the_afternoon_is_judged_against(client,
     spread = client.get("/api/day?kind=auto_pm").json()["spread"]
     assert spread["band"] == {"start": "13:30", "end": "20:00"}
 
+# ---------------------------------------------------------------------------
+# Which wave a run belongs to
+#
+# `_write_run` replaces any `planned` run for (campaign, date, KIND), so the kind
+# a writer picks decides which wave's plan it destroys. The per-campaign
+# `POST /api/campaigns/{id}/plan` used to hardcode `kind="auto"` with an UNBANDED
+# config: opening Plan Review and pressing Build deleted the day screen's banded
+# morning run and left an all-day one in its place, filed as the morning. Approve
+# then posted 19:5x calls under the name "morning wave".
+# ---------------------------------------------------------------------------
+
+def _tomorrow() -> str:
+    """A date `_floor_min` returns None for, so the clock cannot decide the band.
+
+    Tomorrow rather than today on purpose: a run this file does not tag 'seeded'
+    is not swept by `clean_runs`, and the `client` fixture is session-scoped, so a
+    stray run dated TODAY would answer another file's day view. Nothing in the
+    suite reads a future run except through `stranded`, which is past-only.
+    """
+    return (now_ist().date() + timedelta(days=1)).isoformat()
+
+
+def _drop_run(run_id: int) -> None:
+    """Remove a run the API wrote. `clean_runs` only sweeps note='seeded' rows."""
+    with session() as conn:
+        conn.execute("DELETE FROM plan_items WHERE run_id=?", (run_id,))
+        conn.execute("DELETE FROM decisions WHERE run_id=?", (run_id,))
+        conn.execute("DELETE FROM runs WHERE id=?", (run_id,))
+        conn.commit()
+
+
+def _items(client, run_id: int) -> list[dict]:
+    return client.get(f"/api/runs/{run_id}/items?page_size=2000").json()["items"]
+
+
+def test_a_per_campaign_plan_is_banded_to_the_wave_it_files_itself_under(client, monkeypatch):
+    """Build on Plan Review must produce the same banded run the day screen would."""
+    monkeypatch.setitem(day_module.WAVE_BAND, "auto", (None, parse_hhmm("13:30")))
+    campaign_id = _arm()[0]
+    day = _tomorrow()
+    replaced = _seed_run(campaign_id, day, "auto", "planned", 3)
+
+    built = client.post(f"/api/campaigns/{campaign_id}/plan", json={"date": day})
+    assert built.status_code == 200, built.text
+    built = built.json()
+    try:
+        # Before the empty-plan skip below, both of them: a wrongly banded plan
+        # can come back with no slots at all, and a test that skips on that is a
+        # test that goes quiet exactly when the bug is present.
+        assert built["kind"] == "auto", "a plan that opens before the boundary is the morning"
+        # It really does replace the day screen's run -- which is why the run it
+        # leaves behind has to be the same shape.
+        assert client.get(f"/api/runs/{replaced}").status_code == 404
+        items = _items(client, built["id"])
+        if not items:
+            pytest.skip("nothing due tomorrow in the seed")
+        latest = max(i["scheduled_time"][11:16] for i in items)
+        # The band's close, not one minute inside it: which wave owns 13:30
+        # itself is `_free_minute`'s question, asserted where it is answered.
+        assert latest <= "13:30", \
+            f"a run filed as the morning wave put a call at {latest}"
+    finally:
+        _drop_run(built["id"])
+
+
+def test_a_per_campaign_plan_after_the_boundary_leaves_the_morning_alone(client, monkeypatch):
+    """A window that opens after the boundary is the AFTERNOON wave, and files itself so.
+
+    The two halves of the day are two runs. Writing this one as `auto` did not
+    merely mislabel it: `_write_run` deletes the `planned` run for the kind it is
+    given, so the morning's plan went with it.
+    """
+    monkeypatch.setitem(day_module.WAVE_BAND, "auto_pm", (parse_hhmm("13:30"), None))
+    campaign_id = _arm()[0]
+    day = _tomorrow()
+    morning = _seed_run(campaign_id, day, "auto", "planned", 3)
+
+    built = client.post(f"/api/campaigns/{campaign_id}/plan",
+                        json={"date": day, "start": "14:00", "end": "18:00"})
+    assert built.status_code == 200, built.text
+    built = built.json()
+    try:
+        # Before the empty-plan skip, and for the same reason as its twin above:
+        # filed as `auto`, this plan is banded to a morning that its own
+        # 14:00-18:00 window has no minutes in, so it comes back EMPTY -- and a
+        # skip on empty would have reported that as nothing to test.
+        assert built["kind"] == "auto_pm", "14:00-18:00 is not a morning"
+        assert client.get(f"/api/runs/{morning}").status_code == 200, \
+            "planning the afternoon must not delete the morning's plan"
+        items = _items(client, built["id"])
+        if not items:
+            pytest.skip("nothing due tomorrow in the seed")
+        earliest = min(i["scheduled_time"][11:16] for i in items)
+        assert earliest >= "13:30", f"an afternoon run put a call at {earliest}"
+    finally:
+        _drop_run(built["id"])
+
+
+def test_approving_a_run_never_dials_a_slot_outside_its_own_wave(client, pin_clock,
+                                                                 monkeypatch):
+    """The dial path is the last place a stray slot can be caught, so it is caught there.
+
+    A slot can leave its band after the plan was written: `patch_item` validates a
+    hand-edited time against the campaign's own window, which is wider than the
+    band by construction. A morning run posting an 18:45 call is the exact lie the
+    bands exist to stop, so `_commit` skips it and dials the rest.
+    """
+    monkeypatch.setitem(day_module.WAVE_BAND, "auto", (None, parse_hhmm("13:30")))
+    campaign_id = _arm()[0]
+    # 09:00, so the seeded 10:0x slots are still ahead of Formi's five-minute
+    # floor and it is the BAND, not the clock, deciding what goes out.
+    today = pin_clock(9).date().isoformat()
+    run_id = _seed_run(campaign_id, today, "auto", "planned", 3)
+    before = _items(client, run_id)
+    stray = before[0]["id"]
+    with session() as conn:
+        conn.execute("UPDATE plan_items SET scheduled_time=? WHERE id=?",
+                     (f"{today}T18:45:00", stray))
+        conn.commit()
+
+    done = client.post(f"/api/runs/{run_id}/approve")
+    assert done.status_code == 200, done.text
+    done = done.json()
+
+    after = {i["id"]: i for i in _items(client, run_id)}
+    assert after[stray]["status"] == "skipped", \
+        "18:45 is not a morning call, whatever the run says it is"
+    assert done["counts"]["posted"] == len(before) - 1, "the rest of the wave still goes out"
+    assert done["out_of_band"] == 1, "the operator has to be told a lead was left behind"
+    assert all(i["status"] == "simulated" for i in after.values() if i["id"] != stray)
