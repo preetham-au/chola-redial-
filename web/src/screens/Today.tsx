@@ -486,6 +486,7 @@ export function Today() {
           kind={kind}
           rev={rev}
           onPick={() => setPicking(true)}
+          onDayChanged={() => setRev((r) => r + 1)}
         />
       ))}
 
@@ -552,6 +553,7 @@ export function DayPanel({
   kind,
   rev,
   onPick,
+  onDayChanged,
 }: {
   agent: Agent | null;
   date: string;
@@ -559,6 +561,11 @@ export function DayPanel({
   /** Bumped by the shell when the picker re-plans the day. */
   rev: number;
   onPick: () => void;
+  /** For the actions inside this panel whose REACH is the whole day, not this
+   *  agent — warehouse verification is one endpoint over one date. Reloading
+   *  only the panel that was clicked would leave the others showing counts the
+   *  server has already replaced. */
+  onDayChanged: () => void;
 }) {
   const toast = useStore((s) => s.toast);
   const day = useAsync(() => panelDay(agent, date, kind), [date, kind, agent?.agent_id, rev]);
@@ -616,7 +623,7 @@ export function DayPanel({
           <RedBands day={d} />
           <Buckets day={d} chosen={chosen} onChange={setPicked} />
           <Campaigns day={d} />
-          <Proof day={d} onReload={() => day.reload()} />
+          <Proof day={d} onReload={onDayChanged} />
         </>
       )}
 
@@ -1367,8 +1374,13 @@ export function Proof({ day, onReload }: { day: DayView; onReload: () => void })
   const check = async () => {
     setBusy(true);
     try {
+      // `/api/dial-log/verify` takes a date and nothing else: it re-reads the
+      // whole day, every agent, however narrow the card the button sits in. So
+      // the sentence names its real reach, and `onReload` is wired to refresh
+      // every panel — a day-wide action that refreshes one panel leaves the
+      // others showing counts the server has already replaced.
       await api.verifyDialLog(day.date, true);
-      toast('ok', 'Read the warehouse back.');
+      toast('ok', 'Read the warehouse back for the whole day — every agent, not just this panel.');
       onReload();
     } catch (e) {
       toast('bad', (e as Error).message);
@@ -1442,14 +1454,20 @@ export function Proof({ day, onReload }: { day: DayView; onReload: () => void })
             <b>{n(count)}</b> {state}
           </span>
         ))}
-        <button className="btn btn-ghost btn-sm" disabled={busy} onClick={check}>
+        <button
+          className="btn btn-ghost btn-sm"
+          disabled={busy}
+          title="Re-reads the warehouse for the whole day, every agent"
+          onClick={check}
+        >
           {busy ? <Loader2 className="spin" /> : <RefreshCw />} Check now
         </button>
       </div>
       <p className="hero-sub" style={{ marginBottom: 0 }}>
         A call reads <span className="mono">dialled</span> only once the warehouse shows a real
         interaction for it. <span className="mono">pending</span> means it was accepted by Formi
-        and not yet read back.
+        and not yet read back. <b>Check now</b> re-reads the whole day, every agent — every panel
+        on this screen refreshes with it.
       </p>
     </Card>
   );

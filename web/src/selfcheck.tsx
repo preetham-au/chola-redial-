@@ -688,7 +688,14 @@ ok(
   // below it renders — but that is one real call site pinned rather than none.
   ok('a panel heads itself with the agent it was handed, not with nobody',
      has(renderToStaticMarkup(
-       <DayPanel agent={labelled(127, 'Tamil')} date={DATE} kind="auto" rev={0} onPick={() => {}} />,
+       <DayPanel
+         agent={labelled(127, 'Tamil')}
+         date={DATE}
+         kind="auto"
+         rev={0}
+         onPick={() => {}}
+         onDayChanged={() => {}}
+       />,
      ), '>Tamil</h2>'));
 
   const screen = renderToStaticMarkup(<Today />);
@@ -1143,6 +1150,20 @@ ok(
   ok('a rehearsed wave that strayed is told where it WOULD have strayed, not where it landed',
      has(rehearsedStray, '15 calls were scheduled outside the 09:00–13:30 band')
      && !has(rehearsedStray, 'calls landed outside'));
+
+  // "Check now" sits in a card rendered once PER PANEL, but the endpoint behind
+  // it takes a date and nothing else — it re-reads the warehouse for every agent
+  // on the day. A button that quietly does more than the panel it sits in has to
+  // say so, and its refresh has to reach as far as its effect: reloading only
+  // the panel that was clicked leaves the others showing counts the server has
+  // already replaced.
+  ok('the whole-day reach of the warehouse check is on the card, not just in the handler',
+     has(kept, 'every agent') && has(kept, 'every panel on this screen refreshes with it'));
+  // The wiring is a click, which this renderer cannot reach. Read the source
+  // instead, the way the colour ramp and the prepare call sites are read.
+  const today = readFileSync('src/screens/Today.tsx', 'utf8');
+  ok('and the card is wired to refresh every panel, not only its own',
+     today.includes('<Proof day={d} onReload={onDayChanged} />'));
 }
 
 // --- scope leak guard (async: exercises the api layer's offline fallback) ----
