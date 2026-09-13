@@ -1903,3 +1903,72 @@ def test_an_auto_timed_test_call_is_free_of_the_dial_window(client, pin_clock, h
     expected = (now + timedelta(minutes=FORMI_LEAD_MINUTES)).strftime("%Y-%m-%dT%H:%M:00")
     assert body["would_post"]["body"]["scheduled_time"] == expected, \
         f"a {hour:02d}:00 rehearsal must go out at {hour:02d}:{FORMI_LEAD_MINUTES:02d} today"
+
+
+# ---------------------------------------------------------------------------
+# A refusal that writes nothing
+# ---------------------------------------------------------------------------
+
+def test_a_commit_refused_for_leaving_the_band_retires_no_slots(client, pin_clock, monkeypatch):
+    """The all-strays 409 must not leave the run's stale slots `expired` behind it.
+
+    `_commit` retired the stale slots BEFORE it judged the band, and on the day
+    approve nothing takes that back: the 409 is caught by `_approve_one`, whose
+    `failing()` writes the campaign's note and COMMITS the same connection a
+    moment later. The run kept slots marked `expired` while `runs.dropped` was
+    never incremented -- `slots` stopped equalling `posted + failed + dropped`
+    for a run that did not place a single call. (On `/resume` and `/retry` the
+    same UPDATE is rolled back when the connection closes, so the day approve is
+    where this has to be asked.)
+
+    The state is the minute rolling over between the re-plan and the commit:
+    `_write_run` plans from `_floor_min`, `_commit` re-reads the clock for its
+    own cutoff, and both take it from `_earliest_dialable`. Advanced on the
+    second call only, that race is exactly reproduced -- the plan's first minutes
+    are in the past by the time it is dialled.
+    """
+    from api import routes_core
+
+    monkeypatch.setitem(day_module.WAVE_BAND, "auto", (None, parse_hhmm("13:30")))
+    today = pin_clock(12).date().isoformat()
+    campaign_id = _arm_replannable(today, "auto")
+    # `_approve_one` approves a PLANNED run and re-plans it; with nothing on file
+    # it answers `not_prepared` and never reaches `_commit`.
+    _seed_run(campaign_id, today, "auto", "planned", 3)
+
+    dialable, seen = routes_core._earliest_dialable, {"n": 0}
+
+    def the_minute_rolls_over_before_the_commit(now):
+        seen["n"] += 1
+        return dialable(now if seen["n"] == 1 else now + timedelta(minutes=2))
+
+    monkeypatch.setattr(routes_core, "_earliest_dialable",
+                        the_minute_rolls_over_before_the_commit)
+    # Every slot that is still dialable belongs to the other wave, which is the
+    # 409 under test. Forced through `kind_for` rather than by hand-editing a
+    # time, because the re-plan deletes any time written before it.
+    monkeypatch.setattr(day_module, "kind_for", lambda minute: "auto_pm")
+
+    body = client.post("/api/day/approve",
+                       json={"date": today, "campaign_ids": [campaign_id]}).json()
+    one = next(c for c in body["campaigns"] if c["campaign_id"] == campaign_id)
+    assert one["status"] == "not_dialled", f"the band refusal did not fire: {one}"
+    assert "outside" in one["detail"], one["detail"]
+
+    with session() as conn:
+        run = conn.execute(
+            "SELECT * FROM runs WHERE campaign_id=? AND run_date=? AND kind='auto' "
+            "ORDER BY id DESC", (campaign_id, today)).fetchone()
+        statuses = [r["status"] for r in conn.execute(
+            "SELECT status FROM plan_items WHERE run_id=?", (run["id"],))]
+    try:
+        expired = statuses.count("expired")
+        assert expired == 0, (
+            f"a refused approve retired {expired} slot(s) anyway, and they stay that "
+            f"way -- the run holds {run['slots']} slots and reports dropped="
+            f"{run['dropped']}")
+        assert run["dropped"] == 0, (
+            f"nothing was dialled and nothing was counted as dropped, but dropped is "
+            f"{run['dropped']}")
+    finally:
+        _drop_run(run["id"])

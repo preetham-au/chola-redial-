@@ -807,7 +807,8 @@ def _commit(conn: sqlite3.Connection, run: sqlite3.Row, campaign: sqlite3.Row,
 
     # A plan is a proposal, not a promise: it can sit unapproved while the
     # clock runs past its early slots. Posting those to Formi would ask for a
-    # call at a time that has already gone, so they are retired here instead.
+    # call at a time that has already gone, so they are held out of `items` here
+    # and retired below, once this run is known to be dialling at all.
     # The rest of the run still goes out — one stale slot must not block the
     # afternoon. Re-plan to put the retired leads back on the clock.
     # The cutoff is Formi's five-minute floor, not "now": a slot four minutes
@@ -821,10 +822,6 @@ def _commit(conn: sqlite3.Connection, run: sqlite3.Row, campaign: sqlite3.Row,
         raise HTTPException(
             409, f"every remaining slot in run {run_id} is in the past (it is "
                  f"{now_ist().strftime('%H:%M')}); re-plan before {verb}")
-    if stale:
-        conn.executemany("UPDATE plan_items SET status='expired' WHERE id=?",
-                         [(r["id"],) for r in stale])
-
     # The wave's half of the day, enforced where the dialling happens rather than
     # in each of approve / resume / retry. A slot can leave its band after the
     # plan was written -- `patch_item` judges a hand-edited time against the
@@ -850,6 +847,17 @@ def _commit(conn: sqlite3.Connection, run: sqlite3.Row, campaign: sqlite3.Row,
         raise HTTPException(
             409, f"every remaining slot in run {run_id} falls outside the "
                  f"{run['kind']} wave's hours; re-plan before {verb}")
+
+    # Both refusals are behind us, so this run is going out and the slots it is
+    # leaving behind can be written down. Retiring the stale ones any earlier
+    # left them `expired` on a run refused for the band a few lines later, with
+    # `runs.dropped` -- incremented only at the end, on the path that dials --
+    # never told about them: a run that placed no call at all, holding slots
+    # nothing would ever count. Nothing rolls it back on the day approve either,
+    # where `failing()` commits the same connection a moment afterwards.
+    if stale:
+        conn.executemany("UPDATE plan_items SET status='expired' WHERE id=?",
+                         [(r["id"],) for r in stale])
     if strays:
         conn.executemany("UPDATE plan_items SET status='skipped' WHERE id=?",
                          [(r["id"],) for r in strays])
