@@ -31,7 +31,7 @@ import { navigate, useAsync, useStore, type Toast } from '../lib/store';
 import { Card, Empty, Fact, Modal, TypeToConfirm } from '../components/ui';
 import { DayProgress, type ProgressRow } from '../components/DayProgress';
 import type {
-  Agent, ApproveResult, Campaign, DayBucket, DayCampaign, DayView, PrepareResult,
+  Agent, ApproveResult, Campaign, DayBucket, DayCampaign, DaySpread, DayView, PrepareResult,
 } from '../lib/types';
 
 const WAVES = [
@@ -285,6 +285,25 @@ export const planAge = (campaigns: DayCampaign[], now: number) => {
   return { builtAt, minutes, stale: !!builtAt && minutes >= STALE_MIN };
 };
 
+/** The hours of a spread that fall ENTIRELY outside the band it was approved
+ *  against — the only ones the card is entitled to paint red.
+ *
+ *  An hour counts as outside only if NO minute of it falls in the band. With a
+ *  13:30 boundary the 13:00 hour is half in — 13:00–13:29 belongs to the
+ *  morning, 13:30–13:59 to the afternoon — so reddening that bar under either
+ *  wave would accuse a call that kept its band. The far end is the other way
+ *  round and exclusive: a band closing at 20:00 holds nothing at all at 20:xx.
+ *
+ *  A pure function rather than four lines inside the card, because this
+ *  arithmetic IS the card's claim. Inlined, the `+ 59` could go, every bar would
+ *  still draw, and the sentence reading "N calls landed outside the band" would
+ *  start lying with the whole gate green. */
+export const outsideBand = (spread: DaySpread): [string, number][] => {
+  const min = (t: string) => +t.slice(0, 2) * 60 + +t.slice(3, 5);
+  const [lo, hi] = [min(spread.band.start), min(spread.band.end)];
+  return Object.entries(spread.hours).filter(([h]) => +h * 60 + 59 < lo || +h * 60 >= hi);
+};
+
 /** Which campaigns to arm and which to disarm — the only thing this screen puts
  *  on the wire that changes who gets called.
  *
@@ -490,6 +509,7 @@ export function DayPanel({
           <RedBands day={d} />
           <Buckets day={d} chosen={chosen} onChange={setPicked} />
           <Campaigns day={d} />
+          <Proof day={d} onReload={() => day.reload()} />
         </>
       )}
 
@@ -1166,6 +1186,77 @@ function Stranded({ day }: { day: DayView }) {
         in a later plan; they were not called on the day they were planned for.
       </span>
     </div>
+  );
+}
+
+/** The two facts that answer "did it schedule properly": which hours the calls
+ *  landed in, and what the warehouse says actually happened. */
+export function Proof({ day, onReload }: { day: DayView; onReload: () => void }) {
+  const toast = useStore((s) => s.toast);
+  const [busy, setBusy] = useState(false);
+  const hours = Object.entries(day.spread.hours).sort(([a], [b]) => +a - +b);
+  const total = hours.reduce((s, [, v]) => s + v, 0);
+  if (total === 0) return null;
+
+  const peak = Math.max(...hours.map(([, v]) => v));
+  const outside = outsideBand(day.spread);
+
+  const check = async () => {
+    setBusy(true);
+    try {
+      await api.verifyDialLog(day.date, true);
+      toast('ok', 'Read the warehouse back.');
+      onReload();
+    } catch (e) {
+      toast('bad', (e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Card
+      title="Where the calls landed"
+      eyebrow={`${n(total)} on the clock · band ${day.spread.band.start}–${day.spread.band.end}`}
+    >
+      <div className="row" style={{ gap: 4, alignItems: 'flex-end', height: 64 }}>
+        {hours.map(([h, v]) => (
+          <div key={h} style={{ flex: 1, textAlign: 'center' }} title={`${h}:00 — ${n(v)} calls`}>
+            <div
+              style={{
+                height: `${(v / peak) * 48}px`,
+                background: outside.some(([o]) => o === h) ? 'var(--bad)' : 'var(--ok)',
+                borderRadius: 2,
+              }}
+            />
+            <span className="eyebrow">{h}</span>
+          </div>
+        ))}
+      </div>
+
+      {outside.length > 0 && (
+        <p className="hero-sub" style={{ color: 'var(--bad)' }}>
+          {n(outside.reduce((s, [, v]) => s + v, 0))} calls landed outside the{' '}
+          {day.spread.band.start}–{day.spread.band.end} band.
+        </p>
+      )}
+
+      <div className="dialbar-keys">
+        {Object.entries(day.dial_log).map(([state, count]) => (
+          <span key={state} className="dialbar-key">
+            <b>{n(count)}</b> {state}
+          </span>
+        ))}
+        <button className="btn btn-ghost btn-sm" disabled={busy} onClick={check}>
+          {busy ? <Loader2 className="spin" /> : <RefreshCw />} Check now
+        </button>
+      </div>
+      <p className="hero-sub" style={{ marginBottom: 0 }}>
+        A call reads <span className="mono">dialled</span> only once the warehouse shows a real
+        interaction for it. <span className="mono">pending</span> means it was accepted by Formi
+        and not yet read back.
+      </p>
+    </Card>
   );
 }
 

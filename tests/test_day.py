@@ -5,9 +5,10 @@ from datetime import timedelta
 
 import pytest
 
+from api import day as day_module
 from api.day import ARMED, STRANDED_DAYS, WAVE_BOUNDARY, _band
 from api.db import now_ist, session
-from engine.dispatcher import DispatchConfig
+from engine.dispatcher import DispatchConfig, parse_hhmm
 
 
 @pytest.fixture(autouse=True)
@@ -1222,3 +1223,67 @@ def test_last_dialled_is_the_most_recent_day_that_posted(client):
             conn.execute("DELETE FROM leads WHERE campaign_id=?", (campaign_id,))
             conn.execute("DELETE FROM campaigns WHERE id=?", (campaign_id,))
             conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Where did the calls actually land?
+# ---------------------------------------------------------------------------
+
+def test_spread_reports_the_hours_posted_calls_actually_landed_in(client, monkeypatch):
+    """"Is it scheduling properly" is answered by the hours, not by the wave name.
+
+    Seeds its own campaign on its own agent and asks for that agent only. The
+    `client` fixture is session-scoped (tests/conftest.py:21) and
+    tests/test_autopilot.py has already committed real runs for TODAY against
+    campaigns 1-11; `spread` is a sum over every armed campaign, so an unscoped
+    read here would be counting somebody else's hours alongside these four rows.
+    """
+    # The band is the thing the spread is judged against, so it is pinned rather
+    # than read off the environment: WAVE_BOUNDARY is env-driven (api/day.py:82)
+    # and WAVE_BAND is built from it at import, so setting the env var here would
+    # be too late. Pinning the band is what keeps the assertion below meaningful.
+    monkeypatch.setitem(day_module.WAVE_BAND, "auto", (None, parse_hhmm("13:30")))
+
+    campaign_id, agent_id = 90002, 90125
+    with session() as conn:
+        conn.execute("INSERT INTO campaigns (id, agent_id, warehouse_id, name, autopilot) "
+                     "VALUES (?, ?, 99002, 'spread fixture', 1)", (campaign_id, agent_id))
+        conn.commit()
+    today = now_ist().date().isoformat()
+    try:
+        run_id = _seed_run(campaign_id, today, "auto", "committed", 0)
+        with session() as conn:
+            conn.executemany(
+                "INSERT INTO plan_items (run_id, lead_uuid, policy_no, phone, disposition, "
+                "disposition_class, dte, bucket, bucket_label, priority, slot_no, "
+                "scheduled_time, status) VALUES (?,?,?,'9999999999','','',0,'M0','M0',0,1,?,?)",
+                [(run_id, "a", "PA", f"{today}T10:15:00", "posted"),
+                 (run_id, "b", "PB", f"{today}T10:45:00", "posted"),
+                 (run_id, "c", "PC", f"{today}T19:30:00", "posted"),
+                 (run_id, "d", "PD", f"{today}T11:00:00", "planned")])
+            conn.commit()
+
+        spread = client.get(f"/api/day?agent_id={agent_id}").json()["spread"]
+
+        assert spread["hours"]["10"] == 2, "both 10:xx calls belong to the 10:00 hour"
+        assert spread["hours"]["19"] == 1
+        assert "11" not in spread["hours"], "a planned slot has not been scheduled anywhere yet"
+        assert spread["band"] == {"start": "09:00", "end": "13:30"}, \
+            "the band is what the spread has to be judged against"
+    finally:
+        # Every table that REFERENCES campaigns(id) first (api/schema.sql), or the
+        # FK refuses -- reading the day view wrote this campaign a default config
+        # row. Same four deletes as the last-dialled fixture above.
+        with session() as conn:
+            conn.execute("DELETE FROM config WHERE campaign_id=?", (campaign_id,))
+            conn.execute("DELETE FROM runs WHERE campaign_id=?", (campaign_id,))
+            conn.execute("DELETE FROM leads WHERE campaign_id=?", (campaign_id,))
+            conn.execute("DELETE FROM campaigns WHERE id=?", (campaign_id,))
+            conn.commit()
+
+
+def test_spread_names_the_afternoon_band_the_afternoon_is_judged_against(client, monkeypatch):
+    """The band comes from the WAVE, not from a constant. Same day, other half."""
+    monkeypatch.setitem(day_module.WAVE_BAND, "auto_pm", (parse_hhmm("13:30"), None))
+    spread = client.get("/api/day?kind=auto_pm").json()["spread"]
+    assert spread["band"] == {"start": "13:30", "end": "20:00"}

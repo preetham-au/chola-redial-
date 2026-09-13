@@ -485,6 +485,39 @@ def _plan_facts(conn: sqlite3.Connection, runs: dict[int, sqlite3.Row],
     return facts
 
 
+def _spread(conn: sqlite3.Connection, runs: dict[int, sqlite3.Row],
+            kind: str) -> dict[str, Any]:
+    """Which hours the day's calls actually went onto, against the band approved.
+
+    This is the honest answer to "is it scheduling properly". On 12 Sep 2026 the
+    `auto` wave's posted slots were spread across 12:00-20:00 and the `auto_pm`
+    wave's across 13:00-20:00 -- the same evening twice, under two names -- and
+    nothing in this console showed it. A count per hour beside the band the
+    operator approved makes a wave that dialled outside its half of the day
+    visible at a glance instead of needing a database query.
+
+    Only `posted` and `simulated` items count: a `planned` slot has not been
+    scheduled anywhere yet, and an `expired` one never will be.
+
+    `runs` arrives already narrowed to the scope of the page (`_plan_rows` over
+    the armed campaigns, get_day), so there is no agent filter here -- a second
+    one would be a second chance to disagree with the rest of the answer.
+    """
+    lo, hi = WAVE_BAND[kind]
+    band = {"start": hhmm(lo if lo is not None else parse_hhmm(DEFAULT_WINDOW["start"])),
+            "end": hhmm(hi if hi is not None else parse_hhmm(DEFAULT_WINDOW["end"]))}
+    run_ids = [r["id"] for r in runs.values()]
+    if not run_ids:
+        return {"band": band, "hours": {}}
+
+    marks = ",".join("?" * len(run_ids))
+    rows = conn.execute(
+        f"SELECT substr(scheduled_time, 12, 2) AS hour, COUNT(*) AS n FROM plan_items "
+        f"WHERE run_id IN ({marks}) AND status IN ('posted','simulated') "
+        f"GROUP BY hour ORDER BY hour", run_ids).fetchall()
+    return {"band": band, "hours": {str(int(r["hour"])): r["n"] for r in rows}}
+
+
 @router.get("/api/day")
 def get_day(date: Optional[str] = Query(None), kind: str = Query(MORNING),
             agent_id: Optional[int] = Query(None)) -> dict[str, Any]:
@@ -537,6 +570,7 @@ def get_day(date: Optional[str] = Query(None), kind: str = Query(MORNING),
         log = _dialled_today(conn, day, agent_id)
         stranded_runs = _stranded(conn, day, agent_id)
         facts = _plan_facts(conn, runs, [c["id"] for c in campaigns])
+        spread = _spread(conn, runs, kind)
 
         from .db import current_config                  # noqa: PLC0415 — avoids a cycle
         # Every armed campaign's own config. There is no campaign whose settings
@@ -634,6 +668,8 @@ def get_day(date: Optional[str] = Query(None), kind: str = Query(MORNING),
         # Plans from earlier days that nobody ever approved. Not history: those
         # leads were never called and nothing else in this console says so.
         "stranded": stranded_runs,
+        # Which hours the calls actually landed in, against the band approved.
+        "spread": spread,
     }
 
 

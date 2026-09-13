@@ -16,6 +16,7 @@ import {
   DialResult,
   Headline,
   PanelHead,
+  Proof,
   Today,
   approveArgs,
   approveModal,
@@ -23,6 +24,7 @@ import {
   closesAt,
   dialQueue,
   mergeResults,
+  outsideBand,
   panelDay,
   panelPrepare,
   panelsFor,
@@ -59,7 +61,8 @@ import {
   passState,
 } from './lib/domain';
 import type {
-  Agent, ApproveResult, Campaign, Config, DayCampaign, PrepareResult, TestCallResult,
+  Agent, ApproveResult, Campaign, Config, DayCampaign, DaySpread, DialWindow, PrepareResult,
+  TestCallResult,
 } from './lib/types';
 
 const ROWS = configurableBuckets(mockConfig.frequency_table);
@@ -890,6 +893,60 @@ ok(
      bandRange(0, 0) === 'RED');
   ok('argument order does not change the reading',
      bandRange(-3, -1) === bandRange(-1, -3));
+}
+
+// --- where the calls landed: the band is judged by the MINUTE, not the hour --
+//
+// The whole point of the proof card is that a bar painted red accuses a wave of
+// dialling outside its half of the day. With a 13:30 boundary the 13:00 hour is
+// half in and half out of BOTH waves, so the obvious `hour < start || hour >=
+// end` is wrong twice over and wrong in the direction that cries wolf.
+{
+  const AM: DialWindow = { start: '09:00', end: '13:30' };
+  const PM: DialWindow = { start: '13:30', end: '20:00' };
+  const out = (hours: Record<string, number>, band: DialWindow) =>
+    outsideBand({ band, hours }).map(([h]) => h).join();
+
+  ok('the 13:00 hour is INSIDE a band ending 13:30 — 13:00-13:29 is in it',
+     out({ '13': 4 }, AM) === '');
+  ok('and inside a band STARTING 13:30 as well — 13:30-13:59 is in it',
+     out({ '13': 4 }, PM) === '');
+  ok('a band closing at 20:00 holds nothing at 20:xx', out({ '20': 1 }, PM) === '20');
+  ok('an hour wholly before the band opens is outside it', out({ '8': 3 }, AM) === '8');
+  // Caught, so a rewrite that reaches for the first hour without checking there
+  // IS one reddens THIS line by name rather than a bare stack trace.
+  const empty = () => { try { return out({}, AM) === ''; } catch { return false; } };
+  ok('a day with nothing on the clock answers with nothing, rather than throwing', empty());
+  ok('the hours in the band are kept and only the strays are returned',
+     out({ '8': 1, '9': 2, '13': 3, '20': 4 }, AM) === '8,20');
+
+  // The card itself: it is the one place an operator sees the verdict, and the
+  // sentence under the bars is the only part of it that names a number.
+  const proof = (spread: DaySpread, dial_log: Record<string, number> = { dialled: 7 }) =>
+    renderToStaticMarkup(
+      <Proof day={{ ...mockDay('2026-09-13', 'auto'), spread, dial_log }} onReload={() => {}} />,
+    );
+  ok('a day with nothing on the clock shows no proof card at all, rather than an empty one',
+     proof({ band: AM, hours: {} }) === '');
+  const kept = proof({ band: AM, hours: { '9': 40, '13': 12 } });
+  ok('a wave that stayed inside its band says how many calls it put on the clock',
+     has(kept, '52 on the clock') && has(kept, 'band 09:00–13:30'));
+  ok('and is not accused of landing outside it', !has(kept, 'landed outside'));
+  ok('nor painted as having strayed', !has(kept, 'var(--bad)'));
+  ok('each hour gets its own bar, labelled with what landed in it',
+     has(kept, '9:00 — 40 calls') && has(kept, '13:00 — 12 calls'));
+  // The COUNT, not the word: "dialled" also appears in the card's own sentence
+  // explaining what it means, so `has(kept, 'dialled')` stays green with the
+  // whole read-back deleted.
+  ok('the warehouse read-back is shown beside the hours, or the card proves half a thing',
+     has(kept, 'dialbar-key') && has(kept, '<b>7</b>'));
+  const strayed = proof({ band: AM, hours: { '9': 40, '19': 12, '20': 3 } });
+  ok('a wave that dialled past its band is told so, counting only the strays',
+     has(strayed, '15 calls landed outside the 09:00–13:30 band'));
+  // Two stray bars and the sentence under them. The hour that kept the band is
+  // NOT one of them — reddening the whole day would say nothing.
+  ok('and only the stray hours are painted red',
+     (strayed.match(/var\(--bad\)/g) ?? []).length === 3);
 }
 
 // --- scope leak guard (async: exercises the api layer's offline fallback) ----

@@ -212,8 +212,8 @@ interpret.
 **`agent_id` narrows the day to one agent — one language.** Omitted, every
 endpoint here answers for every armed campaign, exactly as it did before scoping
 existed. Supplied, `campaigns`, `stopped`, `stranded`, `totals`, `buckets`,
-`red_bands`, `capacity_before_close` and `dial_log` all describe that agent
-alone, and the response echoes it back in `agent_id` (`null` when unscoped).
+`red_bands`, `capacity_before_close`, `dial_log` and `spread` all describe that
+agent alone, and the response echoes it back in `agent_id` (`null` when unscoped).
 `dial_log` is included because it is the one number that says whether the day
 actually ran — two language panels each reporting the whole day's dials is the
 confusion this scoping exists to remove. Agents 125 and 127
@@ -255,7 +255,23 @@ nothing to list anywhere. An agent with nothing armed answers `200` with
   "campaigns": [ { "id": 1650, "name": "…", "run_id": 912,
                    "run_status": "planned",   // or "not_prepared"
                    "ready": 312, "by_bucket": { "M0": 96 },
-                   "posted": 0, "failed": 0, "dropped": 0 } ],
+                   "posted": 0, "failed": 0, "dropped": 0,
+                   // When this plan was built: `runs.created_at`, naive IST with
+                   // NO offset on the string (api/db.py's `now_iso`). Do not
+                   // hand it to a bare `new Date(...)` — ECMA-262 reads an ISO
+                   // date-TIME with no offset as the BROWSER's local time, so
+                   // west of IST every plan reads 5h30m younger than it is.
+                   // Null on a campaign with no plan for this wave.
+                   "plan_built_at": "2026-09-09T09:00:00",
+                   // The most recent run_date this campaign actually posted on,
+                   // over its whole history. Null means it has never dialled —
+                   // a run that posted nothing did not dial, however recent.
+                   "last_dialled": "2026-09-08",
+                   // Leads Formi had ALREADY queued when this plan was built, so
+                   // the engine skipped them (ALREADY_SCHEDULED_TODAY). Checked
+                   // at PLAN time, which is why `plan_built_at` is beside it:
+                   // the older the plan, the less this number can be trusted.
+                   "already_booked": 18 } ],
   // "Why is nothing happening for X" — armed campaigns now held, with the reason.
   // A campaign hidden while it still has calls on Formi's clock appears here too,
   // until its last slot has gone out.
@@ -269,8 +285,22 @@ nothing to list anywhere. An agent with nothing armed answers `200` with
   // morning's queued plan as abandoned.
   "stranded": [ { "campaign_id": 1650, "name": "…", "run_date": "2026-09-12",
                   "kind": "auto", "slots": 214 } ],
-  "dial_log": { "dialled": 88, "queued": 12, "missing": 1 } }
+  "dial_log": { "dialled": 88, "queued": 12, "missing": 1 },
+  // WHICH HOURS the calls actually landed in, against the band they were
+  // approved against. The honest answer to "is it scheduling properly": on
+  // 12 Sep 2026 the `auto` wave's slots were spread across 12:00-20:00 and
+  // `auto_pm`'s across 13:00-20:00 — the same evening twice, under two names —
+  // and no screen said so. Keys are the hour with no leading zero ("9".."19");
+  // only `posted` and `simulated` slots are counted, since a `planned` one has
+  // not been scheduled anywhere yet and an `expired` one never will be. Scoped
+  // with the rest of the page when `agent_id` is supplied.
+  "spread": { "band": { "start": "09:00", "end": "13:30" },
+              "hours": { "9": 120, "10": 240, "13": 8 } } }
 ```
+
+An hour in `hours` is only outside `band` when **no minute of it** falls inside:
+with a 13:30 boundary the 13:00 hour is half in for both waves, so `"13"` is
+inside either band, while `"20"` is outside a band closing at `20:00`.
 
 **Each wave dials inside its own half of the day.** `auto` runs from each
 campaign's own opening to `WAVE_BOUNDARY` (env, default `13:30`, range-checked

@@ -229,6 +229,13 @@ export interface StrandedRun {
   slots: number;
 }
 
+export interface DaySpread {
+  /** The hours this wave is allowed to dial into. */
+  band: DialWindow;
+  /** Hour of day ("9".."19") -> calls actually put on the clock. */
+  hours: Record<string, number>;
+}
+
 export interface DayView {
   date: string;
   kind: string;
@@ -254,6 +261,8 @@ export interface DayView {
    *  capped per campaign against its own window and then summed. Approve
    *  re-plans, so the real number is decided then. */
   capacity_before_close: number;
+  /** Proof: where the calls actually landed, against the band approved. */
+  spread: DaySpread;
   buckets: DayBucket[];
   red_bands: DayBand[];
   campaigns: DayCampaign[];

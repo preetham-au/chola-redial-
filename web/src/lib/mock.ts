@@ -136,6 +136,14 @@ export const mockDay = (date: string, kind: string, agent_id?: number): DayView 
     status: campaigns.length ? 'awaiting_approval' : 'no_campaigns',
     totals: { campaigns: campaigns.length, ready, posted: 0, failed: 0, dropped: 0 },
     capacity_before_close: ready,
+    // Offline the day has not been approved, so nothing is on the clock yet and
+    // the proof card stays off screen — a fixture must never look like evidence
+    // that calls went out. The band is still this wave's own half of the day.
+    spread: {
+      band: kind === 'auto_pm' ? { start: '13:30', end: '20:00' }
+                               : { start: '09:00', end: '13:30' },
+      hours: {},
+    },
     buckets: [
       { bucket: 'M0', label: 'Mandatory day', ready: Math.round(ready * 0.31), best_rank: 0 },
       { bucket: 'F5', label: 'Critical window', ready: Math.round(ready * 0.28), best_rank: 0 },
