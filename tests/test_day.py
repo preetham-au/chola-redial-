@@ -1,11 +1,11 @@
 """The daily gate: stranded runs, wave bands, agent scoping, proof."""
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import timedelta
 
 import pytest
 
-from api.day import STRANDED_DAYS
+from api.day import ARMED, STRANDED_DAYS
 from api.db import now_ist, session
 
 
@@ -94,7 +94,7 @@ def _arm(count: int = 1) -> list[int]:
 def test_stranded_lists_a_past_planned_run(client):
     """A run left `planned` on an earlier date is 491 calls nobody dialled."""
     campaign_id = _arm()[0]
-    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    yesterday = (now_ist().date() - timedelta(days=1)).isoformat()
     _seed_run(campaign_id, yesterday, "auto", "planned", 3)
 
     body = client.get("/api/day").json()
@@ -114,10 +114,13 @@ def test_stranded_ignores_today_and_committed_runs(client):
     somebody else's campaign.
     """
     campaign_id = _arm()[0]
-    today = date.today().isoformat()
-    yesterday = (date.today() - timedelta(days=1)).isoformat()
-    two_days_ago = (date.today() - timedelta(days=2)).isoformat()
-    long_ago = (date.today() - timedelta(days=20)).isoformat()
+    # now_ist, not date.today: the server clamps against ITS today, and on a
+    # non-IST host the two are a day apart for part of every day.
+    day = now_ist().date()
+    today = day.isoformat()
+    yesterday = (day - timedelta(days=1)).isoformat()
+    two_days_ago = (day - timedelta(days=2)).isoformat()
+    long_ago = (day - timedelta(days=20)).isoformat()
     _seed_run(campaign_id, today, "auto", "planned", 5)
     _seed_run(campaign_id, yesterday, "auto_pm", "committed", 7)
     _seed_run(campaign_id, long_ago, "auto", "planned", 9)
@@ -131,6 +134,39 @@ def test_stranded_ignores_today_and_committed_runs(client):
     assert (long_ago, "auto") not in seen, \
         f"older than the {STRANDED_DAYS}-day bound is history, not a thing to act on"
     assert (two_days_ago, "auto") not in seen, "a plan holding no slots dialled nothing"
+
+
+def test_stranded_reports_only_campaigns_in_the_daily_plan(client):
+    """A stranded plan on a campaign nobody armed is not this screen's business.
+
+    Every other test here seeds into the campaign `_arm` just armed, so none of
+    them touched the roster predicate: deleting it from the query outright left
+    all three green. It is the line that decides whose runs reach the warning, so
+    it gets its own test -- a campaign that is NOT in the daily plan was never
+    going to be dialled today and is not a plan somebody forgot to approve.
+
+    The unarmed campaign is read back out of the DB rather than hardcoded: `_arm`
+    picks its ids from the same table, and `restore_campaigns` puts every flag
+    back afterwards, so an id that is disarmed today may not be tomorrow.
+    """
+    armed = _arm()[0]
+    with session() as conn:
+        # Genuinely failing ARMED as the request will evaluate it -- asked AFTER
+        # `_arm` has run, so whatever it just armed cannot come back from here.
+        unarmed = [r["id"] for r in conn.execute(
+            f"SELECT id FROM campaigns WHERE NOT ({ARMED}) ORDER BY id")]
+    assert unarmed, "the seed DB must hold a campaign that is not in the daily plan"
+
+    yesterday = (now_ist().date() - timedelta(days=1)).isoformat()
+    _seed_run(armed, yesterday, "auto", "planned", 3)
+    _seed_run(unarmed[0], yesterday, "auto", "planned", 5)
+
+    reported = {s["campaign_id"] for s in client.get("/api/day").json()["stranded"]}
+
+    # Both halves, so a seeding mistake cannot pass this off as a clean exclusion.
+    assert armed in reported, "an armed campaign's undialled plan is still reported"
+    assert unarmed[0] not in reported, \
+        "a campaign outside the daily plan must not appear in the stranded warning"
 
 
 def test_stranded_ignores_today_when_a_future_day_is_requested(client):
@@ -148,3 +184,24 @@ def test_stranded_ignores_today_when_a_future_day_is_requested(client):
     assert all(s["run_date"] != today.isoformat() for s in body["stranded"]
                if s["campaign_id"] == campaign_id), \
         "today's plan is awaiting approval, not abandoned"
+
+
+def test_stranded_still_looks_back_when_a_far_future_day_is_requested(client):
+    """The lower bound is clamped with the upper, so the window cannot invert.
+
+    Same unbounded date input as the test above. Keyed off the REQUESTED day, a
+    date more than STRANDED_DAYS out pushed `since` past `upper` and the window
+    collapsed to nothing -- the screen then said no plan was stranded, which is
+    the one answer this warning must never give wrongly.
+    """
+    campaign_id = _arm()[0]
+    today = now_ist().date()
+    yesterday = (today - timedelta(days=1)).isoformat()
+    _seed_run(campaign_id, yesterday, "auto", "planned", 6)
+
+    far = (today + timedelta(days=STRANDED_DAYS + 1)).isoformat()
+    body = client.get(f"/api/day?date={far}").json()
+
+    assert any(s["run_date"] == yesterday for s in body["stranded"]
+               if s["campaign_id"] == campaign_id), \
+        "yesterday's undialled plan is stranded whatever date the screen asks for"

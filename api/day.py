@@ -260,8 +260,14 @@ def _stranded(conn: sqlite3.Connection, day: date) -> list[dict[str, Any]]:
     # bounded by the requested day, this morning's `planned` run would be
     # reported as never dialled while it is in fact queued and awaiting
     # approval. A plan for a day that has not arrived is waiting, not abandoned.
-    upper = min(day, now_ist().date()).isoformat()
-    since = (day - timedelta(days=STRANDED_DAYS)).isoformat()
+    #
+    # BOTH bounds come off the one clamped date. Clamping only the upper one left
+    # the lower keyed to the requested day, so a date far enough in the future put
+    # `since` past `upper` and the window collapsed to nothing -- the warning then
+    # reported no stranded run at all, through the same unbounded date input.
+    today = min(day, now_ist().date())
+    since = (today - timedelta(days=STRANDED_DAYS)).isoformat()
+    upper = today.isoformat()
     # The roster predicate is scoped to its own SELECT so every bare column in
     # ARMED resolves against `campaigns` by construction -- qualifying only the
     # first of the four left the rest to SQLite's search across the join.
