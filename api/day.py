@@ -213,7 +213,7 @@ DEFAULT_WINDOW = {"start": "09:00", "end": "20:00"}
 
 
 def _day_window(configs: dict[int, dict[str, Any]], ready: dict[int, int],
-                floor: int, today: bool) -> dict[str, Any]:
+                floor: int, today: bool, kind: str) -> dict[str, Any]:
     """The day's dialling window and its ceiling, from every armed campaign.
 
     `dial_window` and `max_per_minute` are per-campaign, and each is one PUT away
@@ -223,9 +223,11 @@ def _day_window(configs: dict[int, dict[str, Any]], ready: dict[int, int],
     `with_defaults` retires the stale 09:30-19:00 snapshot — and would have named
     a close time the other 68 do not keep the moment one was narrowed.
 
-    The window reported is the ENVELOPE: no call goes out before its start or
-    after its end, whichever campaign places it. `varies` says the campaigns do
-    not agree, so the screen can say so instead of implying a shared close.
+    The window reported is the ENVELOPE of the campaigns' windows CLIPPED TO THIS
+    WAVE'S BAND: no call goes out before its start or after its end, whichever
+    campaign places it, and this approval cannot reach past the band whatever a
+    campaign's own close says. `varies` says the campaigns do not agree, so the
+    screen can say so instead of implying a shared close.
 
     `open` is true while ANY campaign can still dial — approving is worth doing
     for the campaigns still open even once the others have shut.
@@ -240,8 +242,15 @@ def _day_window(configs: dict[int, dict[str, Any]], ready: dict[int, int],
     spans, capacity = set(), 0
     for campaign_id, config in configs.items():
         window = config.get("dial_window") or DEFAULT_WINDOW
-        start = parse_hhmm(window.get("start", DEFAULT_WINDOW["start"]))
-        end = parse_hhmm(window.get("end", DEFAULT_WINDOW["end"]))
+        # Clipped to the wave's band, so the screen names the hours this approval
+        # can actually reach rather than the campaign's whole day.
+        start, end = _clip(parse_hhmm(window.get("start", DEFAULT_WINDOW["start"])),
+                           parse_hhmm(window.get("end", DEFAULT_WINDOW["end"])), kind)
+        # A campaign with no band at all clips to start > end. `room` and `open`
+        # both read that as zero either way, but the reported envelope is a STRING
+        # on the operator's screen and "13:30-13:00" is not a window anyone can
+        # read. Collapsed to a point, it says the honest thing: no hours here.
+        end = max(end, start)
         spans.add((start, end))
         waiting = ready.get(campaign_id, 0)
         if not today:
@@ -431,7 +440,7 @@ def get_day(date: Optional[str] = Query(None), kind: str = Query(MORNING)) -> di
     # afterwards.
     first_free = _earliest_dialable(now)
     span = _day_window(configs, {c["id"]: c["ready"] for c in listed},
-                       first_free.hour * 60 + first_free.minute, today)
+                       first_free.hour * 60 + first_free.minute, today, kind)
 
     return {
         "date": day.isoformat(), "kind": kind, "wave": WAVE_LABEL[kind],
@@ -538,11 +547,21 @@ def _prepare_one(campaign_id: int, day: date, kind: str, resync: bool) -> dict[s
 
         try:
             cfg, red, dcfg, _now, leads, pairs = _evaluate(conn, campaign, day)
+            # The wave's half of the day, not the campaign's whole window: a
+            # 'morning' plan that dials at 19:00 is not a morning plan.
+            dcfg = _band(kind, dcfg)
+            # An empty band is not a closed one, and it is not caught by the
+            # guard below: on a past or future date `_floor_min` returns None and
+            # nothing else looks at the clock.
+            if dcfg.start_min >= dcfg.end_min:
+                return {**out, "status": "window_closed",
+                        "detail": f"this campaign's window has no "
+                                  f"{WAVE_LABEL[kind]} band"}
             floor = _floor_min(now_ist(), day, dcfg)
             if floor is not None and floor >= dcfg.end_min:
                 return {**out, "status": "window_closed",
-                        "detail": f"the {hhmm(dcfg.start_min)}-{hhmm(dcfg.end_min)} window "
-                                  f"has closed"}
+                        "detail": f"the {hhmm(dcfg.start_min)}-{hhmm(dcfg.end_min)} "
+                                  f"{WAVE_LABEL[kind]} band has closed"}
             run_id = _write_run(conn, campaign, day, kind, cfg["version"], pairs, red, dcfg,
                                 evaluated=len(leads), note=f"{WAVE_LABEL[kind]} plan, awaiting "
                                                            f"approval", floor_min=floor)
@@ -645,11 +664,16 @@ def _approve_one(conn: sqlite3.Connection, campaign: sqlite3.Row, day: date, kin
 
     try:
         cfg, red, dcfg, now, leads, pairs = _evaluate(conn, campaign, day)
+        dcfg = _band(kind, dcfg)
+        if dcfg.start_min >= dcfg.end_min:
+            return failing("window_closed", run_id=run["id"],
+                           detail=f"this campaign's window has no {WAVE_LABEL[kind]} band")
         floor = _floor_min(now, day, dcfg)
         if floor is not None and floor >= dcfg.end_min:
             return failing("window_closed", run_id=run["id"],
-                           detail=f"the {hhmm(dcfg.start_min)}-{hhmm(dcfg.end_min)} window has "
-                                  f"closed (it is {now_ist().strftime('%H:%M')})")
+                           detail=f"the {hhmm(dcfg.start_min)}-{hhmm(dcfg.end_min)} "
+                                  f"{WAVE_LABEL[kind]} band has closed "
+                                  f"(it is {now_ist().strftime('%H:%M')})")
         note = f"approved {now_ist().strftime('%H:%M')}"
         if buckets:
             note += " buckets=" + ",".join(buckets)

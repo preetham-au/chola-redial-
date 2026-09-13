@@ -213,10 +213,13 @@ interpret.
 // GET /api/day
 { "date": "2026-09-09", "kind": "auto", "wave": "morning",
   "now": "11:04", "dry_run": true,
-  "window": { "start": "09:00", "end": "20:00" }, "window_open": true,
+  // The campaigns' windows clipped to this WAVE'S BAND, so the header names
+  // the hours this approval can actually reach. `auto` ends at WAVE_BOUNDARY
+  // (13:30), `auto_pm` starts there.
+  "window": { "start": "09:00", "end": "13:30" }, "window_open": true,
   "status": "awaiting_approval",
   "totals": { "campaigns": 4, "ready": 633, "posted": 0, "failed": 0, "dropped": 0 },
-  // A ceiling, not a promise: minutes left in the window x max_per_minute.
+  // A ceiling, not a promise: minutes left in the BAND x max_per_minute.
   // Approve re-plans, so the real number is decided then — but an operator
   // opening this at 18:00 has to see the day no longer fits BEFORE approving.
   "capacity_before_close": 633,
@@ -237,9 +240,16 @@ interpret.
   "dial_log": { "dialled": 88, "queued": 12, "missing": 1 } }
 ```
 
+**Each wave dials inside its own half of the day.** `auto` runs from each
+campaign's own opening to `WAVE_BOUNDARY` (env, default `13:30`) and `auto_pm`
+from there to the campaign's own close — clipped, never widened, so a campaign
+that shuts at 13:00 has no afternoon at all and says so. Without a band the wave
+name meant nothing on the clock: on 12 Sep 2026 the `auto` wave's calls landed
+between 12:00 and 20:00 and `auto_pm`'s between 13:00 and 20:00.
+
 **Approving late does not dial into the night.** `approve` RE-PLANS each campaign
 from the current minute with the buckets the operator ticked, then commits it, so
-only what genuinely fits before the window shuts is scheduled — best RED band
+only what genuinely fits before the band shuts is scheduled — best RED band
 first. Whatever does not fit is not dialled today and returns in tomorrow's plan
 (`not_dialled` in the response). Approving a wave twice does not dial twice: a run
 that is no longer `planned` answers `already_committed`.
@@ -257,7 +267,7 @@ that is no longer `planned` answers `already_committed`.
                  // outcome except not_prepared, where there is no run to act on.
                  { "campaign_id": 1651, "name": "…", "status": "window_closed",
                    "run_id": 914,
-                   "detail": "the 10:00-19:00 window has closed (it is 19:24)" } ] }
+                   "detail": "the 10:00-13:30 morning band has closed (it is 19:24)" } ] }
 ```
 
 A per-campaign `status` is one of `approved` · `not_prepared` ·

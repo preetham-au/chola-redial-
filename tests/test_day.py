@@ -246,3 +246,89 @@ def test_band_leaves_other_config_untouched(client):
     band = _band("auto", dcfg)
     assert band.max_per_minute == 7 and band.max_per_run == 99
     assert band.red_priority == dcfg.red_priority
+
+
+def test_prepare_reports_the_band_that_closed_not_the_whole_window(client, monkeypatch):
+    """Preparing the morning wave after the boundary must name the BAND.
+
+    Before bands, this said "the 09:00-20:00 window has closed" only after 20:00,
+    and happily planned a 'morning' wave into the evening at any hour before it.
+    """
+    import api.day as day_module
+
+    _arm()
+    # Captured BEFORE the patch. Reading `day_module.now_ist` from inside the
+    # replacement would be the replacement reading itself -- infinite recursion.
+    real_now_ist = day_module.now_ist
+    monkeypatch.setattr(day_module, "now_ist", lambda: real_now_ist().replace(
+        hour=15, minute=0, second=0, microsecond=0))
+
+    out = day_module.prepare_day(real_now_ist().date(), "auto")
+    closed = [c for c in out["campaigns"] if c["status"] == "window_closed"]
+
+    assert closed, "the morning band is shut at 15:00 - every campaign must say so"
+    assert "13:30" in closed[0]["detail"], \
+        f"the detail must name the band, got {closed[0]['detail']!r}"
+    assert "20:00" not in closed[0]["detail"], \
+        "naming the full window hides the fact that the morning band is what shut"
+
+
+def test_a_campaign_with_no_afternoon_band_neither_prepares_nor_approves(client):
+    """A campaign that shuts at 13:00 cannot run the afternoon wave at all.
+
+    Dated TOMORROW on purpose: `_floor_min` returns None for a day that is not
+    today, so the clock guard cannot fire and the empty band is the only thing
+    left that can close this window. Without it `dispatch` would be handed a
+    window whose start is past its end.
+
+    Both halves, because they are two separate guards in two functions and the
+    approve one is the one that reaches Formi. `_prepare_one`/`_approve_one`
+    rather than the day-wide passes, which have no campaign filter and would
+    write runs for every other armed campaign as a side effect.
+    """
+    import api.day as day_module
+
+    campaign_id = _arm()[0]
+    tomorrow = now_ist().date() + timedelta(days=1)
+    config = client.get(f"/api/campaigns/{campaign_id}/config").json()
+    saved = client.put(f"/api/campaigns/{campaign_id}/config",
+                       json={**config, "dial_window": {"start": "09:00", "end": "13:00"}})
+    assert saved.status_code == 200, saved.text
+    try:
+        prepared = day_module._prepare_one(campaign_id, tomorrow, "auto_pm", False)
+        # An approve needs a `planned` run in front of it, or it stops at
+        # `not_prepared` before ever reaching the band.
+        _seed_run(campaign_id, tomorrow.isoformat(), "auto_pm", "planned", 3)
+        with session() as conn:
+            campaign = conn.execute("SELECT * FROM campaigns WHERE id=?",
+                                    (campaign_id,)).fetchone()
+            approved = day_module._approve_one(conn, campaign, tomorrow, "auto_pm", [])
+    finally:
+        # Session-scoped `client`: a narrowed window left behind would shorten
+        # this campaign's day for every test after it.
+        client.put(f"/api/campaigns/{campaign_id}/config", json=config)
+
+    assert prepared["status"] == "window_closed", prepared
+    assert "no afternoon band" in prepared["detail"], prepared["detail"]
+    assert approved["status"] == "window_closed", approved
+    assert "no afternoon band" in approved["detail"], approved["detail"]
+    assert approved.get("posted") is None, "an empty band must never reach Formi"
+
+
+def test_the_window_a_campaign_has_no_band_for_reports_no_hours(client):
+    """The header must not invert when a campaign has no hours in this wave.
+
+    Clipping alone leaves start past end. `capacity` and `open` both read that as
+    zero either way, but `window` is a STRING on the operator's screen and
+    "13:30-13:00" is not a window anybody can act on.
+    """
+    from api.day import AFTERNOON, _day_window
+
+    span = _day_window({1: {"dial_window": {"start": "09:00", "end": "13:00"},
+                            "max_per_minute": 10}},
+                       {1: 500}, floor=10 * 60, today=True, kind=AFTERNOON)
+
+    assert span["window"] == {"start": "13:30", "end": "13:30"}, \
+        "a band with no hours in it must not be reported as a backwards window"
+    assert span["open"] is False, "there is no afternoon here to open"
+    assert span["capacity"] == 0, "no hours means no capacity, whatever is ready"

@@ -894,7 +894,9 @@ def test_a_campaign_that_ran_out_of_window_says_which_window(client, monkeypatch
         assert entry["run_id"] == run["id"], "no run_id, so the UI cannot offer the retry"
         note = conn.execute("SELECT autopilot_note FROM campaigns WHERE id=?",
                             (cid,)).fetchone()[0]
-        assert "window_closed" in note and "window has closed" in note, note
+        # "band", not "window": each wave dials inside its own half of the day,
+        # so the hours the note names are the band's, not the campaign's whole day.
+        assert "window_closed" in note and "morning band has closed" in note, note
     finally:
         conn.execute("UPDATE campaigns SET autopilot=? WHERE id=?", (was, cid))
         conn.commit()
