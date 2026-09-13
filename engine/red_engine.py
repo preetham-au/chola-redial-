@@ -258,6 +258,10 @@ DEFAULT_DISPOSITION_RULES: dict[str, DispositionRule] = _rules(
     DispositionRule("lost", EXCLUDED, note="Terminal"),
     DispositionRule("not_interested", EXCLUDED, note="Terminal"),
     DispositionRule("firm_decision_to_discontinue", EXCLUDED, note="Terminal — will not renew"),
+    # The renewal window has closed. Operator's rule: not called, and not on
+    # RED−1/RED either — hence the `never_dial` entry below as well, without
+    # which the mandatory days would override this exclusion.
+    DispositionRule("policy_expired", EXCLUDED, note="Terminal — renewal window closed"),
     DispositionRule("wrong_number", EXCLUDED, note="Bad data"),
     DispositionRule("number_not_working", EXCLUDED, note="Bad data"),
     DispositionRule("invalid_number", EXCLUDED, note="Bad data"),
@@ -278,6 +282,10 @@ DEFAULT_DISPOSITION_RULES: dict[str, DispositionRule] = _rules(
     # restores its RED−1/RED calls: those two days override a hold, and an
     # unmapped slug is the one class that overrides nothing.
     DispositionRule("needs_human_review", HOLD, note="Awaiting human review — disposition not final"),
+    # The feed also emits chola_v137's level-0 GROUP names, not just its leaves
+    # (confirmed against production `decisions`). `Review` is the group whose
+    # only leaf is Needs_Human_Review, so it takes the same class.
+    DispositionRule("review", HOLD, note="Awaiting human review — disposition not final"),
     DispositionRule("alternate_contact_given", HOLD,
                     note="Number on file superseded — needs a data update before dialling"),
 
@@ -321,6 +329,9 @@ DEFAULT_DISPOSITION_RULES: dict[str, DispositionRule] = _rules(
     # chola_v137 level-2 child of Hung_Up: the customer dropped during the
     # intro, so nothing was discussed. Follows its parent.
     DispositionRule("hung_up_intro", DNP, follow_red_frequency=True),
+    # The level-0 group over did_not_pick / Hung_Up / Voicemail_IVR. Every leaf
+    # under it is DNP, so the group is too.
+    DispositionRule("not_contacted", DNP, follow_red_frequency=True),
     DispositionRule("did_not_pick", DNP, follow_red_frequency=True),
     DispositionRule("unreachable", DNP, follow_red_frequency=True, note="RNR"),
     DispositionRule("rnr", DNP, follow_red_frequency=True, note="Alias of unreachable"),
@@ -346,6 +357,10 @@ DEFAULT_DISPOSITION_RULES: dict[str, DispositionRule] = _rules(
     # rather than letting a catch-all silently retire a live lead.
     DispositionRule("others", DNP, follow_red_frequency=True,
                     note="Catch-all — nothing settled, follows the RED ramp"),
+    # A person was reached but the slug carries no outcome of its own, so it is
+    # the same shape as `follow_up_required`: connected, nothing committed.
+    DispositionRule("contacted", DNP, follow_red_frequency=True,
+                    note="Connected, no committed date — follows the RED ramp"),
 
     # --- fresh leads -------------------------------------------------------
     DispositionRule("new", FRESH, follow_red_frequency=True),
@@ -368,6 +383,8 @@ NEVER_DIAL: tuple[str, ...] = (
     "renewed", "already_paid_to_chola",
     # the number on file does not reach this customer
     "wrong_number", "number_not_working", "invalid_number",
+    # the renewal window has closed — there is nothing left for RED−1/RED to save
+    "policy_expired",
 )
 
 

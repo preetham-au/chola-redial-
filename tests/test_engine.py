@@ -11,7 +11,7 @@ from engine.dispatcher import (
 )
 from engine.red_engine import (
     DEFAULT_CONFIG, SCHEDULE, SKIP_CADENCE, SKIP_DAILY_CAP, SKIP_MANUAL_ONLY,
-    SKIP_REACHED, DNP, HOLD, UNKNOWN, Decision, classify_disposition, decide,
+    SKIP_REACHED, DNP, EXCLUDED, HOLD, UNKNOWN, Decision, classify_disposition, decide,
 )
 
 # The config the live console actually ships, as opposed to the engine's bare
@@ -865,7 +865,10 @@ CHOLA_V137_LEAVES = (
     "lead_cmrl_interested", "lead_directed_to_branch", "lead_premium_quotation",
     "lead_link_sent_online", "already_paid_to_chola",
     "requested_human_agent_connect", "needs_human_review",
-    # Not in the taxonomy JSON, but the pipeline emits them alongside it.
+    # Not in the taxonomy JSON, but production `decisions` proves the pipeline
+    # emits them: the level-0 GROUP names as well as the leaves, plus two slugs
+    # the JSON does not mention at all.
+    "not_contacted", "review", "contacted", "policy_expired",
     "telephony_failed", "redial_required", "follow_up_required",
 )
 
@@ -889,13 +892,32 @@ def test_every_live_disposition_is_mapped(slug):
     # same lead must not be dialled or held depending only on which pipeline
     # version wrote the row.
     ("needs_human_review", HOLD, "same state as human_review, so the same class"),
+    ("contacted", DNP, "reached, nothing committed -- the follow_up_required shape"),
+    ("not_contacted", DNP, "the group over did_not_pick/Hung_Up/Voicemail_IVR"),
+    ("review", HOLD, "the group whose only leaf is Needs_Human_Review"),
+    ("policy_expired", EXCLUDED, "the renewal window has closed"),
 ])
 def test_the_codes_that_used_to_be_unmapped(slug, expected, why):
     klass, _rule = classify_disposition(slug, DEFAULT_CONFIG)
     assert klass == expected, why
     assert klass == classify_disposition(
         {"hung_up_intro": "hung_up", "others": "follow_up_required",
-         "needs_human_review": "human_review"}[slug], DEFAULT_CONFIG)[0]
+         "needs_human_review": "human_review", "contacted": "follow_up_required",
+         "not_contacted": "did_not_pick", "review": "human_review",
+         "policy_expired": "lost"}[slug], DEFAULT_CONFIG)[0]
+
+
+def test_an_expired_policy_is_not_called_even_on_its_red_date():
+    """The operator's rule is "not called, and not on RED either".
+
+    EXCLUDED alone does not deliver that: RED−1 and RED override an exclusion
+    by design. Only `never_dial` survives them, so this pins both halves --
+    drop `policy_expired` from NEVER_DIAL and this test is what notices.
+    """
+    assert "policy_expired" in DEFAULT_CONFIG.never_dial
+    decision = decide(lead(stage="policy_expired", red=TODAY.isoformat()),
+                      NOW, SHIPPED)
+    assert decision.schedule is False
 
 
 def test_an_abstained_lead_is_still_called_on_its_red_date():
