@@ -81,12 +81,20 @@ WAVE_LABEL = {MORNING: "morning", AFTERNOON: "afternoon"}
 _WAVE_BOUNDARY_RAW = (os.environ.get("WAVE_BOUNDARY") or "13:30").strip()
 WAVE_BOUNDARY = parse_hhmm(_WAVE_BOUNDARY_RAW, "WAVE_BOUNDARY")
 # `parse_hhmm` only bounds the TOTAL, so it reads `13:70` as 14:10 rather than
-# refusing it. Required to round-trip instead: a boundary quietly set to a time
-# nobody typed is the same failure as one set outside the hours, and it is the
-# likelier typo of the two.
-if hhmm(WAVE_BOUNDARY) != _WAVE_BOUNDARY_RAW:
+# refusing it. A boundary quietly set to a time nobody typed is the same failure
+# as one set outside the hours, and it is the likelier typo of the two.
+#
+# The MINUTE FIELD is what has to be checked, not the round trip. Comparing
+# `hhmm(WAVE_BOUNDARY)` against the raw string also refused `9:30` and `13:5` --
+# unpadded, unambiguous, and booting fine before this guard existed. A guard that
+# stops a live dialler on a legal value is worse than the bug it prevents. The
+# hour needs no check of its own: `parse_hhmm` bounds the total at 24:00 and the
+# dialling-hours check below is stricter still.
+_WAVE_BOUNDARY_MM = _WAVE_BOUNDARY_RAW.partition(":")[2].strip()
+if not (_WAVE_BOUNDARY_MM.isdigit() and int(_WAVE_BOUNDARY_MM) < 60):
     raise ValueError(f"WAVE_BOUNDARY must be HH:MM, got {_WAVE_BOUNDARY_RAW!r} "
-                     f"(read as {hhmm(WAVE_BOUNDARY)})")
+                     f"(minutes {_WAVE_BOUNDARY_MM!r} are not 00-59; it would be "
+                     f"read as {hhmm(WAVE_BOUNDARY)})")
 # Inside the dialling hours, and strictly: a boundary ON or outside either edge
 # gives one wave the whole day and the other an empty band for EVERY campaign,
 # and nothing downstream says so -- `_clip` just returns a band with no minutes

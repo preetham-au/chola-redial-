@@ -471,6 +471,74 @@ def test_wave_boundary_set_in_the_env_file_reaches_the_band_logic(client, tmp_pa
         f"logic; the bands report {out.stdout.strip()!r}")
 
 
+# WAVE_BOUNDARY -> may the API boot on it? `None` is the variable unset.
+# Unpadded is legal and has always booted; only a minute field outside 00-59 or a
+# boundary outside the dialling hours is impossible.
+BOUNDARY_BOOTS = ((None, True), ("13:30", True), ("9:30", True), ("13:5", True),
+                  ("13:70", False), ("00:00", False), ("25:00", False))
+
+
+def test_the_wave_boundary_guard_refuses_only_impossible_times(client, tmp_path):
+    """`9:30` and `13:5` must boot; `13:70`, `00:00` and `25:00` must not.
+
+    The first version of this guard compared `hhmm(parse_hhmm(raw))` against the
+    raw string, so it refused every unpadded value too -- both of those name a
+    real time and both booted before the guard existed. On a box running with
+    DRY_RUN=0, an API that will not start on a legal value is worse than the
+    silent 14:10 the guard was written to catch.
+
+    One subprocess for the whole matrix, because the guard runs at MODULE level
+    in api.day: each value needs its own fresh import chain, and this session
+    imported api.day long ago.
+    """
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    # A file rather than `python -c`: the probe is a loop, and a multi-line -c
+    # argument is a quoting question this test has no reason to ask.
+    probe = tmp_path / "boundary_matrix.py"
+    probe.write_text(
+        "import os, sys\n"
+        f"CASES = {[v for v, _ in BOUNDARY_BOOTS]!r}\n"
+        "for value in CASES:\n"
+        "    for name in [m for m in sys.modules if m.split('.')[0] in ('api', 'engine')]:\n"
+        "        del sys.modules[name]\n"
+        "    os.environ.pop('WAVE_BOUNDARY', None)\n"
+        "    if value is not None:\n"
+        "        os.environ['WAVE_BOUNDARY'] = value\n"
+        "    try:\n"
+        "        import api.main\n"
+        "        from api.day import WAVE_BOUNDARY\n"
+        "        from engine.dispatcher import hhmm\n"
+        "        print(f'{value}\\tBOOT\\t{hhmm(WAVE_BOUNDARY)}')\n"
+        "    except Exception as exc:\n"
+        "        print(f'{value}\\tREFUSED\\t{type(exc).__name__}: {exc}')\n",
+        encoding="utf-8")
+    # A .env that does not exist, so the unset case is genuinely unset: `load_env`
+    # uses setdefault, and a file carrying WAVE_BOUNDARY would answer for it.
+    env = {k: v for k, v in os.environ.items() if k != "WAVE_BOUNDARY"}
+    env.update(REDIAL_ENV_FILE=str(tmp_path / "absent.env"), PYTHONPATH=str(root))
+
+    out = subprocess.run([sys.executable, str(probe)], cwd=str(root), env=env,
+                         capture_output=True, text=True)
+
+    assert out.returncode == 0, out.stderr
+    seen = dict(line.split("\t", 1) for line in out.stdout.splitlines() if "\t" in line)
+    for value, boots in BOUNDARY_BOOTS:
+        answer = seen.get(str(value), "")
+        if boots:
+            assert answer.startswith("BOOT"), \
+                f"WAVE_BOUNDARY={value} is a legal time and must boot; it answered {answer!r}"
+        else:
+            assert answer.startswith("REFUSED"), \
+                f"WAVE_BOUNDARY={value} is impossible and must refuse; it answered {answer!r}"
+            assert str(value) in answer, \
+                f"the refusal for {value!r} must name the value the operator typed: {answer!r}"
+
+
 def test_a_campaign_closing_exactly_on_the_boundary_has_no_afternoon_band(client):
     """start == end is an empty band too, and only `>=` catches it.
 
@@ -690,6 +758,48 @@ def test_approve_is_scoped_to_its_agent(client):
         "an unscoped approve must still visit every armed campaign"
 
 
+def test_approve_dials_the_intersection_of_the_agent_scope_and_campaign_ids(client):
+    """Both narrowings at once must INTERSECT -- neither one wins.
+
+    `approve_day` takes an `agent_id` scope and a `campaign_ids` list, and this
+    is the only endpoint in the console that reaches Formi. The per-panel Approve
+    button sends both at once, so "what do they mean together" is answered on a
+    live dialler unless it is answered here. An agent scope that overrode the
+    named ids, ids that overrode the agent scope, and a union of the two are all
+    different sets of customers, and all three passed the suite before this test.
+
+    Three campaigns, so the three wrong answers are all distinguishable from the
+    right one: two armed on the first agent and one on the second, with only one
+    of the first agent's two named. Dated tomorrow with no plan prepared, so every
+    campaign visited answers `not_prepared` and nothing dials -- what is asserted
+    is which campaigns the approve reached at all, which is the roster decision.
+    """
+    (first, first_c), (second, second_c) = _arm_two_agents()
+    with session() as conn:
+        row = conn.execute("SELECT id FROM campaigns WHERE agent_id=? AND id<>? "
+                           "ORDER BY id", (first, first_c)).fetchone()
+        assert row is not None, \
+            f"agent {first} needs a second campaign for this test to separate the cases"
+        also_first = row["id"]
+        conn.execute("UPDATE campaigns SET autopilot=1, enabled=1, paused=0, hidden=0 "
+                     "WHERE id=?", (also_first,))
+        conn.commit()
+    tomorrow = (now_ist().date() + timedelta(days=1)).isoformat()
+
+    dialled = {c["campaign_id"] for c in client.post(
+        "/api/day/approve",
+        json={"date": tomorrow, "agent_id": first,
+              "campaign_ids": [first_c, second_c]}).json()["campaigns"]}
+
+    assert dialled == {first_c}, (
+        f"a scoped approve naming campaigns {[first_c, second_c]} must dial their "
+        f"intersection with agent {first} -- campaign {first_c} alone. It dialled "
+        f"{sorted(dialled)}. Campaign {also_first} is agent {first}'s but was not "
+        f"named (the agent scope alone would add it); campaign {second_c} was named "
+        f"but belongs to agent {second} (the id list alone would add it); both "
+        f"together is the union.")
+
+
 def test_armed_helper_leaves_the_unscoped_clause_exactly_as_it_was(client):
     """`_armed(None)` is the literal roster string, with no parameters.
 
@@ -740,6 +850,24 @@ def test_agents_carry_the_field_even_with_nothing_configured(client, monkeypatch
 
     assert agents, "the fixture DB must hold at least one agent"
     assert all("language" in a and a["language"] is None for a in agents)
+
+
+def test_an_agent_named_twice_is_refused_rather_than_last_wins(client, monkeypatch):
+    """`125:Hindi,125:Tamil` is a contradiction, not an override.
+
+    It used to boot clean and label 125 Tamil, on the one variable whose entire
+    justification is that a wrong label means a script read to the wrong cohort.
+    The refusal has to name the id and BOTH labels -- neither is more likely to be
+    the intended one, so the operator is the only one who can choose.
+    """
+    import api.routes_core as core
+
+    monkeypatch.setenv("AGENT_LANGUAGES", "125:Hindi,125:Tamil")
+    with pytest.raises(ValueError, match="125") as raised:
+        core.list_agents()
+
+    assert "Hindi" in str(raised.value) and "Tamil" in str(raised.value), \
+        f"the refusal must name both labels: {raised.value}"
 
 
 def test_a_malformed_agent_language_is_refused_rather_than_guessed(client, monkeypatch):

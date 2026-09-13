@@ -31,6 +31,10 @@ from pydantic import BaseModel
 from engine.red_engine import EXCLUDED, config_from_settings
 
 from .db import current_config, now_ist, session
+# Not a cycle: `api.day` imports `.db`, `.routes_core` and `engine` at module
+# level and reaches back into this module only from inside functions, so this
+# direction can be a plain import.
+from .day import _scope
 from .routes_core import _campaign, _campaign_json
 
 router = APIRouter()
@@ -128,8 +132,6 @@ def _resync_status(day: date, agent_id: Optional[int] = None) -> list[int]:
     """
     from engine import metabase_source as ms          # noqa: PLC0415 — heavy import
     from engine.sync import refresh_campaign_status   # noqa: PLC0415
-
-    from .day import _scope                           # noqa: PLC0415 — avoids a cycle
 
     config = ms.load_config()
     schema = ms.describe_schema(config)

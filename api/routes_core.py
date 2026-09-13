@@ -211,7 +211,16 @@ def _agent_languages() -> dict[int, str]:
         # int()` and nothing about AGENT_LANGUAGES.
         if not (agent.strip().isdigit() and label.strip()):
             raise ValueError(f"AGENT_LANGUAGES entry {part!r} is not `id:Language`")
-        out[int(agent)] = label.strip()
+        agent_id, label = int(agent), label.strip()
+        # A repeated id is a contradiction, not an override. `125:Hindi,125:Tamil`
+        # last-wins into "125 is Tamil" and boots clean -- on the one variable
+        # whose whole justification is that a wrong label means a script read to
+        # the wrong cohort. Both labels are named because neither is more likely
+        # to be the intended one.
+        if agent_id in out:
+            raise ValueError(f"AGENT_LANGUAGES names agent {agent_id} twice, as "
+                             f"{out[agent_id]!r} and {label!r} -- say which one it speaks")
+        out[agent_id] = label
     return out
 
 
