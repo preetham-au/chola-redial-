@@ -100,8 +100,10 @@ def _band(kind: str, dcfg: DispatchConfig) -> DispatchConfig:
     or in `_write_run` needs to know a band exists.
 
     CLIPPING, never widening. A campaign that shuts at 13:00 gets an afternoon
-    band whose start is at or past its end -- an empty band, which the existing
-    `floor >= end_min` guard already reports as `window_closed`.
+    band whose start is at or past its end -- an empty band, caught by the
+    explicit `start_min >= end_min` check in `_prepare_one` / `_approve_one`.
+    NOT by `floor >= end_min`: on a date that is not today `_floor_min` returns
+    None and that guard never runs.
     """
     start, end = _clip(dcfg.start_min, dcfg.end_min, kind)
     return replace(dcfg, start_min=start, end_min=end)
@@ -246,20 +248,10 @@ def _day_window(configs: dict[int, dict[str, Any]], ready: dict[int, int],
         # can actually reach rather than the campaign's whole day.
         start, end = _clip(parse_hhmm(window.get("start", DEFAULT_WINDOW["start"])),
                            parse_hhmm(window.get("end", DEFAULT_WINDOW["end"])), kind)
-        # A campaign with no band at all clips to start > end. `room` and `open`
-        # both read that as zero either way, but the reported envelope is a STRING
-        # on the operator's screen and "13:30-13:00" is not a window anyone can
-        # read. Collapsed to a point, it says the honest thing: no hours here.
-        #
-        # Collapsed toward the BAND, not forward onto `start`: a legal 14:00-20:00
-        # campaign clips to start=14:00, end=13:30 in the morning, and `end =
-        # max(end, start)` pushed the header out to 14:00 -- the morning wave
-        # naming an hour past the boundary that defines it, which is the same lie
-        # the bands were added to kill. The band edge is the latest hour this
-        # wave can honestly claim.
+        # No hours in this wave: a point at the boundary (every inverted clip
+        # lands there), not a backwards "13:30-13:00" on the operator's screen.
         if start > end:
-            lo, hi = WAVE_BAND[kind]
-            start = end = min(max(start, lo or 0), hi if hi is not None else 24 * 60)
+            start = end = WAVE_BOUNDARY
         spans.add((start, end))
         waiting = ready.get(campaign_id, 0)
         if not today:

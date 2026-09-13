@@ -386,3 +386,92 @@ def test_pin_clock_can_be_called_twice(client, pin_clock):
     for module in (api.db, day_module, routes_core):
         assert module.now_ist().hour == 15, \
             f"{module.__name__} is still on the first pinned hour: {module.now_ist()}"
+
+
+def test_wave_boundary_set_in_the_env_file_reaches_the_band_logic(client, tmp_path):
+    """A WAVE_BOUNDARY in the .env must reach `_band`, not merely os.environ.
+
+    `api.main` used to import the routers BEFORE calling `load_env()`, and
+    `api.day` freezes WAVE_BOUNDARY into a module constant at import. So the one
+    tunable this feature has was inert: the operator moved the boundary, got no
+    error and no warning, and both waves kept dialling to 13:30.
+
+    A subprocess because import ORDER is the thing under test and this session
+    imported `api.day` long ago. The value goes in the .env FILE, not a shell
+    export: an export already worked before the fix, so exporting one tests the
+    single path that was never broken.
+    """
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    env_file = tmp_path / "boundary.env"
+    env_file.write_text("WAVE_BOUNDARY=11:15\n", encoding="utf-8")
+
+    probe = (
+        "import api.main;"                      # the import IS the thing under test
+        "from api.day import AFTERNOON, MORNING, _band;"
+        "from engine.dispatcher import DispatchConfig, hhmm;"
+        "d = DispatchConfig(start_min=9*60, end_min=20*60);"
+        "print(hhmm(_band(MORNING, d).end_min), hhmm(_band(AFTERNOON, d).start_min))"
+    )
+    env = {k: v for k, v in os.environ.items() if k != "WAVE_BOUNDARY"}
+    # Not "" -- load_env uses setdefault, so an empty-but-present key would shadow
+    # the file and this test would pass on the default for the wrong reason.
+    env.update(REDIAL_ENV_FILE=str(env_file), PYTHONPATH=str(root))
+
+    out = subprocess.run([sys.executable, "-c", probe], cwd=str(root), env=env,
+                         capture_output=True, text=True)
+
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split() == ["11:15", "11:15"], (
+        f"{env_file.read_text().strip()} in the .env never reached the band "
+        f"logic; the bands report {out.stdout.strip()!r}")
+
+
+def test_a_campaign_closing_exactly_on_the_boundary_has_no_afternoon_band(client):
+    """start == end is an empty band too, and only `>=` catches it.
+
+    A campaign whose window ends exactly at WAVE_BOUNDARY clips to
+    start == end == WAVE_BOUNDARY in the afternoon. With the guards written `>`
+    instead of `>=` this sails through, and on a future date (`_floor_min`
+    returns None, so the clock guard cannot fire either) the run that gets
+    written stamps every one of its slots on the same single minute --
+    the collapse `api/routes_core.py`'s `floor >= end_min` exists to prevent.
+
+    Dated TOMORROW for exactly that reason: it removes the clock guard, leaving
+    the empty-band check as the only thing that can close this window.
+    """
+    from engine.dispatcher import hhmm
+
+    import api.day as day_module
+
+    campaign_id = _arm()[0]
+    tomorrow = now_ist().date() + timedelta(days=1)
+    config = client.get(f"/api/campaigns/{campaign_id}/config").json()
+    saved = client.put(f"/api/campaigns/{campaign_id}/config",
+                       json={**config, "dial_window": {"start": "09:00",
+                                                       "end": hhmm(WAVE_BOUNDARY)}})
+    assert saved.status_code == 200, saved.text
+    try:
+        prepared = day_module._prepare_one(campaign_id, tomorrow, "auto_pm", False)
+        with session() as conn:
+            written = conn.execute(
+                "SELECT COUNT(*) AS n FROM runs WHERE campaign_id=? AND run_date=? "
+                "AND kind='auto_pm'", (campaign_id, tomorrow.isoformat())).fetchone()["n"]
+        _seed_run(campaign_id, tomorrow.isoformat(), "auto_pm", "planned", 3)
+        with session() as conn:
+            campaign = conn.execute("SELECT * FROM campaigns WHERE id=?",
+                                    (campaign_id,)).fetchone()
+            approved = day_module._approve_one(conn, campaign, tomorrow, "auto_pm", [])
+    finally:
+        client.put(f"/api/campaigns/{campaign_id}/config", json=config)
+
+    assert prepared["status"] == "window_closed", prepared
+    assert "no afternoon band" in prepared["detail"], prepared["detail"]
+    assert written == 0, \
+        "a zero-width band must not write a run whose every slot shares one minute"
+    assert approved["status"] == "window_closed", approved
+    assert approved.get("posted") is None, "a zero-width band must never reach Formi"

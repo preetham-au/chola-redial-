@@ -21,18 +21,21 @@ from pydantic import BaseModel
 
 from .db import (DEFAULT_CONFIG, db_path, dry_run, init_db, leads_source,
                  load_env, save_env_value, session)
-from .day import router as day_router
-from .dial_log import router as dial_log_router
-from .routes_core import router as core_router
-from .routes_stage import router as stage_router
-
-# Before anything reads os.environ. Real environment variables still win, so a
-# test that exports LEADS_SOURCE=seed is not overridden by the .env on disk.
+# Before anything reads os.environ -- which means before the ROUTER imports, not
+# after them. `api.day` resolves WAVE_BOUNDARY into a module constant at import
+# time, so while this call sat below those imports a WAVE_BOUNDARY set in .env
+# was loaded after that constant had already frozen at its default: no error, no
+# warning, both waves still dialling to 13:30 on a live dialler.
+#
+# Real environment variables still win (`load_env` uses setdefault), so a test
+# that exports LEADS_SOURCE=seed is not overridden by the .env on disk.
 load_env()
 
-# After load_env(): the module reads AUTOPILOT_AM/PM at call time, but keeping
-# the import here documents the ordering the rest of this file depends on.
 from .autopilot import loop as autopilot_loop, router as autopilot_router  # noqa: E402
+from .day import router as day_router  # noqa: E402
+from .dial_log import router as dial_log_router  # noqa: E402
+from .routes_core import router as core_router  # noqa: E402
+from .routes_stage import router as stage_router  # noqa: E402
 
 
 @asynccontextmanager
