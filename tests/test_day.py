@@ -248,22 +248,23 @@ def test_band_leaves_other_config_untouched(client):
     assert band.red_priority == dcfg.red_priority
 
 
-def test_prepare_reports_the_band_that_closed_not_the_whole_window(client, monkeypatch):
+def test_prepare_reports_the_band_that_closed_not_the_whole_window(client, pin_clock):
     """Preparing the morning wave after the boundary must name the BAND.
 
     Before bands, this said "the 09:00-20:00 window has closed" only after 20:00,
     and happily planned a 'morning' wave into the evening at any hour before it.
+
+    `pin_clock` rather than a hand-rolled monkeypatch of `day_module.now_ist`:
+    `_prepare_one` reads the clock twice, once for `_evaluate` and once for
+    `_floor_min`, and patching the one name in one module left the other on the
+    real clock -- working only while the two happened to agree on the date.
     """
     import api.day as day_module
 
     _arm()
-    # Captured BEFORE the patch. Reading `day_module.now_ist` from inside the
-    # replacement would be the replacement reading itself -- infinite recursion.
-    real_now_ist = day_module.now_ist
-    monkeypatch.setattr(day_module, "now_ist", lambda: real_now_ist().replace(
-        hour=15, minute=0, second=0, microsecond=0))
+    now = pin_clock(15)
 
-    out = day_module.prepare_day(real_now_ist().date(), "auto")
+    out = day_module.prepare_day(now.date(), "auto")
     closed = [c for c in out["campaigns"] if c["status"] == "window_closed"]
 
     assert closed, "the morning band is shut at 15:00 - every campaign must say so"
@@ -271,6 +272,12 @@ def test_prepare_reports_the_band_that_closed_not_the_whole_window(client, monke
         f"the detail must name the band, got {closed[0]['detail']!r}"
     assert "20:00" not in closed[0]["detail"], \
         "naming the full window hides the fact that the morning band is what shut"
+    # The wording, not just the hours -- `_approve_one`'s twin is pinned the same
+    # way in test_api.py. Without this the detail reverts to "window has closed"
+    # with the band's hours in front of it, which reads as the campaign's whole
+    # day having ended, and the suite stays green.
+    assert "morning band has closed" in closed[0]["detail"], \
+        f"the detail must say which BAND shut, got {closed[0]['detail']!r}"
 
 
 def test_a_campaign_with_no_afternoon_band_neither_prepares_nor_approves(client):
@@ -332,3 +339,50 @@ def test_the_window_a_campaign_has_no_band_for_reports_no_hours(client):
         "a band with no hours in it must not be reported as a backwards window"
     assert span["open"] is False, "there is no afternoon here to open"
     assert span["capacity"] == 0, "no hours means no capacity, whatever is ready"
+
+
+def test_the_morning_header_never_reports_an_hour_past_the_boundary(client):
+    """A campaign that opens after the boundary must not stretch the morning header.
+
+    14:00-20:00 is a legal window (WINDOW_FLOOR/WINDOW_CEIL are 09:00/20:00), and
+    in the morning it clips to start=14:00, end=13:30. Collapsing that forward
+    onto `start` made the ENVELOPE end at 14:00 -- the morning wave's header
+    promising half an hour past the boundary that defines it, which is the same
+    lie ("morning" slots landing in the evening) the bands were added to kill.
+    Collapsed toward the band, the campaign contributes 13:30 and the header
+    stays inside the morning.
+    """
+    from api.day import MORNING, _day_window
+    from engine.dispatcher import hhmm, parse_hhmm
+
+    span = _day_window({1: {"dial_window": {"start": "14:00", "end": "20:00"},
+                            "max_per_minute": 10},
+                        2: {"dial_window": {"start": "09:00", "end": "20:00"},
+                            "max_per_minute": 10}},
+                       {1: 500, 2: 500}, floor=10 * 60, today=True, kind=MORNING)
+
+    assert parse_hhmm(span["window"]["end"]) <= WAVE_BOUNDARY, \
+        (f"the morning header says {span['window']['end']}, past the "
+         f"{hhmm(WAVE_BOUNDARY)} boundary that defines the morning")
+    assert span["window"] == {"start": "09:00", "end": hhmm(WAVE_BOUNDARY)}, span["window"]
+
+
+def test_pin_clock_can_be_called_twice(client, pin_clock):
+    """A second pin must move every module the first one moved.
+
+    The fixture finds its targets by identity against the original `now_ist`, and
+    each pin installs a DISTINCT lambda -- so a sweep re-run per call matches only
+    api.db the second time and leaves api.day and api.routes_core on the FIRST
+    hour. That fails green, which is precisely the "the fixture patched the wrong
+    target" failure pinning the clock exists to prevent.
+    """
+    import api.day as day_module
+    import api.db
+    import api.routes_core as routes_core
+
+    pin_clock(10)
+    pin_clock(15)
+
+    for module in (api.db, day_module, routes_core):
+        assert module.now_ist().hour == 15, \
+            f"{module.__name__} is still on the first pinned hour: {module.now_ist()}"

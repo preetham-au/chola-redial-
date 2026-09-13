@@ -57,18 +57,27 @@ def pin_clock(monkeypatch):
     filed under today. monkeypatch undoes all of it at teardown, which matters
     here: `client` above is session-scoped, so one database outlives every test
     and a clock left pinned would follow it into the next file.
+
+    The importers are resolved ONCE, here, before anything is patched -- the
+    search is by identity and each patch installs a distinct lambda, so a sweep
+    run per call finds only api.db on the second call and leaves api.day and
+    api.routes_core reporting the FIRST time. A fixture that silently pins the
+    wrong target is the failure this fixture exists to prevent, so calling it
+    twice repins every module it pinned the first time.
     """
     import api.db
 
+    real = api.db.now_ist
+    targets = [m for m in list(sys.modules.values())
+               if getattr(m, "now_ist", None) is real]
+
     def pin(hour: int, minute: int = 0):
-        real = api.db.now_ist
         frozen = real().replace(hour=hour, minute=minute, second=0, microsecond=0)
-        # `lambda: frozen`, captured BEFORE the patch -- never `lambda:
+        # `lambda: frozen`, over the ORIGINAL captured above -- never `lambda:
         # now_ist().replace(...)`, which is the replacement calling itself and
         # recurses until the stack ends.
-        for module in list(sys.modules.values()):
-            if getattr(module, "now_ist", None) is real:
-                monkeypatch.setattr(module, "now_ist", lambda: frozen)
+        for module in targets:
+            monkeypatch.setattr(module, "now_ist", lambda: frozen)
         return frozen
 
     return pin

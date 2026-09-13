@@ -250,7 +250,16 @@ def _day_window(configs: dict[int, dict[str, Any]], ready: dict[int, int],
         # both read that as zero either way, but the reported envelope is a STRING
         # on the operator's screen and "13:30-13:00" is not a window anyone can
         # read. Collapsed to a point, it says the honest thing: no hours here.
-        end = max(end, start)
+        #
+        # Collapsed toward the BAND, not forward onto `start`: a legal 14:00-20:00
+        # campaign clips to start=14:00, end=13:30 in the morning, and `end =
+        # max(end, start)` pushed the header out to 14:00 -- the morning wave
+        # naming an hour past the boundary that defines it, which is the same lie
+        # the bands were added to kill. The band edge is the latest hour this
+        # wave can honestly claim.
+        if start > end:
+            lo, hi = WAVE_BAND[kind]
+            start = end = min(max(start, lo or 0), hi if hi is not None else 24 * 60)
         spans.add((start, end))
         waiting = ready.get(campaign_id, 0)
         if not today:
