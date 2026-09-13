@@ -34,6 +34,7 @@ import {
   lastDialled,
   pickerPrepare,
   planAge,
+  prepareMessage,
   recheckMessage,
   retryArgs,
   runQueue,
@@ -1463,6 +1464,31 @@ ok(
   ok('and an empty scope says it was empty rather than reporting a clean zero',
      tone({ ready: 0, prepared: 0 }) === 'bad'
      && has(say({ ready: 0, prepared: 0 }), 'No campaign was armed'));
+
+  // The same answer, one button over. "Build the plan" and "Re-check and build"
+  // are both `DayPanel.prepare`, and it wrote its own verdict: a flat
+  // `toast('ok', 'Plan built: 0 leads ready across 0 campaigns. Nothing has been
+  // dialled.')` — green tick, cheerful zero — for a pass that had just switched
+  // autopilot off, or come back with no plan at all. Everything the re-check
+  // learned to say went unsaid one button over, off the SAME `/api/day/prepare`
+  // body. So the judgement is one function now and both leads run through it.
+  const built = (over: Partial<PrepareResult>) =>
+    prepareMessage(prep(over), rd, 'Plan built: none.');
+  const off = { campaigns: [failed(paused.id, 'finished')] };
+  ok('a build that switched autopilot off for a campaign is never toasted as success',
+     built(off)[0] === 'bad' && has(built(off)[1], 'Autopilot switched off'));
+  ok('and a build that came back with no plan at all is not reported as a clean zero',
+     built({ ready: 0, prepared: 0 })[0] === 'bad');
+  ok('and a build where nothing went wrong is still the plain success it was',
+     built({})[0] === 'ok');
+  // The helper being right is half of it: the defect was the CALL SITE, an
+  // inline toast that never asked. Both prepares are async clicks the static
+  // renderer never reaches, so the wiring is read off the source — a third
+  // opinion written beside either one reddens here.
+  const afterPrepare = src.split('await panelPrepare(').slice(1).map((s) => s.slice(0, 260));
+  ok('and every build in the day screen toasts that shared judgement, not its own',
+     afterPrepare.length === 2
+     && afterPrepare.every((s) => /toast\(\.\.\.(prepare|recheck)Message\(/.test(s)));
   retryLive();
 
   // --- and the day actually goes out one campaign at a time -------------------

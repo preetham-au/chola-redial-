@@ -102,7 +102,7 @@ export const pickerPrepare = (agentId: number | null, date: string, kind: string
  *  are ordinary answers, not failures. */
 const NO_PLAN = ['resync_failed', 'error'];
 
-/** What the re-check has to say for itself.
+/** What a prepare pass has to say for itself, whatever button started it.
  *
  *  A ready count falling from 4 to 2 is not an explanation. The two facts that
  *  explain it are the two only a `resync` pass can learn, and both used to be
@@ -125,10 +125,20 @@ const NO_PLAN = ['resync_failed', 'error'];
  *
  *  Pure and exported because the handler that toasts it is an async click the
  *  static renderer never reaches — written inline, the sentence naming the
- *  stopped campaigns could be deleted with the whole gate still green. */
-export const recheckMessage = (out: PrepareResult, day: DayView): [Toast['kind'], string] => {
-  const name = (id: number) => day.campaigns.find((c) => c.id === id)?.name ?? `#${id}`;
-  const said = [`Re-checked: ${n(out.ready)} still ready across ${out.prepared} campaigns.`];
+ *  stopped campaigns could be deleted with the whole gate still green.
+ *
+ *  `lead` is the one sentence that differs between the buttons — what was just
+ *  built, or what is still ready after a re-check. EVERYTHING after it is the
+ *  same judgement, because it is the same `/api/day/prepare` answer either way:
+ *  "Build the plan" wrote its own green "Plan built: 0 leads ready across 0
+ *  campaigns" and said nothing about a campaign it had just disarmed, so the
+ *  failure the re-check path learned to report went out as a success one button
+ *  over. `day` is nullable only so the panel can pass its own possibly-unloaded
+ *  day straight in; an id with no day behind it prints as `#id`, as ever. */
+export const prepareMessage = (out: PrepareResult, day: DayView | null,
+                               lead: string): [Toast['kind'], string] => {
+  const name = (id: number) => day?.campaigns.find((c) => c.id === id)?.name ?? `#${id}`;
+  const said = [lead];
   const stopped = (out.stopped_in_formi ?? []).map(name);
   if (stopped.length > 0) said.push(`Stopped in Formi since: ${stopped.join(', ')}.`);
   const failed = out.campaigns
@@ -155,11 +165,16 @@ export const recheckMessage = (out: PrepareResult, day: DayView): [Toast['kind']
   const none = out.prepared === 0;
   if (none)
     said.push(out.campaigns.length === 0
-      ? 'No campaign was armed for this plan, so nothing was re-checked.'
+      ? 'No campaign was armed for this plan, so nothing was planned.'
       : 'No campaign came back with a plan — there is nothing here to dial.');
   const wrong = stopped.length + failed.length + disarmed.length > 0 || none;
   return [wrong ? 'bad' : 'ok', said.join(' ')];
 };
+
+/** The re-check's lead sentence over that same judgement. */
+export const recheckMessage = (out: PrepareResult, day: DayView) =>
+  prepareMessage(out, day,
+    `Re-checked: ${n(out.ready)} still ready across ${out.prepared} campaigns.`);
 
 /** Exactly what `api.approveDay` takes, named so the approve and its Retry can
  *  pass one value between them instead of five. */
@@ -604,7 +619,9 @@ export function DayPanel({
     setBusy('prepare');
     try {
       const res = await panelPrepare(agent, date, kind, resync);
-      toast('ok', `Plan built: ${n(res.ready)} leads ready across ${res.prepared} campaigns. Nothing has been dialled.`);
+      toast(...prepareMessage(res, d,
+        `Plan built: ${n(res.ready)} leads ready across ${res.prepared} campaigns.`
+        + ' Nothing has been dialled.'));
       day.reload();
     } catch (e) {
       toast('bad', (e as Error).message);
