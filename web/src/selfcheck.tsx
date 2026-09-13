@@ -30,6 +30,7 @@ import {
   panelPrepare,
   panelsFor,
   pickerPrepare,
+  lastDialled,
   planAge,
   recheckMessage,
   retryArgs,
@@ -417,6 +418,19 @@ ok(
   const none = modal({}, [], []);
   ok('unticking every bucket blocks the approve button rather than dialling all of them',
      has(none, 'disabled=""') && has(none, 'nothing to dial'));
+
+  // The facts an operator approves ON. Both of these lines reduce every campaign
+  // on the panel to one value, and the modal used to take opposite ends without
+  // saying so: the worst plan age beside the most flattering last-dial date.
+  const mixed = modal(
+    { campaigns: base.campaigns.map((c, i) =>
+        ({ ...c, last_dialled: i === 0 ? '2026-06-01' : '2026-09-12' })) },
+    [], ['M0'],
+  );
+  ok('the approve modal reports the whole range of last-dial dates, not its newest end',
+     has(mixed, '2026-06-01 – 2026-09-12'));
+  ok('and says out loud that the plan age beside it is the oldest one',
+     has(mixed, 'Plan built (oldest)'));
 }
 
 // --- has a call already been placed for these leads? ------------------------
@@ -443,6 +457,22 @@ ok(
      && planAge(built(null, null), Date.now()).minutes === 0);
   ok('the OLDEST plan on the panel decides, not the freshest one beside it',
      planAge(built(5, STALE_MIN + 1, 2), Date.now()).stale);
+
+  // The fact printed beside it, which took the opposite end of its own range.
+  // One line summarising twelve campaigns is a reduction, and which reduction
+  // decides what it means: `plan_built_at` takes the oldest on purpose, while
+  // `last_dialled` took the NEWEST — so campaigns last dialled between June and
+  // yesterday read as "yesterday", the reassuring end of a range whose other end
+  // was the reason to look. Both ends now, whenever they differ.
+  const dialled = (...v: (string | null)[]) => v.map((last_dialled) => ({ last_dialled }));
+  ok('campaigns that were all dialled on the same day say that one day',
+     lastDialled(dialled('2026-09-12', '2026-09-12')) === '2026-09-12');
+  ok('and campaigns that disagree report the range, not the flattering end of it',
+     lastDialled(dialled('2026-09-12', '2026-06-01', '2026-08-04')) === '2026-06-01 – 2026-09-12');
+  ok('a campaign never dialled is the earliest end there is, not a blank',
+     lastDialled(dialled(null, '2026-09-12')) === 'never – 2026-09-12'
+     && lastDialled(dialled(null, null)) === 'never');
+  ok('and a panel with no campaigns claims no date at all', lastDialled([]) === '—');
 
   // The half that cannot be proved on a machine already on IST, and the half
   // that bites hardest: `plan_built_at` carries no offset, and ECMA-262 reads an

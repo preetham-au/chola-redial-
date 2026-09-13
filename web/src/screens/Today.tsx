@@ -285,6 +285,27 @@ export const closesAt = (day: DayView) =>
  *  outside the few minutes between a prepare pass and a prompt approval. */
 export const STALE_MIN = 90;
 
+/** When these campaigns were last dialled — as a range when they disagree.
+ *
+ *  A panel holds many campaigns and one line to say this in, so the line is a
+ *  reduction, and WHICH reduction changes what it means. `plan_built_at` beside
+ *  it takes the OLDEST, deliberately: the worst staleness on the panel is the
+ *  one worth warning about. This took the newest, so twelve campaigns last
+ *  dialled between June and yesterday read as "yesterday" — the reassuring end
+ *  of a range whose other end was the reason to look.
+ *
+ *  Rather than guess which end is the cautious one for a date that is reassuring
+ *  in one reading and alarming in the other, both ends are shown whenever they
+ *  differ. A campaign never dialled sorts first, because never is the earliest a
+ *  last dial can be. */
+export function lastDialled(campaigns: { last_dialled: string | null }[]): string {
+  if (campaigns.length === 0) return '—';
+  const seen = [...new Set(campaigns.map((c) => c.last_dialled ?? ''))].sort();
+  const lo = seen[0] || 'never';
+  const hi = seen[seen.length - 1] || 'never';
+  return lo === hi ? lo : `${lo} – ${hi}`;
+}
+
 /** How old this panel's plan is, in minutes, and whether that is old enough to
  *  stop trusting what it says was already booked.
  *
@@ -1682,11 +1703,15 @@ export function ApproveDay({
           k="Window"
           v={`${day.window.start}–${day.window.end} IST${day.window_varies ? ' · varies by campaign' : ''}`}
         />
-        <Fact k="Plan built" v={builtAt ? `${Math.floor(ageMin / 60)}h ${ageMin % 60}m ago` : '—'} />
+        {/* "oldest" said out loud: this is the worst staleness on the panel, not
+            every campaign's age, and the fact beside it is a range for the same
+            reason — one line summarising many campaigns has to say which of them
+            it is summarising. */}
         <Fact
-          k="Last dialled"
-          v={day.campaigns.map((c) => c.last_dialled).filter(Boolean).sort().reverse()[0] ?? 'never'}
+          k="Plan built (oldest)"
+          v={builtAt ? `${Math.floor(ageMin / 60)}h ${ageMin % 60}m ago` : '—'}
         />
+        <Fact k="Last dialled" v={lastDialled(day.campaigns)} />
       </div>
 
       {booked > 0 && (
