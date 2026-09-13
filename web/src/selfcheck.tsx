@@ -18,7 +18,10 @@ import {
   approveArgs,
   autopilotDiff,
   closesAt,
+  panelDay,
+  panelPrepare,
   panelsFor,
+  retryArgs,
   wireBuckets,
 } from './screens/Today';
 import { Row as LogRow } from './screens/CallLog';
@@ -359,7 +362,7 @@ ok(
 
   const modal = (over: Partial<typeof base>, buckets: string[], shown: string[]) =>
     renderToStaticMarkup(
-      <ApproveDay day={day(over)} buckets={buckets} shown={shown} onClose={() => {}} onDone={() => {}} />,
+      <ApproveDay agent={null} day={day(over)} buckets={buckets} shown={shown} onClose={() => {}} onDone={() => {}} />,
     );
 
   const dry = modal({}, [], ['M0', 'F5', 'E0', 'F4']);
@@ -440,10 +443,32 @@ ok(
   // The button itself cannot be clicked here, so what it would SEND is checked
   // instead. This is the only call that reaches Formi: getting the agent wrong
   // dials a language nobody approved.
-  ok('approving a panel dials that agent and nobody else',
-     approveArgs(mockDay(DATE, 'auto', 127), [])[4] === 127);
+  //
+  // `wholeDay` is deliberately the UNSCOPED day — `agent_id === null` — handed to
+  // a scoped panel. It is the one fixture that tells the two possible sources
+  // apart: the panel's own identity, or the scope the server happened to echo
+  // back. Reading the echo passes every other check in this file and turns a
+  // panel headed "Hindi" into a whole-day dial the moment the echo goes missing.
+  const wholeDay = mockDay(DATE, 'auto');
+  ok('the day fixture really is unscoped, or the two sources cannot be told apart',
+     wholeDay.agent_id === null);
+  ok('approving a panel dials that panel’s agent and nobody else',
+     approveArgs(labelled(127, 'Tamil'), wholeDay, [])[4] === 127);
+  ok('and takes it from the panel, never from the agent the response echoed back',
+     approveArgs(labelled(125, 'Hindi'), wholeDay, [])[4] === 125);
   ok('an unscoped panel still approves the whole day, exactly as before scoping',
-     approveArgs(mockDay(DATE, 'auto'), [])[4] === undefined);
+     approveArgs(null, wholeDay, [])[4] === undefined);
+
+  // The whole-day Retry is the second call that reaches Formi. An empty
+  // `campaign_ids` means EVERY armed campaign to the backend, so a retry that
+  // lost its scope dials the language this panel never approved.
+  const dialled = approveArgs(labelled(125, 'Hindi'), wholeDay, ['M0']);
+  ok('a retry dials the same agent the approve it is retrying dialled',
+     retryArgs(dialled, [7])[4] === 125);
+  ok('with the same buckets, narrowed only to the campaigns that never started',
+     retryArgs(dialled, [7])[2].join() === 'M0' && retryArgs(dialled, [7])[3].join() === '7');
+  ok('and an unscoped approve retries unscoped, exactly as before scoping',
+     retryArgs(approveArgs(null, wholeDay, []), [7])[4] === undefined);
 
   const screen = renderToStaticMarkup(<Today />);
   ok('the day screen renders its panels before any plan has arrived',
@@ -469,7 +494,9 @@ ok(
     ...over,
   });
   const dialres = (over: Partial<ApproveResult> = {}) =>
-    renderToStaticMarkup(<DialResult res={result(over)} buckets={[]} onChange={() => {}} />);
+    renderToStaticMarkup(
+      <DialResult res={result(over)} args={['2026-09-13', 'auto', [], [], undefined]} onChange={() => {}} />,
+    );
 
   const clean = dialres();
   ok('a clean day reads as everything scheduled and offers no retry',
@@ -665,6 +692,26 @@ ok(
   await api.approveDay('2026-09-13', 'auto', [], [], 127);
   ok('approve — the only call that reaches Formi — carries the agent too',
      sent[3].includes('"agent_id":127'));
+
+  // --- and the panel's own two calls, on the same wire ------------------------
+  // Above pins the API layer; this pins the PANEL's use of it. Both of the calls
+  // that establish what a panel is about live in an effect, which the static
+  // renderer never runs — so they are functions of the panel's agent rather than
+  // argument lists written inline, and are driven here with the agent a panel
+  // would hand them. Written inline they could be un-scoped with the whole gate
+  // still green, which is the exact accident this screen was split up to prevent.
+  sent.length = 0;
+  await panelDay(A127, '2026-09-13', 'auto');
+  ok('a panel reads its own agent’s day, scoped from the panel and nothing else',
+     sent[0].includes('agent_id=127'));
+  await panelPrepare(A127, '2026-09-13', 'auto');
+  ok('and builds the plan for that same agent alone — never for both languages',
+     sent[1].includes('"agent_id":127'));
+  await panelDay(null, '2026-09-13', 'auto');
+  ok('an unscoped panel still reads the whole day, byte for byte as before scoping',
+     !sent[2].includes('agent_id'));
+  await panelPrepare(null, '2026-09-13', 'auto');
+  ok('and still builds the whole day’s plan', !sent[3].includes('"agent_id":'));
   retryLive();
 
   console.log('\nall checks passed');

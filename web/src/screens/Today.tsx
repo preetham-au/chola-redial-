@@ -42,15 +42,53 @@ const WAVES = [
 export const wireBuckets = (chosen: string[], all: string[]) =>
   chosen.length === all.length ? [] : chosen;
 
+/** A panel's own read of the day, and its own Prepare. The scope is the panel's
+ *  AGENT and nothing else.
+ *
+ *  Written as functions rather than argument lists inline in an effect, because
+ *  an effect body never runs under the static renderer: as a literal
+ *  `api.day(date, kind, agentId)` the one argument that decides which language a
+ *  panel is about could be deleted with the whole gate still green. As a
+ *  function it goes on the wire in the check and is read back.
+ *
+ *  `agent` null is the unscoped single-panel deployment — a backend with no
+ *  /api/agents, or one agent ever. Nothing is sent and the server answers for
+ *  every armed campaign, byte for byte as before scoping existed. */
+export const panelDay = (agent: Agent | null, date: string, kind: string) =>
+  api.day(date, kind, agent?.agent_id);
+
+export const panelPrepare = (agent: Agent | null, date: string, kind: string) =>
+  api.prepareDay(date, kind, false, agent?.agent_id);
+
+/** Exactly what `api.approveDay` takes, named so the approve and its Retry can
+ *  pass one value between them instead of five. */
+export type ApproveArgs = [string, string, string[], number[], number | undefined];
+
 /** What the Approve button sends. Split out because the button cannot be clicked
  *  by the static check, and the agent is the one argument that must never be
- *  wrong: approving the Hindi panel must not dial Tamil. `agent_id` is null on an
- *  unscoped panel, which sends nothing and approves the whole day as before. */
+ *  wrong: approving the Hindi panel must not dial Tamil.
+ *
+ *  The agent is asserted from the PANEL, never read off `day.agent_id`. The
+ *  panel knows which agent it is; `day` is a response, and a response whose echo
+ *  went missing — an older backend, a proxy that dropped the query string, a
+ *  rename — would turn a panel headed "Hindi" into a whole-day dial without a
+ *  word. */
 export const approveArgs = (
+  agent: Agent | null,
   day: DayView,
   buckets: string[],
-): [string, string, string[], number[], number | undefined] =>
-  [day.date, day.kind, buckets, [], day.agent_id ?? undefined];
+): ApproveArgs => [day.date, day.kind, buckets, [], agent?.agent_id];
+
+/** What the whole-day Retry sends: the argument list that just dialled, narrowed
+ *  to the campaigns that never started. It carries the same agent because it is
+ *  handed the same list — a retry cannot reach outside the approve it is
+ *  retrying, and there is no second agent value on that path to lose.
+ *
+ *  This matters because an empty `campaign_ids` means EVERY armed campaign to
+ *  the backend, so a retry that lost its scope would dial the language this
+ *  panel never approved. */
+export const retryArgs = (args: ApproveArgs, campaign_ids: number[]): ApproveArgs =>
+  [args[0], args[1], args[2], campaign_ids, args[4]];
 
 /** A campaign the server will accept into the daily plan. Disabled and hidden
  *  are both refused with a 409, so they are shown and not offered rather than
@@ -215,8 +253,7 @@ export function DayPanel({
   onPick: () => void;
 }) {
   const toast = useStore((s) => s.toast);
-  const agentId = agent?.agent_id;
-  const day = useAsync(() => api.day(date, kind, agentId), [date, kind, agentId, rev]);
+  const day = useAsync(() => panelDay(agent, date, kind), [date, kind, agent?.agent_id, rev]);
   const [picked, setPicked] = useState<string[] | null>(null);
   const [approving, setApproving] = useState(false);
   const [busy, setBusy] = useState('');
@@ -235,7 +272,7 @@ export function DayPanel({
   const prepare = async () => {
     setBusy('prepare');
     try {
-      const res = await api.prepareDay(date, kind, false, agentId);
+      const res = await panelPrepare(agent, date, kind);
       toast('ok', `Plan built: ${n(res.ready)} leads ready across ${res.prepared} campaigns. Nothing has been dialled.`);
       day.reload();
     } catch (e) {
@@ -281,6 +318,7 @@ export function DayPanel({
 
       {approving && d && (
         <ApproveDay
+          agent={agent}
           day={d}
           buckets={wireBuckets(chosen, all)}
           shown={chosen}
@@ -980,12 +1018,16 @@ function Stopped({ day }: { day: DayView }) {
 
 /** Approving is the only thing in this console that reaches Formi. */
 export function ApproveDay({
+  agent,
   day,
   buckets,
   shown,
   onClose,
   onDone,
 }: {
+  /** Whose panel this Approve belongs to. The dial is scoped from here — from
+   *  the panel's own identity — and not from anything `day` echoed back. */
+  agent: Agent | null;
   day: DayView;
   /** What goes on the wire: empty means every bucket. */
   buckets: string[];
@@ -1009,11 +1051,14 @@ export function ApproveDay({
     .reduce((s, b) => s + b.ready, 0);
   const fits = Math.min(ready, day.capacity_before_close);
   const ok = !live || typed.trim().toUpperCase() === 'DIAL';
+  // The one list that dials. Handed to the result below as-is, so the Retry
+  // re-sends this exact scope rather than a second copy of it.
+  const args = approveArgs(agent, day, buckets);
 
   const submit = async () => {
     setBusy(true);
     try {
-      setRes(await api.approveDay(...approveArgs(day, buckets)));
+      setRes(await api.approveDay(...args));
     } catch (e) {
       toast('bad', (e as Error).message);
     } finally {
@@ -1033,7 +1078,7 @@ export function ApproveDay({
         onClose={done}
         footer={<button className="btn btn-primary" onClick={done}>Done</button>}
       >
-        <DialResult res={res} buckets={buckets} agentId={day.agent_id ?? undefined} onChange={setRes} />
+        <DialResult res={res} args={args} onChange={setRes} />
       </Modal>
     );
   }
@@ -1133,14 +1178,14 @@ const WHY: Record<string, string> = {
  */
 export function DialResult({
   res,
-  buckets,
-  agentId,
+  args,
   onChange,
 }: {
   res: ApproveResult;
-  buckets: string[];
-  /** The panel this result came from. A retry must stay inside it. */
-  agentId?: number;
+  /** The argument list that produced this result — buckets, campaigns and the
+   *  panel's agent. The Retry re-sends it narrowed, so it cannot dial wider than
+   *  the approve it is retrying and there is no second scope here to get wrong. */
+  args: ApproveArgs;
   onChange: (next: ApproveResult) => void;
 }) {
   const toast = useStore((s) => s.toast);
@@ -1162,7 +1207,7 @@ export function DialResult({
   const retryCampaigns = async () => {
     setBusy('day');
     try {
-      const again = await api.approveDay(res.date, res.kind, buckets, restartable, agentId);
+      const again = await api.approveDay(...retryArgs(args, restartable));
       // Every campaign being re-run returned before `_commit`, so it contributed
       // nothing to these totals the first time: the merge is pure addition.
       const byId = new Map(again.campaigns.map((c) => [c.campaign_id, c]));
