@@ -6,6 +6,7 @@ import { readFileSync } from 'node:fs';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { applyBd, BucketDispositions, type BdAction } from './components/BucketDispositions';
 import { AgentChip, AgentPauseConfirm, AgentSwitcher } from './components/AgentBar';
+import { DayProgress, type ProgressRow } from './components/DayProgress';
 import { CampaignPicker } from './App';
 import { BucketOffWhy } from './screens/Dashboard';
 import { TestCallResultView, TestNumberTable, TriggerConfirm } from './screens/TestCall';
@@ -20,10 +21,13 @@ import {
   approveModal,
   autopilotDiff,
   closesAt,
+  dialQueue,
+  mergeResults,
   panelDay,
   panelPrepare,
   panelsFor,
   retryArgs,
+  scopeMismatch,
   wireBuckets,
 } from './screens/Today';
 import { Row as LogRow } from './screens/CallLog';
@@ -515,6 +519,139 @@ ok(
      has(screen, '<h1>The day</h1>') && has(screen, 'Reading today’s plan'));
   ok('and holds no Approve button of its own — approving is per agent',
      !has(screen, 'Approve'));
+}
+
+// --- the day goes out one campaign at a time --------------------------------
+//
+// One Approve used to post every campaign in a single blocking request: 2,967
+// calls on 12 Sep 2026, one timeout away from losing the day, with nothing on
+// screen but a spinner. The loop that walks the day lives in a click handler
+// the static renderer never reaches, so the QUEUE it walks is a pure function
+// and is driven here instead.
+{
+  const DATE = '2026-09-13';
+  const labelled = (id: number, language: string | null): Agent => ({
+    ...agentsFrom(mockCampaigns).find((a) => a.agent_id === id)!,
+    language,
+  });
+  // Again the UNSCOPED day handed to a scoped panel — the one fixture that tells
+  // the panel's own identity apart from the scope the server echoed back.
+  const wholeDay = mockDay(DATE, 'auto');
+  const tamilDay = mockDay(DATE, 'auto', 127);
+  const hindiDay = mockDay(DATE, 'auto', 125);
+  ok('the day fixture really is unscoped, or the two sources cannot be told apart',
+     wholeDay.agent_id === null && tamilDay.agent_id === 127);
+
+  const queue = dialQueue(approveArgs(labelled(127, 'Tamil'), tamilDay, ['M0']), tamilDay);
+  ok('a day is split into one request per campaign, never posted as one',
+     queue.length > 1 && queue.length === tamilDay.campaigns.filter((c) => c.run_status === 'planned').length);
+  ok('each request names exactly one campaign, and each campaign exactly once',
+     queue.every((e) => e.args[3].length === 1) &&
+     new Set(queue.map((e) => e.args[3][0])).size === queue.length);
+  ok('every request carries the day, wave and buckets the operator approved',
+     queue.every((e) => e.args[0] === DATE && e.args[1] === 'auto' && e.args[2].join() === 'M0'));
+  ok('and the progress bar can name each one while it is going',
+     queue.every((e) => e.name.length > 0 && e.campaign_id === e.args[3][0]));
+
+  // Splitting one request into twelve must not become twelve chances to
+  // re-derive the scope from the server's echo. `wholeDay` echoes nothing, so a
+  // queue that read the echo would go out unscoped — every armed campaign on
+  // every agent, for a panel headed "Tamil".
+  const fromEcho = dialQueue(approveArgs(labelled(127, 'Tamil'), wholeDay, []), wholeDay);
+  ok('every campaign in the queue is scoped to the PANEL’s agent, not to the response’s echo',
+     fromEcho.length > 0 && fromEcho.every((e) => e.args[4] === 127));
+  ok('and an unscoped panel still queues unscoped, exactly as before scoping',
+     dialQueue(approveArgs(null, wholeDay, []), wholeDay).every((e) => e.args[4] === undefined));
+  // A campaign already dialled this morning must not be queued again by the
+  // afternoon approve — the backend would no-op it, but each no-op is a round
+  // trip and a row on the operator's progress list saying nothing happened.
+  const committed = {
+    ...wholeDay,
+    campaigns: wholeDay.campaigns.map((c) => ({ ...c, run_status: 'committed' as const })),
+  };
+  ok('only campaigns still waiting on an approval are queued',
+     wholeDay.campaigns.length > 0 &&
+     dialQueue(approveArgs(null, committed, []), committed).length === 0);
+
+  // --- the panel's two witnesses of its own scope ----------------------------
+  //
+  // `args[4]` is what the panel asserts it is about to dial; `day.agent_id` is
+  // what the server says it narrowed this plan to. They agree in every
+  // legitimate state. The echo is read HERE and nowhere else — as a check that
+  // can only refuse a dial, never as a source that could widen one.
+  ok('a panel whose plan and whose button name the same agent is free to dial',
+     scopeMismatch(approveArgs(labelled(125, 'Hindi'), hindiDay, []), hindiDay) === null);
+  ok('and so is an unscoped panel reading an unscoped day',
+     scopeMismatch(approveArgs(null, wholeDay, []), wholeDay) === null);
+
+  const dialsWider = scopeMismatch(approveArgs(null, hindiDay, []), hindiDay);
+  ok('one agent’s plan under a whole-roster dial is refused, not sent',
+     dialsWider !== null && has(dialsWider, 'plan for agent 125') &&
+     has(dialsWider, 'would dial every agent'));
+  const dialsNarrower = scopeMismatch(approveArgs(labelled(127, 'Tamil'), wholeDay, []), wholeDay);
+  ok('and so is the whole roster’s plan under a one-agent dial',
+     dialsNarrower !== null && has(dialsNarrower, 'plan for every agent') &&
+     has(dialsNarrower, 'would dial agent 127'));
+
+  // The refusal has to reach the operator, not just the console: the modal is
+  // rendered through the same `approveModal` a panel wires, with a plan and an
+  // agent that disagree.
+  const disagrees = renderToStaticMarkup(
+    approveModal(labelled(127, 'Tamil'), wholeDay, ['M0'], ['M0', 'F5'], () => {}, () => {}),
+  );
+  ok('a modal whose plan and button disagree says so in words the operator can act on',
+     has(disagrees, 'disagree about who gets called') && has(disagrees, 'plan for every agent'));
+  ok('and the dial button is dead while they do — a dry run has no other reason to be',
+     has(disagrees, 'disabled=""'));
+
+  // --- what is on screen while it runs ---------------------------------------
+  const rows: ProgressRow[] = [
+    { campaign_id: 1, name: 'Renewal Hindi 1', state: 'done' },
+    { campaign_id: 2, name: 'Renewal Hindi 2', state: 'failed' },
+    { campaign_id: 3, name: 'Renewal Hindi 3', state: 'running' },
+  ];
+  const bar = renderToStaticMarkup(
+    <DayProgress done={2} total={5} current="Renewal Hindi 3" rows={rows} />,
+  );
+  ok('the bar fills to the share of CAMPAIGNS finished, not of calls placed',
+     has(bar, 'width:40%'));
+  ok('and says the same thing in numbers, for anyone who cannot read a bar',
+     has(bar, '2 of 5 campaigns'));
+  ok('the campaign being dialled right now is named, so a slow one is not a hang',
+     has(bar, 'Dialling Renewal Hindi 3'));
+  ok('a campaign that failed is flagged on its own row while the rest carry on',
+     has(bar, 'lucide-triangle-alert') && has(bar, 'color:var(--bad)') &&
+     has(bar, 'Renewal Hindi 2'));
+  ok('one that is still going reads as going, not as done',
+     has(bar, 'lucide-loader-circle spin'));
+  ok('and a day with no failures shows no failure at all',
+     !has(renderToStaticMarkup(
+       <DayProgress done={1} total={1} current={null} rows={rows.slice(0, 1)} />),
+       'lucide-triangle-alert'));
+  ok('with nothing to dial the bar is empty rather than dividing by zero',
+     has(renderToStaticMarkup(<DayProgress done={0} total={0} current={null} rows={[]} />), 'width:0%'));
+
+  // --- folding the per-campaign answers back into one result ------------------
+  const part = (over: Partial<ApproveResult>): ApproveResult => ({
+    date: DATE, kind: 'auto', wave: 'morning', dry_run: true, buckets: ['M0'],
+    approved: 1, posted: 100, failed: 0, not_dialled: 0, campaigns: [], ...over,
+  });
+  const stopped = mergeResults([], mockDay(DATE, 'auto'));
+  ok('stopping before the first campaign still leaves a result on screen, not a crash',
+     stopped.approved === 0 && stopped.posted === 0 && stopped.failed === 0 &&
+     stopped.not_dialled === 0 && stopped.campaigns.length === 0);
+  ok('and it is still this day’s result, not a blank one',
+     stopped.date === DATE && stopped.kind === 'auto');
+  const whole = mergeResults(
+    [part({ campaigns: [{ campaign_id: 1, name: 'A', status: 'approved', posted: 100 }] }),
+     part({ posted: 40, failed: 3, not_dialled: 7,
+            campaigns: [{ campaign_id: 2, name: 'B', status: 'approved', posted: 40, failed: 3 }] })],
+    mockDay(DATE, 'auto'),
+  );
+  ok('every campaign’s numbers are added, never overwritten by the last one home',
+     whole.approved === 2 && whole.posted === 140 && whole.failed === 3 && whole.not_dialled === 7);
+  ok('and every campaign keeps its own row in the result',
+     whole.campaigns.length === 2 && whole.campaigns.map((c) => c.name).join() === 'A,B');
 }
 
 // --- the dial result: what went out, and what did not -----------------------

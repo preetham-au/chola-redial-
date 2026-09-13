@@ -10,7 +10,7 @@
  *  hours left, so it is the first thing on the page — above the buckets, which
  *  follow it.
  */
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   CircleSlash,
@@ -29,6 +29,7 @@ import { api } from '../lib/api';
 import { bandRange, bucketColor, friendlyBucket, n } from '../lib/domain';
 import { navigate, useAsync, useStore } from '../lib/store';
 import { Card, Empty, Fact, Modal, TypeToConfirm } from '../components/ui';
+import { DayProgress, type ProgressRow } from '../components/DayProgress';
 import type { Agent, ApproveResult, Campaign, DayBucket, DayView } from '../lib/types';
 
 const WAVES = [
@@ -96,6 +97,55 @@ export const approveArgs = (
  *  panel never approved. */
 export const retryArgs = (args: ApproveArgs, campaign_ids: number[]): ApproveArgs =>
   [args[0], args[1], args[2], campaign_ids, args[4]];
+
+/** The day, split into one request per campaign — the queue the progress bar
+ *  walks.
+ *
+ *  One approve used to post every campaign in a single blocking request: on
+ *  12 Sep 2026 the afternoon wave sent 2,967 calls that way, one timeout from
+ *  losing the day, with nothing on screen but a spinner. Twelve requests of
+ *  ~250 is the same work, queued, and it is what makes a progress bar possible
+ *  at all.
+ *
+ *  Only `campaign_ids` varies down the queue: every entry carries the SAME
+ *  `args` the whole-day approve would have sent, so the scope is the panel's
+ *  agent, asserted once, and cannot drift campaign to campaign. `day` is read
+ *  here for its campaign LIST and never for `day.agent_id` — splitting one
+ *  request into twelve must not become twelve chances to re-derive the scope
+ *  from the server's echo.
+ *
+ *  A function rather than a loop body inside the click handler, because a click
+ *  handler is unreachable from the static check: written inline, the one
+ *  argument that decides which language goes out could be swapped for the echo
+ *  with the whole gate still green. */
+export const dialQueue = (args: ApproveArgs, day: DayView) =>
+  day.campaigns
+    .filter((c) => c.run_status === 'planned')
+    // `DayCampaign.id` IS the campaign id the approve response calls
+    // `campaign_id` — the same identity under two names, which is why the
+    // progress row is keyed on it and matches the result rows later.
+    .map((c) => ({ campaign_id: c.id, name: c.name, args: retryArgs(args, [c.id]) }));
+
+/** The ONLY thing `day.agent_id` is good for: noticing that this panel disagrees
+ *  with itself.
+ *
+ *  `args[4]` is what the panel asserts is about to be dialled; `day.agent_id` is
+ *  what the server says it actually narrowed this plan to. Two independent
+ *  witnesses of one fact, and in every legitimate state they agree. When they
+ *  disagree one of them is a lie — the operator is reading Tamil's plan under a
+ *  button that would dial the whole roster, or the reverse — and the only safe
+ *  answer to "which of these is right" is to dial nothing and say so.
+ *
+ *  Read as a CHECK, never as a source. Sourcing the scope from the echo is the
+ *  bug fixed in a770682 and a refusal cannot reintroduce it: the worst this can
+ *  do is decline a dial, which no phone ever rings for. */
+export const scopeMismatch = (args: ApproveArgs, day: DayView): string | null => {
+  const who = (id: number | null | undefined) => (id == null ? 'every agent' : `agent ${id}`);
+  return (args[4] ?? null) === day.agent_id
+    ? null
+    : `This panel is showing the plan for ${who(day.agent_id)}, but approving it would dial ` +
+      `${who(args[4])}. Nothing will be dialled until the two agree — reload the day.`;
+};
 
 /** The approve modal, wired from the panel that opens it — its agent, its plan,
  *  its ticks.
@@ -1043,6 +1093,39 @@ function Stopped({ day }: { day: DayView }) {
   );
 }
 
+/** Fold the per-campaign approves back into the one result the bar expects.
+ *
+ *  Every request covered a different campaign, so the totals are pure addition
+ *  and no campaign can appear twice. An empty list — every campaign stopped
+ *  before it started — still has to produce a valid result, or the modal has
+ *  nothing to show. */
+export function mergeResults(parts: ApproveResult[], day: DayView): ApproveResult {
+  const base: ApproveResult = {
+    date: day.date,
+    kind: day.kind,
+    wave: day.wave,
+    dry_run: day.dry_run,
+    buckets: 'all',
+    approved: 0,
+    posted: 0,
+    failed: 0,
+    not_dialled: 0,
+    campaigns: [],
+  };
+  return parts.reduce(
+    (acc, p) => ({
+      ...acc,
+      buckets: p.buckets,
+      approved: acc.approved + p.approved,
+      posted: acc.posted + p.posted,
+      failed: acc.failed + p.failed,
+      not_dialled: acc.not_dialled + p.not_dialled,
+      campaigns: [...acc.campaigns, ...p.campaigns],
+    }),
+    base,
+  );
+}
+
 /** Approving is the only thing in this console that reaches Formi. */
 export function ApproveDay({
   agent,
@@ -1072,6 +1155,9 @@ export function ApproveDay({
   // is no run row either, so a campaign the operator ticked could fail to start
   // and leave nothing at all to look at.
   const [res, setRes] = useState<ApproveResult>();
+  const [progress, setProgress] = useState<ProgressRow[]>([]);
+  const [current, setCurrent] = useState<string | null>(null);
+  const stop = useRef(false);
 
   const ready = day.buckets
     .filter((b) => shown.includes(b.bucket))
@@ -1081,14 +1167,44 @@ export function ApproveDay({
   // The one list that dials. Handed to the result below as-is, so the Retry
   // re-sends this exact scope rather than a second copy of it.
   const args = approveArgs(agent, day, buckets);
+  // The panel's two witnesses of its own scope, compared. Non-null means they
+  // disagree, and nothing is offered until they stop.
+  const mismatch = scopeMismatch(args, day);
+  // One request per campaign, all sharing `args`. Read twice — to dial, and for
+  // the progress bar's denominator — so both count the same campaigns.
+  const queue = dialQueue(args, day);
 
+  /** One campaign per request, in order, waiting for each. */
   const submit = async () => {
+    if (mismatch) return; // a panel that disagrees with itself dials nothing
     setBusy(true);
+    stop.current = false;
+    const merged: ApproveResult[] = [];
     try {
-      setRes(await api.approveDay(...args));
-    } catch (e) {
-      toast('bad', (e as Error).message);
+      for (const c of queue) {
+        if (stop.current) break;
+        setCurrent(c.name);
+        setProgress((p) => [...p, { campaign_id: c.campaign_id, name: c.name, state: 'running' }]);
+        try {
+          const out = await api.approveDay(...c.args);
+          merged.push(out);
+          const ok = out.campaigns.every((r) => r.status === 'approved' && !r.failed);
+          setProgress((p) =>
+            p.map((r) =>
+              r.campaign_id === c.campaign_id ? { ...r, state: ok ? 'done' : 'failed' } : r,
+            ),
+          );
+        } catch (e) {
+          // One campaign failing must not end the day for the rest.
+          toast('bad', `${c.name}: ${(e as Error).message}`);
+          setProgress((p) =>
+            p.map((r) => (r.campaign_id === c.campaign_id ? { ...r, state: 'failed' } : r)),
+          );
+        }
+      }
+      setRes(mergeResults(merged, day));
     } finally {
+      setCurrent(null);
       setBusy(false);
     }
   };
@@ -1116,10 +1232,14 @@ export function ApproveDay({
       onClose={onClose}
       footer={
         <>
-          <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+          {/* Stopping leaves the campaigns it never reached `planned` — they stay
+              on the screen and stay approvable. Closing the tab does the same. */}
+          <button className="btn btn-ghost" onClick={() => (busy ? (stop.current = true) : onClose())}>
+            {busy ? 'Stop after this campaign' : 'Cancel'}
+          </button>
           <button
             className={live ? 'btn btn-live' : 'btn btn-primary'}
-            disabled={!ok || busy || shown.length === 0}
+            disabled={!ok || busy || shown.length === 0 || mismatch !== null}
             onClick={submit}
           >
             {busy ? <Loader2 className="spin" /> : live ? <Radio /> : <FlaskConical />}
@@ -1128,6 +1248,24 @@ export function ApproveDay({
         </>
       }
     >
+      {mismatch && (
+        <div className="warnbox">
+          <AlertTriangle />
+          <span>
+            <b>This plan and this button disagree about who gets called.</b> {mismatch}
+          </span>
+        </div>
+      )}
+
+      {busy && (
+        <DayProgress
+          done={progress.filter((r) => r.state !== 'running').length}
+          total={queue.length}
+          current={current}
+          rows={progress}
+        />
+      )}
+
       {live ? (
         <div className="warnbox">
           <Radio />

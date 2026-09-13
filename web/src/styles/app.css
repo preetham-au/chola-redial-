@@ -2337,8 +2337,11 @@ button.bd-colhead:hover b {
   min-width: 2px; /* a single failure still has to be visible */
 }
 
+/* The progress bar reuses the result bar's track. While it is still moving the
+   filled part is animated so a long campaign does not read as a hang. */
 .dialbar-seg.is-scheduled {
   background: var(--ok);
+  transition: width 0.3s ease;
 }
 
 .dialbar-seg.is-not {
