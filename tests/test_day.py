@@ -1557,6 +1557,53 @@ def test_approving_replans_from_the_current_minute_not_the_plan_on_file(client, 
         _drop_run(run_id)
 
 
+def test_a_day_approve_reports_the_slots_it_refused_for_leaving_the_band(client, pin_clock,
+                                                                        monkeypatch):
+    """`_commit` counts out-of-band slots; the day-level approve has to pass that on.
+
+    The per-run endpoints return `_commit`'s result whole, so `/approve`,
+    `/resume` and `/retry` have always carried `out_of_band` to the browser. The
+    day-level approve builds its own per-campaign dict and left the field out, so
+    a skipped stray survived only inside `dropped` -- a number that also holds
+    slots retired for being in the past. Two different things to do about them,
+    and the operator was told neither.
+
+    The stray is forced through `kind_for` rather than by hand-editing a slot:
+    `_approve_one` RE-PLANS before it commits, so a time written into
+    `plan_items` first is deleted with the run it belonged to. Declaring the
+    first slot of the fresh plan to belong to the other wave puts `_commit` in
+    exactly the state it guards -- a run named "morning" holding a call the
+    boundary says is the afternoon's.
+    """
+    monkeypatch.setitem(day_module.WAVE_BAND, "auto", (None, parse_hhmm("13:30")))
+    today = pin_clock(9).date().isoformat()
+    campaign_id = _arm_replannable(today, "auto")
+    # `_approve_one` approves a PLANNED run and re-plans it; with nothing on file
+    # it answers `not_prepared` and never reaches `_commit`.
+    _seed_run(campaign_id, today, "auto", "planned", 3)
+
+    seen = {"n": 0}
+
+    def the_first_slot_belongs_to_the_afternoon(minute: int) -> str:
+        seen["n"] += 1
+        return "auto_pm" if seen["n"] == 1 else "auto"
+
+    monkeypatch.setattr(day_module, "kind_for", the_first_slot_belongs_to_the_afternoon)
+    body = client.post("/api/day/approve",
+                       json={"date": today, "campaign_ids": [campaign_id]}).json()
+
+    one = next(c for c in body["campaigns"] if c["campaign_id"] == campaign_id)
+    if one["status"] != "approved":
+        # Every remaining slot out of band is a 409 by design. A one-slot plan
+        # has none to spare, and that is a different test.
+        pytest.skip(f"the fresh plan held too few slots to spare one: {one}")
+    try:
+        assert one["out_of_band"] == 1, \
+            "a slot refused for leaving its band has to reach the operator, not hide in `dropped`"
+    finally:
+        _drop_run(one["run_id"])
+
+
 # ---------------------------------------------------------------------------
 # "Approved" has to mean somebody approved it
 # ---------------------------------------------------------------------------

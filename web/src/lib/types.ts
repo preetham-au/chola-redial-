@@ -354,6 +354,15 @@ export interface ApproveResult {
     /** Present whenever a run exists to act on — which is every outcome except
      *  `not_prepared`, where there is nothing to retry. */
     run_id?: number;
+    /** Slots the dial path refused for having drifted outside this wave's band —
+     *  leads that were NOT called. They are inside `not_dialled` already, but
+     *  only as part of a number that also holds slots retired for being in the
+     *  past, and the two want different things done about them.
+     *
+     *  Optional because it is newer than this field list: a bundle that ships
+     *  ahead of the API sees nothing here. Absent is not zero — read it through
+     *  `outOfBand`, which says which of the two it is. */
+    out_of_band?: number;
   }>;
 }
 

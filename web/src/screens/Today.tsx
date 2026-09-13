@@ -312,6 +312,22 @@ export function alreadyBooked(campaigns: { already_booked?: number }[]) {
   };
 }
 
+/** Calls the dial path refused for having left this wave's band — leads that
+ *  were not called, and will not be until the day is re-planned.
+ *
+ *  Only campaigns that reached `_commit` can have strays, so only `approved`
+ *  rows are asked; a campaign that never started has nothing to be outside the
+ *  band. `known` is `alreadyBooked`'s lesson applied to a field one deploy
+ *  younger than this client: a server that does not send it must not read as a
+ *  server reporting none. */
+export function outOfBand(campaigns: { status: string; out_of_band?: number }[]) {
+  const dialled = campaigns.filter((c) => c.status === 'approved');
+  return {
+    count: dialled.reduce((s, c) => s + (c.out_of_band ?? 0), 0),
+    known: dialled.every((c) => typeof c.out_of_band === 'number'),
+  };
+}
+
 /** When these campaigns were last dialled — as a range when they disagree.
  *
  *  A panel holds many campaigns and one line to say this in, so the line is a
@@ -1932,7 +1948,13 @@ export function DialResult({
   const total = res.posted + notScheduled;
   const pct = (x: number) => (total ? `${(x / total) * 100}%` : '0%');
 
-  const problems = res.campaigns.filter((c) => c.status !== 'approved' || (c.failed ?? 0) > 0);
+  // A campaign that dialled most of its wave and had slots refused for leaving
+  // the band did not finish cleanly: those leads were not called and will not be
+  // until the day is re-planned. Listing it here is also what keeps it out of
+  // "Every selected lead is on the clock" below.
+  const band = outOfBand(res.campaigns);
+  const problems = res.campaigns.filter(
+    (c) => c.status !== 'approved' || (c.failed ?? 0) > 0 || (c.out_of_band ?? 0) > 0);
   const clean = res.campaigns.length - problems.length;
   // `already_committed` DID dial, on an earlier approve, and approving it again
   // is a deliberate no-op — re-running it would say the same thing twice. Its
@@ -2027,19 +2049,47 @@ export function DialResult({
         {res.not_dialled > 0 && (
           <>{n(res.not_dialled)} did not fit before the window shut — back in the next plan</>
         )}
+        {band.count > 0 && (
+          <>
+            {' · '}
+            <b style={{ color: 'var(--warn)' }}>
+              {n(band.count)} left the {res.wave} band and {band.count === 1 ? 'was' : 'were'} not
+              dialled
+            </b>
+          </>
+        )}
         {/* Earned, not assumed. A campaign that was skipped, refused or never
             started contributes nothing to `notScheduled` — the totals of a
             campaign that produced no result are all zero — so the counts alone
-            cannot tell a clean day from a day that did nothing. */}
+            cannot tell a clean day from a day that did nothing. A campaign with
+            strays is inside `problems`, so this sentence is withheld for it
+            too — no separate `band.count` term, which could only ever repeat
+            what `problems` already said. */}
         {notScheduled === 0 && problems.length === 0 && !short
           && 'Every selected lead is on the clock.'}
         {res.dry_run && ' Nothing reached Formi: the server is in dry run.'}
       </p>
 
+      {/* `out_of_band` is younger than this bundle's field list. A server that
+          does not send it is not a server reporting none — and the strays are
+          already inside `not_dialled`, wearing the one explanation this screen
+          has for that number. Saying so is cheaper than a wrong reason. */}
+      {!band.known && res.not_dialled > 0 && (
+        <div className="warnbox">
+          <AlertTriangle />
+          <span>
+            This server does not report calls refused for leaving the wave’s band, so some of
+            those {n(res.not_dialled)} may have been dropped for that rather than for the window
+            shutting. Re-planning the day puts them back on the clock either way.
+          </span>
+        </div>
+      )}
+
       {problems.length > 0 && (
         <div className="grid" style={{ gap: 0, marginTop: 4 }}>
           {problems.map((c) => {
             const refused = c.failed ?? 0;
+            const strays = c.out_of_band ?? 0;
             return (
               <div className="dialrow" key={c.campaign_id}>
                 <AlertTriangle
@@ -2048,9 +2098,14 @@ export function DialResult({
                 />
                 <b className="trunc">{c.name}</b>
                 <span className="dialrow-why">
-                  {refused > 0
-                    ? `${n(refused)} refused by Formi`
-                    : c.detail || WHY[c.status] || c.status}
+                  {refused > 0 && `${n(refused)} refused by Formi`}
+                  {refused > 0 && strays > 0 && ' · '}
+                  {/* A stray is not a retry: Formi never saw it. The lead comes
+                      back by re-planning the day, not by sending it again. */}
+                  {strays > 0
+                    && `${n(strays)} ${strays === 1 ? 'call' : 'calls'} outside the band — `
+                       + 're-plan the day to put them back on the clock'}
+                  {refused === 0 && strays === 0 && (c.detail || WHY[c.status] || c.status)}
                 </span>
                 {refused > 0 && c.run_id != null && (
                   <button

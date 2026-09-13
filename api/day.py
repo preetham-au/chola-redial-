@@ -942,5 +942,12 @@ def _approve_one(conn: sqlite3.Connection, campaign: sqlite3.Row, day: date, kin
     return {**out, "status": "approved", "run_id": result["id"],
             "posted": posted, "failed": failed,
             "dropped": result["counts"]["dropped"], "expired": result["expired"],
+            # Slots `_commit` refused for having drifted outside this wave's
+            # band. They are inside `dropped` already, but only as part of a
+            # number that also holds slots retired for being in the past -- two
+            # different things to do about them, and the operator was told
+            # neither. The per-run endpoints have always passed this through;
+            # a day-level approve dropped it on the floor.
+            "out_of_band": result["out_of_band"],
             "simulated": result["simulated"], "run": _run_json(
                 conn.execute("SELECT * FROM runs WHERE id=?", (result["id"],)).fetchone())}

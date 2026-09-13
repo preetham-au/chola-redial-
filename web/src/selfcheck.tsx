@@ -26,6 +26,7 @@ import {
   closesAt,
   dialQueue,
   mergeResults,
+  outOfBand,
   outsideBand,
   panelDay,
   panelPrepare,
@@ -909,6 +910,60 @@ ok(
   // Re-approving it would be a no-op -- `_approve_one` answers already_committed
   // -- and would read as an offer to dial the other 288 a second time.
   ok('but is not offered as a whole-campaign re-run', !has(refused, 'Retry 1 campaign'));
+
+  // --- slots the dial path refused for leaving the wave's band ----------------
+  //
+  // `_commit` skips a slot that has drifted outside its wave's hours and dials
+  // the rest. Those leads were NOT called. The count reached the browser from
+  // the per-run endpoints but not from the day-level approve, where it survived
+  // only inside `not_dialled` — wearing that number's one explanation, "did not
+  // fit before the window shut", which is a different fault with a different fix.
+  const rows: ApproveResult['campaigns'] = [
+    // `run_id` present, as an approved run always has one: there IS a run to
+    // retry, and the row must still not offer it.
+    { campaign_id: 1, name: 'Strayed campaign', status: 'approved', posted: 300, failed: 0,
+      run_id: 7, out_of_band: 4 },
+    { campaign_id: 2, name: 'Clean campaign', status: 'approved', posted: 90, failed: 0,
+      out_of_band: 0 },
+  ];
+  ok('the strays of every campaign that dialled are added up',
+     outOfBand(rows).count === 4 && outOfBand(rows).known);
+  // A campaign that never reached `_commit` has no slots to be outside anything,
+  // so its silence is not the server's silence.
+  const alsoNeverStarted: ApproveResult['campaigns'] = [
+    { campaign_id: 3, name: 'Never started', status: 'window_closed' }, ...rows];
+  ok('and a campaign that never started is not mistaken for a server that did not say',
+     outOfBand(alsoNeverStarted).known);
+  // alreadyBooked's lesson, on a field one deploy younger than this bundle: the
+  // default fixture above is exactly what an API without it sends.
+  ok('but a server that sends no count at all is reported as unknown, not as none',
+     outOfBand(result().campaigns).known === false);
+
+  const strayed = dialres({ posted: 390, not_dialled: 4, campaigns: rows });
+  ok('a wave that left leads outside its band says so in its own words, not as "did not fit"',
+     has(strayed, '4 left the Morning band and were not dialled'));
+  // Listed as a problem — which is also what withholds the green sentence, so
+  // this check reddens if the campaign stops counting as one.
+  ok('and never reads as a day where every selected lead is on the clock',
+     has(clean, 'Every selected lead is on the clock')
+     && !has(strayed, 'Every selected lead is on the clock'));
+  ok('and names the campaign, and what actually puts those leads back',
+     has(strayed, 'Strayed campaign') && has(strayed, '4 calls outside the band')
+     && has(strayed, 're-plan the day'));
+  // Formi never saw these, so there is nothing to send again — the lead comes
+  // back by re-planning, and an offer to retry would dial nothing.
+  ok('and offers no retry for calls that were never posted', !has(strayed, 'Retry'));
+  // The other half of not-knowing: an older API sends no field, the strays are
+  // inside `not_dialled` anyway, and the screen would otherwise blame the
+  // window for them.
+  const older = dialres({
+    posted: 300, not_dialled: 4,
+    campaigns: [{ campaign_id: 1, name: 'Old server', status: 'approved', posted: 300 }],
+  });
+  ok('a server too old to report strays is said to be too old, not taken as reporting none',
+     has(older, 'does not report calls refused for leaving'));
+  ok('and a server that does report them adds no such hedge',
+     !has(strayed, 'does not report calls refused for leaving'));
 
   // --- Stop leaves campaigns behind, and has to say so ------------------------
   //
