@@ -120,7 +120,9 @@ export interface Run {
   id: number;
   campaign_id: number;
   run_date: string;
-  kind: 'auto' | 'manual';
+  /** `auto` is the morning pass, `auto_pm` the afternoon one (`make_plan` in
+   *  `api/routes_core.py` writes both); `manual` is an operator-built run. */
+  kind: 'auto' | 'auto_pm' | 'manual';
   status: RunStatus;
   config_version: number;
   created_at: string;

@@ -921,6 +921,17 @@ ok(
   ok('and can be re-run, since it never dialled',
      has(shut, 'Retry 1 campaign'));
 
+  // `_approve_one` answers `not_dialled` for an HTTPException it caught. It
+  // sends a `detail` with it, and that wins above — but the fallback under it
+  // is what the operator reads if a deploy ever stops sending one, and a raw
+  // status token is not a sentence anybody can act on.
+  const caught = dialres({
+    approved: 0, posted: 0,
+    campaigns: [{ campaign_id: 1, name: 'Refused campaign', status: 'not_dialled' }],
+  });
+  ok('a campaign refused with no reason attached still says so in words',
+     has(caught, 'Refused campaign') && has(caught, 'refused before any call went out'));
+
   const refused = dialres({
     failed: 12,
     campaigns: [{
@@ -1053,6 +1064,27 @@ ok(
      has(html, 'Backlog campaign · 2026-08-20 morning (544)'));
   ok('a day with nothing stranded still shows no warning at all',
      renderToStaticMarkup(<Stranded day={base} />) === '');
+
+  // `_stranded` carries no kind filter, so a `manual` run lands in this banner
+  // beside the two waves. Naming everything that is not `auto` "afternoon" sent
+  // an operator to the afternoon plan for a run that was never in a wave.
+  const mixed = renderToStaticMarkup(
+    <Stranded
+      day={{
+        ...base,
+        stranded_leads: 3,
+        stranded: [
+          { campaign_id: 1, name: 'AM', run_date: '2026-09-01', kind: 'auto', slots: 1 },
+          { campaign_id: 2, name: 'PM', run_date: '2026-09-01', kind: 'auto_pm', slots: 1 },
+          { campaign_id: 3, name: 'Hand', run_date: '2026-09-01', kind: 'manual', slots: 1 },
+        ],
+      }}
+    />,
+  );
+  ok('each stranded run is named by the wave it was actually built for',
+     has(mixed, 'AM · 2026-09-01 morning (1)') && has(mixed, 'PM · 2026-09-01 afternoon (1)'));
+  ok('and a hand-built run is not reported as an afternoon one',
+     has(mixed, 'Hand · 2026-09-01 manual (1)'));
 }
 
 // --- the call log: proof, not paperwork -------------------------------------

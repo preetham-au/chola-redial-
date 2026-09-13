@@ -286,7 +286,8 @@ def dispatch(
     load: dict[int, int] = {}
     result = DispatchResult(slots=[])
     for index, (lead, dec) in enumerate(ordered):
-        minute = _free_minute(desired[index] or start, load, dcfg, start)
+        want = desired[index]
+        minute = _free_minute(start if want is None else want, load, dcfg, start)
         if minute is None:
             result.unplaceable += 1
             continue

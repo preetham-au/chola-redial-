@@ -39,6 +39,13 @@ const WAVES = [
   { kind: 'auto_pm', label: 'Afternoon' },
 ];
 
+/** The wave a run belongs to, in the words the rest of the screen uses. Runs
+ *  reach this from lists that carry no kind filter (`_stranded`), so `manual`
+ *  arrives here too: it is neither wave, and calling it "afternoon" misreports
+ *  the one banner that reports abandoned plans. */
+export const waveLabel = (kind: string) =>
+  WAVES.find((w) => w.kind === kind)?.label.toLowerCase() ?? kind;
+
 /** What goes on the wire. The backend reads an empty list as "every bucket", so
  *  a partial tick MUST be sent verbatim — sending [] after unticking one bucket
  *  would dial the ones the operator just excluded. */
@@ -1432,7 +1439,7 @@ export function Stranded({ day }: { day: DayView }) {
         </b>{' '}
         {day.stranded
           .slice(0, 4)
-          .map((r) => `${r.name} · ${r.run_date} ${r.kind === 'auto' ? 'morning' : 'afternoon'} (${n(r.slots)})`)
+          .map((r) => `${r.name} · ${r.run_date} ${waveLabel(r.kind)} (${n(r.slots)})`)
           .join(', ')}
         {day.stranded.length > 4 && ` and ${day.stranded.length - 4} more`}. Those leads return
         in a later plan; they were not called on the day they were planned for.
@@ -2013,6 +2020,7 @@ const WHY: Record<string, string> = {
   already_committed: 'already dialled earlier today',
   already_paused: 'the run is paused — resume it to send the rest',
   nothing_to_dial: 'nothing left that fits before the window shuts',
+  not_dialled: 'the plan was refused before any call went out — nothing was dialled',
   no_result: 'it was no longer in the daily plan when the day was approved — nothing was dialled',
 };
 
