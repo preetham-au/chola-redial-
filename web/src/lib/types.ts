@@ -275,10 +275,20 @@ export interface PrepareResult {
   prepared: number;
   campaigns: Array<{
     campaign_id: number;
+    /** Absent on every failure row. `_prepare_one` builds its answer off `out`,
+     *  which holds `campaign_id` alone, and assigns `out["name"]` only AFTER the
+     *  resync block — so a `resync_failed` row has never carried one. Name a
+     *  campaign through the day view's own `campaigns`, not through this. */
     name?: string;
-    /** `prepared` | `not_in_daily_plan` | `finished` | `resync_failed`. The last
-     *  one is the only failure: the warehouse could not be read, so the campaign
-     *  was left OUT of this plan rather than planned off a stale copy. */
+    /** Every value `api/day.py`'s `_prepare_one` can return, all seven of them:
+     *  `prepared` | `not_in_daily_plan` | `finished` | `window_closed` |
+     *  `already_ran` | `resync_failed` | `error`.
+     *
+     *  TWO of them are failures, not one. `resync_failed` is the warehouse read
+     *  failing before planning; `error` is `_write_run` raising during it. Either
+     *  way nothing was written and the campaign is in NO plan at all — the silent
+     *  failure the re-check exists to report. The other five are ordinary
+     *  answers: nothing was planned and nothing is wrong. */
     status: string;
     detail?: string;
     ready?: number;

@@ -1170,48 +1170,55 @@ def test_already_booked_counts_leads_formi_had_already_queued(client):
 
 
 def test_last_dialled_is_the_most_recent_day_that_posted(client):
-    # A campaign with NO run history, not `_arm()`'s first-per-agent pick.
-    # `last_dialled` is a MAX over a campaign's WHOLE history and the `client`
-    # fixture is session-scoped (tests/conftest.py:21), so one database serves
-    # every file: by the time this one runs, tests/test_autopilot.py has already
-    # committed a real run for TODAY against campaigns 1-11. Those rows are not
-    # tagged 'seeded', so `clean_runs` rightly leaves them alone -- and today
-    # beats every date seeded below, which would answer this test with somebody
-    # else's approve.
+    # This test needs a campaign with NO run history. `last_dialled` is a MAX over
+    # a campaign's WHOLE history and the `client` fixture is session-scoped
+    # (tests/conftest.py:21), so one database serves every file: by the time this
+    # one runs, tests/test_autopilot.py has already committed a real run for TODAY
+    # against campaigns 1-11. Those rows are not tagged 'seeded', so `clean_runs`
+    # rightly leaves them alone -- and today beats every date seeded below, which
+    # would answer this test with somebody else's approve.
+    #
+    # So it seeds its own rather than hunting the shared corpus for a free one.
+    # Hunting worked until it didn't: 3 of 17 campaigns were still free, and the
+    # next test to seed a run against the last of them would have retired this
+    # assertion. api/schema.sql:19-52 gives every column but these three a
+    # default, so one INSERT is the whole fixture -- and the DELETE is required,
+    # because `restore_campaigns` restores flags and never removes rows.
+    campaign_id = 90001
     with session() as conn:
-        free = conn.execute(
-            "SELECT id FROM campaigns WHERE id NOT IN "
-            "(SELECT campaign_id FROM runs) ORDER BY id LIMIT 1").fetchone()
-        if free is None:
-            # fail, not skip. This precondition can only ever VANISH as the suite
-            # grows -- one new test seeding a run against the last free campaign
-            # silently retires this one while the suite still reads green, and
-            # the only trace is the skip count going 1 -> 2. Red says out loud
-            # that the shared database ran out of free campaigns and this
-            # assertion stopped running.
-            pytest.fail("every campaign already carries a run; seed a fresh campaign "
-                        "here rather than letting this test quietly stop running")
-        campaign_id = int(free["id"])
-        conn.execute("UPDATE campaigns SET autopilot=1, enabled=1, paused=0, hidden=0 "
-                     "WHERE id=?", (campaign_id,))
+        conn.execute("INSERT INTO campaigns (id, agent_id, warehouse_id, name, autopilot) "
+                     "VALUES (?, 125, 99001, 'last-dialled fixture', 1)", (campaign_id,))
         conn.commit()
     today = now_ist().date()
     older = (today - timedelta(days=4)).isoformat()
     newer = (today - timedelta(days=2)).isoformat()
-    with session() as conn:
-        for run_date, posted in ((older, 5), (newer, 9),
-                                 ((today - timedelta(days=1)).isoformat(), 0)):
-            conn.execute(
-                "INSERT INTO runs (campaign_id, run_date, kind, status, config_version, "
-                "created_at, dry_run, evaluated, planned, slots, posted, failed, dropped, note) "
-                "VALUES (?,?,'auto','committed',1,?,1,0,0,0,?,0,0,'seeded')",
-                (campaign_id, run_date, f"{run_date}T09:00:00", posted))
-        conn.commit()
+    try:
+        with session() as conn:
+            for run_date, posted in ((older, 5), (newer, 9),
+                                     ((today - timedelta(days=1)).isoformat(), 0)):
+                conn.execute(
+                    "INSERT INTO runs (campaign_id, run_date, kind, status, config_version, "
+                    "created_at, dry_run, evaluated, planned, slots, posted, failed, dropped, "
+                    "note) VALUES (?,?,'auto','committed',1,?,1,0,0,0,?,0,0,'seeded')",
+                    (campaign_id, run_date, f"{run_date}T09:00:00", posted))
+            conn.commit()
 
-    body = client.get("/api/day").json()
-    # `_campaign_json` names it `id`; `campaign_id` is what the APPROVE response
-    # calls the same identity.
-    row = next(c for c in body["campaigns"] if c["id"] == campaign_id)
+        body = client.get("/api/day").json()
+        # `_campaign_json` names it `id`; `campaign_id` is what the APPROVE
+        # response calls the same identity.
+        row = next(c for c in body["campaigns"] if c["id"] == campaign_id)
 
-    assert row["last_dialled"] == newer, \
-        "a run that posted nothing did not dial, however recent it is"
+        assert row["last_dialled"] == newer, \
+            "a run that posted nothing did not dial, however recent it is"
+    finally:
+        # Every table that REFERENCES campaigns(id) first (api/schema.sql), or the
+        # FK refuses: `clean_runs` only sweeps at teardown so the runs are still
+        # here, and reading the day view wrote this campaign a default `config`
+        # row. Three deletes because the schema has three referrers -- adding a
+        # fourth would fail here loudly rather than leak a row.
+        with session() as conn:
+            conn.execute("DELETE FROM runs WHERE campaign_id=?", (campaign_id,))
+            conn.execute("DELETE FROM config WHERE campaign_id=?", (campaign_id,))
+            conn.execute("DELETE FROM leads WHERE campaign_id=?", (campaign_id,))
+            conn.execute("DELETE FROM campaigns WHERE id=?", (campaign_id,))
+            conn.commit()

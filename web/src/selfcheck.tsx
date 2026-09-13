@@ -1028,18 +1028,53 @@ ok(
     date: '2026-09-13', kind: 'auto', wave: 'Morning', ready: 2, prepared: 2,
     campaigns: [], ...over,
   });
+  // The failure rows carry NO `name`, because the server never sends one:
+  // `_prepare_one` builds `resync_failed` off `out`, which holds `campaign_id`
+  // alone, and assigns `out["name"]` only AFTER the resync block. Seeding a name
+  // here pinned a branch production cannot reach — where production always
+  // rendered `#12`, this check watched a name it had invented itself.
+  const failed = (campaign_id: number, status: string) => ({ campaign_id, status });
+  const say = (over: Partial<PrepareResult>) => recheckMessage(prep(over), rd)[1];
+  const tone = (over: Partial<PrepareResult>) => recheckMessage(prep(over), rd)[0];
+
+  // The WHOLE sentence, not the name inside it. `has(…, paused.name)` alone went
+  // red only because tsc calls an unreferenced local unused — that proves the
+  // name is interpolated somewhere, not that the sentence still reports what
+  // happened. Reworded while still interpolating, it used to pass.
   ok('the re-check names the campaign Formi had paused since the plan was built, '
      + 'rather than only letting the ready count drop',
-     has(recheckMessage(prep({ stopped_in_formi: [paused.id] }), rd), paused.name)
-     && !has(recheckMessage(prep({}), rd), 'Stopped in Formi'));
-  ok('and names one the warehouse would not answer for, which is now in no plan at all',
-     has(recheckMessage(prep({ campaigns: [
-       { campaign_id: broken.id, name: broken.name, status: 'resync_failed' },
-       { campaign_id: paused.id, name: paused.name, status: 'prepared' },
-     ] }), rd), broken.name)
-     && !has(recheckMessage(prep({ campaigns: [
-       { campaign_id: paused.id, name: paused.name, status: 'prepared' },
-     ] }), rd), 'Could not re-read'));
+     has(say({ stopped_in_formi: [paused.id] }), `Stopped in Formi since: ${paused.name}.`)
+     && !has(say({}), 'Stopped in Formi'));
+  // BOTH failures, not just the one. `error` is `_write_run` raising, which also
+  // writes nothing and also leaves the campaign in no plan — filtering
+  // `resync_failed` alone let exactly the silent failure this button exists to
+  // end walk past it. The other five statuses are ordinary answers and name
+  // nobody.
+  ok('and names every campaign left in NO plan at all — the warehouse read that '
+     + 'failed AND the plan write that threw, neither of which will dial',
+     has(say({ campaigns: [failed(broken.id, 'resync_failed'),
+                           { campaign_id: paused.id, name: paused.name, status: 'prepared' }] }),
+         `Could not plan ${broken.name} — left out of this plan.`)
+     && has(say({ campaigns: [failed(broken.id, 'error')] }),
+            `Could not plan ${broken.name} — left out of this plan.`)
+     && !has(say({ campaigns: ['prepared', 'not_in_daily_plan', 'finished', 'window_closed',
+                               'already_ran'].map((s) => failed(broken.id, s)) }),
+             'Could not plan'));
+  // An id this panel does not hold. Both lists resolve ids through
+  // `day.campaigns`, and a `find` that cannot miss pins nothing: this used to be
+  // seeded from `rd.campaigns`, so `?? `#${id}`` -> `?? ''` and
+  // `.find(c => c.id === id)` -> `.find(() => true)` both stayed green.
+  ok('and a campaign outside this panel’s view is still named, as #id rather than dropped',
+     has(say({ stopped_in_formi: [999] }), 'Stopped in Formi since: #999.')
+     && has(say({ campaigns: [failed(999, 'resync_failed')] }),
+            'Could not plan #999 — left out of this plan.'));
+  // Tone travels with the sentence. "left out of this plan" rendered in the green
+  // success tone is the failure dressed as a success, which is the exact reading
+  // mistake the whole re-check exists to stop.
+  ok('and a re-check that names a stopped or unplanned campaign is not toasted as success',
+     tone({}) === 'ok'
+     && tone({ stopped_in_formi: [paused.id] }) === 'bad'
+     && tone({ campaigns: [failed(broken.id, 'error')] }) === 'bad');
   retryLive();
 
   // --- and the day actually goes out one campaign at a time -------------------

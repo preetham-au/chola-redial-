@@ -27,7 +27,7 @@ import {
 } from 'lucide-react';
 import { api } from '../lib/api';
 import { bandRange, bucketColor, friendlyBucket, n } from '../lib/domain';
-import { navigate, useAsync, useStore } from '../lib/store';
+import { navigate, useAsync, useStore, type Toast } from '../lib/store';
 import { Card, Empty, Fact, Modal, TypeToConfirm } from '../components/ui';
 import { DayProgress, type ProgressRow } from '../components/DayProgress';
 import type {
@@ -77,34 +77,51 @@ export const panelDay = (agent: Agent | null, date: string, kind: string) =>
 export const panelPrepare = (agent: Agent | null, date: string, kind: string, resync = false) =>
   api.prepareDay(date, kind, resync, agent?.agent_id);
 
+/** Every `_prepare_one` status that means the campaign is in NO plan at all.
+ *
+ *  `resync_failed` is the warehouse read failing, so it was left out rather than
+ *  planned off a stale copy. `error` is `_write_run` raising — nothing was
+ *  written, and the campaign is in no plan either. They arrive by different
+ *  doors and land in the same place, so both have to be said. The other five
+ *  (`prepared`, `not_in_daily_plan`, `finished`, `window_closed`, `already_ran`)
+ *  are ordinary answers, not failures. */
+const NO_PLAN = ['resync_failed', 'error'];
+
 /** What the re-check has to say for itself.
  *
  *  A ready count falling from 4 to 2 is not an explanation. The two facts that
  *  explain it are the two only a `resync` pass can learn, and both used to be
  *  dropped on the floor: `stopped_in_formi` — campaigns this pass found paused
  *  in Formi and stopped, which is the 11:00 pause still sitting in the 15:00
- *  plan the button exists to catch — and any campaign answering `resync_failed`,
- *  whose warehouse read failed, so it is now in NO plan at all rather than
- *  planned off a stale copy.
+ *  plan the button exists to catch — and any campaign left in NO plan at all
+ *  (see `NO_PLAN`), which is the silent failure this whole screen exists to end.
  *
- *  Ids are named from the panel's own `day`, which already holds every campaign
- *  on screen. `#id` for one it does not, rather than dropping it: a campaign
- *  stopped outside this panel's view is still a campaign that was stopped.
+ *  BOTH lists are ids, and both are named the same way — through the panel's own
+ *  `day`, which already holds every campaign on screen, with `#id` for one it
+ *  does not rather than dropping it. The failure rows carry no `name` of their
+ *  own: `api/day.py`'s `_prepare_one` assigns `out["name"]` only AFTER the resync
+ *  block, so a `resync_failed` row never has one and reading `c.name` off it
+ *  printed `#12` in production every single time.
+ *
+ *  Returns the toast TONE with the text. A sentence naming a campaign that was
+ *  stopped, or left out of the plan entirely, rendered in the green success tone
+ *  is the failure dressed as a success — the one thing this button exists to
+ *  stop. Tone travels with the sentence so the two cannot drift apart.
  *
  *  Pure and exported because the handler that toasts it is an async click the
  *  static renderer never reaches — written inline, the sentence naming the
  *  stopped campaigns could be deleted with the whole gate still green. */
-export const recheckMessage = (out: PrepareResult, day: DayView) => {
+export const recheckMessage = (out: PrepareResult, day: DayView): [Toast['kind'], string] => {
+  const name = (id: number) => day.campaigns.find((c) => c.id === id)?.name ?? `#${id}`;
   const said = [`Re-checked: ${n(out.ready)} still ready across ${out.prepared} campaigns.`];
-  const stopped = (out.stopped_in_formi ?? [])
-    .map((id) => day.campaigns.find((c) => c.id === id)?.name ?? `#${id}`);
+  const stopped = (out.stopped_in_formi ?? []).map(name);
   if (stopped.length > 0) said.push(`Stopped in Formi since: ${stopped.join(', ')}.`);
   const failed = out.campaigns
-    .filter((c) => c.status === 'resync_failed')
-    .map((c) => c.name ?? `#${c.campaign_id}`);
+    .filter((c) => NO_PLAN.includes(c.status))
+    .map((c) => name(c.campaign_id));
   if (failed.length > 0)
-    said.push(`Could not re-read Formi for ${failed.join(', ')} — left out of this plan.`);
-  return said.join(' ');
+    said.push(`Could not plan ${failed.join(', ')} — left out of this plan.`);
+  return [stopped.length + failed.length > 0 ? 'bad' : 'ok', said.join(' ')];
 };
 
 /** Exactly what `api.approveDay` takes, named so the approve and its Retry can
@@ -1305,7 +1322,7 @@ export function ApproveDay({
     setRechecking(true);
     try {
       const out = await panelPrepare(agent, day.date, day.kind, true);
-      toast('ok', recheckMessage(out, day));
+      toast(...recheckMessage(out, day));
       onDone();
       onClose();
     } catch (e) {
