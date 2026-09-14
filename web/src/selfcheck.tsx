@@ -26,7 +26,6 @@ import {
   closesAt,
   dialQueue,
   mergeResults,
-  outOfBand,
   outsideBand,
   panelDay,
   panelPrepare,
@@ -40,7 +39,6 @@ import {
   runQueue,
   scopeMismatch,
   stoppedShort,
-  straddlesBand,
   unbuilt,
   STALE_MIN,
   wireBuckets,
@@ -306,24 +304,24 @@ ok(
   ok('and says picking campaigns places no call',
      has(head(day({ status: 'no_campaigns' })), 'places no call'));
 
-  // A plan that was built and came back EMPTY — the afternoon wave after a
-  // morning that booked every lead reaching it. `api/day.py` answered `approved`
+  // A plan that was built and came back EMPTY — the recall pass after a first
+  // pass that booked every lead reaching it. `api/day.py` answered `approved`
   // here until 14 Sep 2026 and this screen believed it: a headline reading "0
-  // calls on the clock. This wave has been approved." over a day nobody
+  // calls on the clock. This pass has been approved." over a day nobody
   // approved and nothing was dialled for, with the call log as the only button.
   // Worse, the screen then offered neither Build nor Approve, so leads a later
   // re-sync pulled in could not be planned at all.
   const blank = head(day({ status: 'nothing_to_dial', totals: { ...base.totals, ready: 0 } }));
-  ok('a wave whose plan came back empty says nothing was approved',
+  ok('a pass whose plan came back empty says nothing was approved',
      has(blank, 'Nothing was approved') && !has(blank, 'has been approved'));
   ok('and never reads as calls on the clock', !has(blank, 'calls on the clock'));
-  // The way back. Without it the panel is a dead end until the wave rolls over.
+  // The way back. Without it the panel is a dead end until the pass rolls over.
   ok('and offers to re-read Formi and build again, rather than only a call log',
      has(blank, 'Re-check and build') && !has(blank, 'Open the call log'));
 
   // The same defect one state over: eight campaigns committed and one that never
   // built. `{committed, not_prepared}` matched no arm of the server's ladder and
-  // fell through to `approved`, so the hero read "This wave has been approved.
+  // fell through to `approved`, so the hero read "This pass has been approved.
   // 2,140 calls on the clock." over a campaign whose ~250 leads were on no clock
   // at all — and offered the call log and nothing else. The picker is not the way
   // back either: that campaign is already armed, so `autopilotDiff` returns two
@@ -336,8 +334,8 @@ ok(
   ok('one campaign left unbuilt is counted off run_status, not guessed',
      unbuilt(partlyBuilt) === 1 && unbuilt(base) === 0);
   const mixedHero = head(partlyBuilt);
-  ok('a wave holding an unbuilt campaign never says it has been approved',
-     !has(mixedHero, 'has been approved') && has(mixedHero, 'no plan for this wave'));
+  ok('a pass holding an unbuilt campaign never says it has been approved',
+     !has(mixedHero, 'has been approved') && has(mixedHero, 'no plan for this pass'));
   // The way back, and the only one: Build is on no other branch of this hero.
   ok('and offers to build the campaigns that have none',
      has(mixedHero, 'Build the missing plan') && !has(mixedHero, 'Open the call log'));
@@ -463,7 +461,7 @@ ok(
 // --- has a call already been placed for these leads? ------------------------
 //
 // The engine does skip every lead Formi has already queued — but it checks at
-// PLAN time. On 12 Sep 2026 the plans were built in the morning and approved six
+// PLAN time. On 12 Sep 2026 the plans were built at 10:00 and approved six
 // hours later, so every call booked in Formi in between was invisible to the
 // approval. `already_booked` is therefore only as good as the plan's age, which
 // makes that age arithmetic this screen has to get right.
@@ -664,7 +662,7 @@ ok(
   // `string`, so transposing them type-checks and goes out on the wire as a
   // request for the wrong day. `DATE` and `'auto'` cannot be swapped unnoticed.
   const tamilArgs = approveArgs(labelled(127, 'Tamil'), wholeDay, []);
-  ok('approving a panel dials that panel’s agent and nobody else, on the day and wave it is showing',
+  ok('approving a panel dials that panel’s agent and nobody else, on the day and pass it is showing',
      tamilArgs[4] === 127 && tamilArgs[0] === DATE && tamilArgs[1] === 'auto');
   ok('and takes it from the panel, never from the agent the response echoed back',
      approveArgs(labelled(125, 'Hindi'), wholeDay, [])[4] === 125);
@@ -677,7 +675,7 @@ ok(
   const dialled = approveArgs(labelled(125, 'Hindi'), wholeDay, ['M0']);
   ok('a retry dials the same agent the approve it is retrying dialled',
      retryArgs(dialled, [7])[4] === 125);
-  ok('with the same day, wave and buckets, narrowed only to the campaigns that never started',
+  ok('with the same day, pass and buckets, narrowed only to the campaigns that never started',
      retryArgs(dialled, [7])[0] === DATE && retryArgs(dialled, [7])[1] === 'auto' &&
      retryArgs(dialled, [7])[2].join() === 'M0' && retryArgs(dialled, [7])[3].join() === '7');
   ok('and an unscoped approve retries unscoped, exactly as before scoping',
@@ -757,7 +755,7 @@ ok(
   ok('each request names exactly one campaign, and each campaign exactly once',
      queue.every((e) => e.args[3].length === 1) &&
      new Set(queue.map((e) => e.args[3][0])).size === queue.length);
-  ok('every request carries the day, wave and buckets the operator approved',
+  ok('every request carries the day, pass and buckets the operator approved',
      queue.every((e) => e.args[0] === DATE && e.args[1] === 'auto' && e.args[2].join() === 'M0'));
   ok('and the progress bar can name each one while it is going',
      queue.every((e) => e.name.length > 0 && e.campaign_id === e.args[3][0]));
@@ -771,8 +769,8 @@ ok(
      fromEcho.length > 0 && fromEcho.every((e) => e.args[4] === 127));
   ok('and an unscoped panel still queues unscoped, exactly as before scoping',
      dialQueue(approveArgs(null, wholeDay, []), wholeDay).every((e) => e.args[4] === undefined));
-  // A campaign already dialled this morning must not be queued again by the
-  // afternoon approve — the backend would no-op it, but each no-op is a round
+  // A campaign already dialled on the first pass must not be queued again by the
+  // recall approve — the backend would no-op it, but each no-op is a round
   // trip and a row on the operator's progress list saying nothing happened.
   const committed = {
     ...wholeDay,
@@ -857,7 +855,7 @@ ok(
 
   // --- folding the per-campaign answers back into one result ------------------
   const part = (over: Partial<ApproveResult>): ApproveResult => ({
-    date: DATE, kind: 'auto', wave: 'morning', dry_run: true, buckets: ['M0'],
+    date: DATE, kind: 'auto', pass_label: 'first pass', dry_run: true, buckets: ['M0'],
     approved: 1, posted: 100, failed: 0, not_dialled: 0, campaigns: [], ...over,
   });
   const stopped = mergeResults([], mockDay(DATE, 'auto'));
@@ -887,7 +885,7 @@ ok(
 // only one of them is a fault, which is the distinction under test here.
 {
   const result = (over: Partial<ApproveResult> = {}): ApproveResult => ({
-    date: '2026-09-13', kind: 'auto', wave: 'Morning', dry_run: false, buckets: 'all',
+    date: '2026-09-13', kind: 'auto', pass_label: 'first pass', dry_run: false, buckets: 'all',
     approved: 2, posted: 300, failed: 0, not_dialled: 0,
     campaigns: [
       { campaign_id: 1, name: 'Clean campaign', status: 'approved', posted: 300, failed: 0 },
@@ -946,70 +944,6 @@ ok(
   // -- and would read as an offer to dial the other 288 a second time.
   ok('but is not offered as a whole-campaign re-run', !has(refused, 'Retry 1 campaign'));
 
-  // --- slots the dial path refused for leaving the wave's band ----------------
-  //
-  // `_commit` skips a slot that has drifted outside its wave's hours and dials
-  // the rest. Those leads were NOT called. The count reached the browser from
-  // the per-run endpoints but not from the day-level approve, where it survived
-  // only inside `not_dialled` — wearing that number's one explanation, "did not
-  // fit before the window shut", which is a different fault with a different fix.
-  const rows: ApproveResult['campaigns'] = [
-    // `run_id` present, as an approved run always has one: there IS a run to
-    // retry, and the row must still not offer it.
-    { campaign_id: 1, name: 'Strayed campaign', status: 'approved', posted: 300, failed: 0,
-      run_id: 7, out_of_band: 4 },
-    { campaign_id: 2, name: 'Clean campaign', status: 'approved', posted: 90, failed: 0,
-      out_of_band: 0 },
-  ];
-  ok('the strays of every campaign that dialled are added up',
-     outOfBand(rows).count === 4 && outOfBand(rows).known);
-  // A campaign that never reached `_commit` has no slots to be outside anything,
-  // so its silence is not the server's silence.
-  const alsoNeverStarted: ApproveResult['campaigns'] = [
-    { campaign_id: 3, name: 'Never started', status: 'window_closed' }, ...rows];
-  ok('and a campaign that never started is not mistaken for a server that did not say',
-     outOfBand(alsoNeverStarted).known);
-  // alreadyBooked's lesson, on a field one deploy younger than this bundle: the
-  // default fixture above is exactly what an API without it sends.
-  ok('but a server that sends no count at all is reported as unknown, not as none',
-     outOfBand(result().campaigns).known === false);
-
-  const strayed = dialres({ posted: 390, not_dialled: 4, campaigns: rows });
-  ok('a wave that left leads outside its band says so in its own words, not as "did not fit"',
-     has(strayed, '4 left the Morning band and were not dialled'));
-  // Listed as a problem — which is also what withholds the green sentence, so
-  // this check reddens if the campaign stops counting as one.
-  ok('and never reads as a day where every selected lead is on the clock',
-     has(clean, 'Every selected lead is on the clock')
-     && !has(strayed, 'Every selected lead is on the clock'));
-  // The advice has to be one the operator can carry out. Strays are only ever
-  // reported for a run that reached `_commit`, and `_commit` ends by setting it
-  // `committed` — which is exactly what `_write_run` refuses to re-plan (409,
-  // surfaced as `already_ran`). "Re-plan the day" sent the operator to a Build
-  // that answers nothing changed, and the leads sat there until the next wave.
-  ok('and names the campaign, and what actually puts those leads back',
-     has(strayed, 'Strayed campaign') && has(strayed, '4 calls outside the band')
-     && has(strayed, 'come back in the next wave')
-     && !has(strayed, 're-plan the day to put them back'));
-  // Formi never saw these, so there is nothing to send again — the lead comes
-  // back by re-planning, and an offer to retry would dial nothing.
-  ok('and offers no retry for calls that were never posted', !has(strayed, 'Retry'));
-  // The other half of not-knowing: an older API sends no field, the strays are
-  // inside `not_dialled` anyway, and the screen would otherwise blame the
-  // window for them.
-  const older = dialres({
-    posted: 300, not_dialled: 4,
-    campaigns: [{ campaign_id: 1, name: 'Old server', status: 'approved', posted: 300 }],
-  });
-  ok('a server too old to report strays is said to be too old, not taken as reporting none',
-     has(older, 'does not report calls refused for leaving'));
-  // Same correction on the hedge: whichever of the two it was, the wave it came
-  // from has dialled and will not take a re-plan.
-  ok('and points that day at the next wave too, not at a re-plan that would 409',
-     has(older, 'cannot be re-planned now that it has dialled'));
-  ok('and a server that does report them adds no such hedge',
-     !has(strayed, 'does not report calls refused for leaving'));
-
   // --- Stop leaves campaigns behind, and has to say so ------------------------
   //
   // Stopping breaks the queue mid-walk and the result modal then replaces the
@@ -1041,7 +975,7 @@ ok(
 
 // --- the stranded warning counts people, not slots ---------------------------
 //
-// An unapproved plan is built again for the same leads the next morning, so a
+// An unapproved plan is built again for the same leads the next day, so a
 // backlog that sat a fortnight has a run row per day it waited. Summing the
 // rows' `slots` multiplies the backlog by that wait: 544 people were reported
 // as "7,616 calls were planned and never dialled" — a number nothing else in
@@ -1062,13 +996,13 @@ ok(
   ok('and never the same backlog once per day it sat unapproved',
      !has(html, '7,616') && !has(html, '7616'));
   ok('while each run row still reports its own slots, which is true of that run',
-     has(html, 'Backlog campaign · 2026-08-20 morning (544)'));
+     has(html, 'Backlog campaign · 2026-08-20 first pass (544)'));
   ok('a day with nothing stranded still shows no warning at all',
      renderToStaticMarkup(<Stranded day={base} />) === '');
 
   // `_stranded` carries no kind filter, so a `manual` run lands in this banner
-  // beside the two waves. Naming everything that is not `auto` "afternoon" sent
-  // an operator to the afternoon plan for a run that was never in a wave.
+  // beside the two passes. Naming everything that is not `auto` "recall pass"
+  // sent an operator to the recall plan for a run that was in neither pass.
   const mixed = renderToStaticMarkup(
     <Stranded
       day={{
@@ -1082,9 +1016,10 @@ ok(
       }}
     />,
   );
-  ok('each stranded run is named by the wave it was actually built for',
-     has(mixed, 'AM · 2026-09-01 morning (1)') && has(mixed, 'PM · 2026-09-01 afternoon (1)'));
-  ok('and a hand-built run is not reported as an afternoon one',
+  ok('each stranded run is named by the pass it was actually built for',
+     has(mixed, 'AM · 2026-09-01 first pass (1)')
+     && has(mixed, 'PM · 2026-09-01 recall pass (1)'));
+  ok('and a hand-built run is not reported as a recall one',
      has(mixed, 'Hand · 2026-09-01 manual (1)'));
 }
 
@@ -1135,7 +1070,7 @@ ok(
 
 // --- autopilot pass state --------------------------------------------------
 // A pass fires once a day and is never retried, so "10:00 has gone by and it is
-// not in fired_today" is the ONLY signal that this morning's calls never went
+// not in fired_today" is the ONLY signal that the day's calls never went
 // out. The clock has to be the server's: the times are IST.
 {
   const fired = ['auto'];
@@ -1185,10 +1120,11 @@ ok(
 
 // --- where the calls landed: the band is judged by the MINUTE, not the hour --
 //
-// The whole point of the proof card is that a bar painted red accuses a wave of
-// dialling outside its half of the day. With a 13:30 boundary the 13:00 hour is
-// half in and half out of BOTH waves, so the obvious `hour < start || hour >=
-// end` is wrong twice over and wrong in the direction that cries wolf.
+// A bar painted red accuses the day of dialling outside the window it was
+// approved against. The bars are hour-sized and a window edge need not be on the
+// hour, so the obvious `hour < start || hour >= end` is wrong in the direction
+// that cries wolf: it reddens an hour that is half inside. The half-past bands
+// below are the sharp case — not a time of day this console still schedules by.
 {
   const AM: DialWindow = { start: '09:00', end: '13:30' };
   const PM: DialWindow = { start: '13:30', end: '20:00' };
@@ -1208,18 +1144,6 @@ ok(
   ok('the hours in the band are kept and only the strays are returned',
      out({ '8': 1, '9': 2, '13': 3, '20': 4 }, AM) === '8,20');
 
-  // The other side of the same arithmetic. `outsideBand` is right to let the
-  // 13:00 hour through, but letting it through SILENTLY leaves a half-hour
-  // escape hatch on the exact boundary the card polices: hour-sized buckets
-  // cannot say whether a 13:0x call belonged to the morning or the afternoon.
-  const cut = (hours: Record<string, number>, band: DialWindow) =>
-    straddlesBand({ band, hours }).map(([h]) => h).join();
-  ok('the hour a 13:30 boundary cuts in half is named as unjudgeable, under either wave',
-     cut({ '9': 1, '13': 4 }, AM) === '13' && cut({ '13': 4, '15': 2 }, PM) === '13');
-  ok('an hour the band opens or closes exactly ON is not ambiguous — nothing is split',
-     cut({ '9': 1, '20': 2 }, { start: '09:00', end: '20:00' }) === '');
-  ok('and an hour wholly outside the band is a stray, not an ambiguity — it is already judged',
-     cut({ '8': 1, '20': 2 }, AM) === '' && out({ '8': 1, '20': 2 }, AM) === '8,20');
 
   // The card itself: it is the one place an operator sees the verdict, and the
   // sentence under the bars is the only part of it that names a number.
@@ -1240,7 +1164,7 @@ ok(
   ok('a day with nothing on the clock shows no proof card at all, rather than an empty one',
      proof({ band: AM, hours: {} }) === '');
   const kept = proof({ band: AM, hours: { '9': 40, '13': 12 } });
-  ok('a wave that stayed inside its band says how many calls it put on the clock',
+  ok('a pass that stayed inside its band says how many calls it put on the clock',
      has(kept, '52 on the clock') && has(kept, 'band 09:00–13:30'));
   ok('and is not accused of landing outside it', !has(kept, 'landed outside'));
   ok('nor painted as having strayed', !has(kept, 'var(--bad)'));
@@ -1252,7 +1176,7 @@ ok(
   ok('the warehouse read-back is shown beside the hours, or the card proves half a thing',
      has(kept, 'dialbar-key') && has(kept, '<b>7</b>'));
   const strayed = proof({ band: AM, hours: { '9': 40, '19': 12, '20': 3 } });
-  ok('a wave that dialled past its band is told so, counting only the strays',
+  ok('a pass that dialled past its band is told so, counting only the strays',
      has(strayed, '15 calls landed outside the 09:00–13:30 band'));
   // Two stray bars and the sentence under them. The hour that kept the band is
   // NOT one of them — reddening the whole day would say nothing.
@@ -1264,7 +1188,7 @@ ok(
   // bars are still worth seeing — that IS the schedule — but the sentences over
   // them are the ones an operator reads as "the day went out".
   const rehearsed = proof({ band: AM, hours: { '9': 40, '13': 12 } }, { dialled: 7 }, true);
-  ok('a rehearsed wave never claims its calls are on the clock',
+  ok('a rehearsed pass never claims its calls are on the clock',
      !has(rehearsed, 'on the clock') && has(rehearsed, '52 simulated, none dialled'));
   ok('and says so in full, rather than leaving it to the eyebrow',
      has(rehearsed, 'Nothing on this card was dialled'));
@@ -1274,20 +1198,9 @@ ok(
   ok('and its heading is in the conditional too',
      has(kept, 'Where the calls landed')
      && has(rehearsed, 'Where the calls would have landed'));
-  // On screen: the card has to SAY it cannot judge the boundary hour, not just
-  // decline to redden it. Silence there reads as a pass.
-  ok('the card says outright which hour it cannot answer for, and how many calls that is',
-     has(kept, '13:00 is')
-     && has(kept, 'cut in half by the 09:00–13:30 band')
-     && has(kept, 'which of those 12 calls kept the band'));
-  ok('and the unresolved bar is neither the green of a pass nor the red of an accusation',
-     has(kept, 'var(--warn)') && !has(kept, 'var(--bad)'));
-  const clear = proof({ band: { start: '09:00', end: '20:00' }, hours: { '9': 40, '13': 12 } });
-  ok('a band that opens and closes on the hour has nothing to disclaim',
-     !has(clear, 'cut in half') && !has(clear, 'var(--warn)'));
 
   const rehearsedStray = proof({ band: AM, hours: { '9': 40, '19': 12, '20': 3 } }, {}, true);
-  ok('a rehearsed wave that strayed is told where it WOULD have strayed, not where it landed',
+  ok('a rehearsed pass that strayed is told where it WOULD have strayed, not where it landed',
      has(rehearsedStray, '15 calls were scheduled outside the 09:00–13:30 band')
      && !has(rehearsedStray, 'calls landed outside'));
 
@@ -1405,7 +1318,7 @@ ok(
   // pauses campaigns and re-pulls every campaign's leads out of Metabase, and a
   // warehouse that hiccups answers `resync_failed` — the campaign is left
   // unplanned. That is the right price for the re-check, which exists because
-  // the plan is hours old, and the wrong one for a button pressed every morning
+  // the plan is hours old, and the wrong one for a button pressed every day
   // against a copy the hourly sync already keeps fresh. Flipping the default
   // used to pass this whole gate.
   ok('and builds the plan for that same agent alone — never for both languages, '
@@ -1473,7 +1386,7 @@ ok(
   const rd = mockDay('2026-09-13', 'auto', 127);
   const [paused, broken] = rd.campaigns;
   const prep = (over: Partial<PrepareResult>): PrepareResult => ({
-    date: '2026-09-13', kind: 'auto', wave: 'Morning', ready: 2, prepared: 2,
+    date: '2026-09-13', kind: 'auto', pass_label: 'first pass', ready: 2, prepared: 2,
     campaigns: [], ...over,
   });
   // The failure rows carry NO `name`, because the server never sends one:
@@ -1526,7 +1439,7 @@ ok(
 
   // `finished` is not an ordinary answer. `_prepare_one` reaches it through
   // `_stop` — `UPDATE campaigns SET autopilot=0` — so the campaign is disarmed
-  // for good and for every later wave, and only a person re-arms it. That went
+  // for good and for every later pass, and only a person re-arms it. That went
   // out green, in a sentence naming nobody; the campaign just stopped appearing
   // in tomorrow's plan and no screen ever said why.
   const fin = { campaigns: [failed(broken.id, 'finished')], ready: 2, prepared: 1 };
@@ -1536,7 +1449,7 @@ ok(
      !has(say({}), 'Autopilot switched off'));
 
   // The whole reason the tone exists. Every campaign answering `window_closed`
-  // — the ordinary afternoon answer — leaves ready and prepared at zero with
+  // — the ordinary recall-pass answer — leaves ready and prepared at zero with
   // every list above empty, so the one reading that means NOTHING WILL DIAL was
   // the one reading that came out green: "Re-checked: 0 still ready across 0
   // campaigns", next to an Approve button that would now call nobody.
@@ -1623,7 +1536,7 @@ ok(
   (globalThis as { fetch?: unknown }).fetch = async () => ({
     ok: true, status: 200,
     json: async () => ({
-      date: '2026-09-13', kind: 'auto', wave: 'morning', dry_run: false,
+      date: '2026-09-13', kind: 'auto', pass_label: 'first pass', dry_run: false,
       buckets: 'all', approved: 0, posted: 0, failed: 0, not_dialled: 0, campaigns: [],
     }),
   });

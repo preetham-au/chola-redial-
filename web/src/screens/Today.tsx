@@ -1,7 +1,8 @@
 /** The day. One screen, one decision.
  *
- *  Nothing in this console dials on its own. A pass prepares a plan each morning
- *  and afternoon and leaves it waiting; this screen is where an operator reads
+ *  Nothing in this console dials on its own. A pass prepares a plan — the day's
+ *  first, then the recall after it — and leaves it waiting; this screen is where
+ *  an operator reads
  *  what is ready and approves it. If nobody approves, no call goes out.
  *
  *  The order is the client's, not the bucket order: the three days just PAST
@@ -34,17 +35,21 @@ import type {
   Agent, ApproveResult, Campaign, DayBucket, DayCampaign, DaySpread, DayView, PrepareResult,
 } from '../lib/types';
 
-const WAVES = [
-  { kind: 'auto', label: 'Morning' },
-  { kind: 'auto_pm', label: 'Afternoon' },
+/** The two passes a day is made of. NOT two halves of the clock: both dial the
+ *  campaign's whole window. What makes the recall pass a recall is who is in it
+ *  — only leads whose last call says nobody was reached, at least
+ *  `same_day_gap_hours` after it. Mirrors PASS_LABEL in api/day.py. */
+const PASSES = [
+  { kind: 'auto', label: 'First pass' },
+  { kind: 'auto_pm', label: 'Recall pass' },
 ];
 
-/** The wave a run belongs to, in the words the rest of the screen uses. Runs
+/** The pass a run belongs to, in the words the rest of the screen uses. Runs
  *  reach this from lists that carry no kind filter (`_stranded`), so `manual`
- *  arrives here too: it is neither wave, and calling it "afternoon" misreports
- *  the one banner that reports abandoned plans. */
-export const waveLabel = (kind: string) =>
-  WAVES.find((w) => w.kind === kind)?.label.toLowerCase() ?? kind;
+ *  arrives here too: it is neither pass, and calling it "recall pass"
+ *  misreports the one banner that reports abandoned plans. */
+export const passLabel = (kind: string) =>
+  PASSES.find((w) => w.kind === kind)?.label.toLowerCase() ?? kind;
 
 /** What goes on the wire. The backend reads an empty list as "every bucket", so
  *  a partial tick MUST be sent verbatim — sending [] after unticking one bucket
@@ -155,7 +160,7 @@ export const prepareMessage = (out: PrepareResult, day: DayView | null,
     said.push(`Could not plan ${failed.join(', ')} — left out of this plan.`);
   // `finished` is not an ordinary answer: `_prepare_one` reaches it through
   // `_stop`, which is `UPDATE campaigns SET autopilot=0`. The campaign is
-  // DISARMED, for good and for every later wave, and nothing re-arms it but a
+  // DISARMED, for good and for every later pass, and nothing re-arms it but a
   // person. That went out under the green tone, in a sentence that named
   // nobody, so the campaign simply stopped appearing in tomorrow's plan.
   const disarmed = out.campaigns
@@ -217,7 +222,7 @@ export const retryArgs = (args: ApproveArgs, campaign_ids: number[]): ApproveArg
  *  walks.
  *
  *  One approve used to post every campaign in a single blocking request: on
- *  12 Sep 2026 the afternoon wave sent 2,967 calls that way, one timeout from
+ *  12 Sep 2026 the recall pass sent 2,967 calls that way, one timeout from
  *  losing the day, with nothing on screen but a spinner. Twelve requests of
  *  ~250 is the same work, queued, and it is what makes a progress bar possible
  *  at all.
@@ -310,10 +315,10 @@ export const pickable = (c: Campaign) => c.enabled !== false && !c.hidden;
 export const closesAt = (day: DayView) =>
   day.window_varies ? 'their campaigns close' : day.window.end;
 
-/** Campaigns on this panel with no run at all for this wave.
+/** Campaigns on this panel with no run at all for this pass.
  *
  *  The whole of the `part_prepared` headline: how many campaigns were left
- *  behind while the rest of the wave was acted on. Read off `run_status`, which
+ *  behind while the rest of the pass was acted on. Read off `run_status`, which
  *  is the same field the Campaigns card badges "not built" with, so the hero and
  *  the list below it cannot disagree.
  *
@@ -343,27 +348,6 @@ export function alreadyBooked(campaigns: { already_booked?: number }[]) {
   return {
     count: campaigns.reduce((s, c) => s + (c.already_booked ?? 0), 0),
     known: campaigns.every((c) => typeof c.already_booked === 'number'),
-  };
-}
-
-/** Calls the dial path refused for having left this wave's band — leads that
- *  were not called, and will not be until this campaign is planned again.
- *
- *  Not by re-planning THIS wave: a run only reaches `_commit` on its way to
- *  `committed`, and `_write_run` refuses to rewrite a run that has been acted
- *  on (409 → `already_ran`). The lead is still unbooked in the warehouse, so
- *  it returns in the next plan that covers it — the other wave's, or tomorrow's.
- *
- *  Only campaigns that reached `_commit` can have strays, so only `approved`
- *  rows are asked; a campaign that never started has nothing to be outside the
- *  band. `known` is `alreadyBooked`'s lesson applied to a field one deploy
- *  younger than this client: a server that does not send it must not read as a
- *  server reporting none. */
-export function outOfBand(campaigns: { status: string; out_of_band?: number }[]) {
-  const dialled = campaigns.filter((c) => c.status === 'approved');
-  return {
-    count: dialled.reduce((s, c) => s + (c.out_of_band ?? 0), 0),
-    known: dialled.every((c) => typeof c.out_of_band === 'number'),
   };
 }
 
@@ -428,11 +412,10 @@ export const planAge = (campaigns: DayCampaign[], now: number) => {
 /** The hours of a spread that fall ENTIRELY outside the band it was approved
  *  against — the only ones the card is entitled to paint red.
  *
- *  An hour counts as outside only if NO minute of it falls in the band. With a
- *  13:30 boundary the 13:00 hour is half in — 13:00–13:29 belongs to the
- *  morning, 13:30–13:59 to the afternoon — so reddening that bar under either
- *  wave would accuse a call that kept its band. The far end is the other way
- *  round and exclusive: a band closing at 20:00 holds nothing at all at 20:xx.
+ *  An hour counts as outside only if NO minute of it falls in the band: a band
+ *  opening at 09:30 leaves the 09:00 bar half in, and reddening it would accuse
+ *  calls that were on time. The far end is the other way round and exclusive: a
+ *  band closing at 20:00 holds nothing at all at 20:xx.
  *
  *  A pure function rather than four lines inside the card, because this
  *  arithmetic IS the card's claim. Inlined, the `+ 59` could go, every bar would
@@ -442,28 +425,6 @@ export const outsideBand = (spread: DaySpread): [string, number][] => {
   const min = (t: string) => +t.slice(0, 2) * 60 + +t.slice(3, 5);
   const [lo, hi] = [min(spread.band.start), min(spread.band.end)];
   return Object.entries(spread.hours).filter(([h]) => +h * 60 + 59 < lo || +h * 60 >= hi);
-};
-
-/** The hours no bar can answer for: the ones a band edge cuts in half.
- *
- *  `_spread` groups by `substr(scheduled_time, 12, 2)` — whole hours — and the
- *  morning/afternoon boundary is 13:30. So every call between 13:00 and 13:59
- *  arrives in this card as one number, and which half of it kept the band is
- *  information the answer no longer contains. `outsideBand` is right to leave
- *  that hour alone: reddening it would accuse calls that were on time. But
- *  leaving it green and silent is the same lie the other way round, and it lands
- *  on exactly the thirty minutes the card exists to police.
- *
- *  So: name it. An hour the band edge passes through is drawn as unresolved and
- *  said out loud, and the operator is sent to the call log, which keeps the
- *  minute. Fixing this properly means minute-resolution buckets from
- *  `api/day.py` — out of scope here, and the wrong trade for a chart. */
-export const straddlesBand = (spread: DaySpread): [string, number][] => {
-  const min = (t: string) => +t.slice(0, 2) * 60 + +t.slice(3, 5);
-  const edges = [min(spread.band.start), min(spread.band.end)];
-  // Strictly inside: an edge ON the hour (09:00, 20:00) splits nothing.
-  return Object.entries(spread.hours)
-    .filter(([h]) => edges.some((e) => +h * 60 < e && e < +h * 60 + 60));
 };
 
 /** Which campaigns to arm and which to disarm — the only thing this screen puts
@@ -504,7 +465,8 @@ export function Today() {
       <div className="page-head">
         <div>
           <span className="eyebrow">
-            {kind === 'auto' ? 'Morning band' : 'Afternoon band'}
+            {/* The pass, not an hour. Both dial the campaign's whole window. */}
+            {PASSES.find((p) => p.kind === kind)?.label}
           </span>
           <h1>The day</h1>
         </div>
@@ -516,8 +478,8 @@ export function Today() {
             aria-label="Day"
             onChange={(e) => setDate(e.target.value)}
           />
-          <div className="seg" role="group" aria-label="Wave">
-            {WAVES.map((w) => (
+          <div className="seg" role="group" aria-label="Pass">
+            {PASSES.map((w) => (
               <button
                 key={w.kind}
                 className={`seg-btn${kind === w.kind ? ' is-active' : ''}`}
@@ -732,7 +694,7 @@ export function Headline({
     return (
       <section className="hero">
         <div className="hero-body">
-          <span className="eyebrow">{day.date} · {day.wave}</span>
+          <span className="eyebrow">{day.date} · {day.pass_label}</span>
           <h2 className="hero-h">No campaign is in the daily plan.</h2>
           <p className="hero-sub">
             Pick the campaigns to run today. Their leads are then scheduled by RED — the days to
@@ -750,8 +712,8 @@ export function Headline({
     return (
       <section className="hero">
         <div className="hero-body">
-          <span className="eyebrow">{day.date} · {day.wave} · {day.totals.campaigns} campaigns</span>
-          <h2 className="hero-h">No plan built yet for this wave.</h2>
+          <span className="eyebrow">{day.date} · {day.pass_label} · {day.totals.campaigns} campaigns</span>
+          <h2 className="hero-h">No plan built yet for this pass.</h2>
           <p className="hero-sub">
             Building a plan writes it down and dials nothing. You approve it afterwards.
           </p>
@@ -774,12 +736,12 @@ export function Headline({
     return (
       <section className="hero">
         <div className="hero-body">
-          <span className="eyebrow">{day.date} · {day.wave} · {day.totals.campaigns} campaigns</span>
+          <span className="eyebrow">{day.date} · {day.pass_label} · {day.totals.campaigns} campaigns</span>
           <h2 className="hero-h">
-            0 <span className="hero-h-dim">leads in this wave’s plan. Nothing was approved.</span>
+            0 <span className="hero-h-dim">leads in this pass’s plan. Nothing was approved.</span>
           </h2>
           <p className="hero-sub">
-            A plan was built and came back empty — every lead that reaches this wave has already
+            A plan was built and came back empty — every lead that reaches this pass has already
             been booked, or sits outside {day.window.start}–{day.window.end}. No call went out and
             none is waiting to. Building again re-reads Formi first, so leads booked or freed since
             this plan was built are counted properly.
@@ -787,7 +749,7 @@ export function Headline({
         </div>
         {/* Build, not Approve. This state used to answer `approved`, which left
             the screen offering neither — so leads a later re-sync pulled in
-            could not be planned at all without reloading into another wave. */}
+            could not be planned at all without reloading into the other pass. */}
         <button
           className="btn btn-primary btn-hero"
           disabled={busy !== ''}
@@ -804,15 +766,15 @@ export function Headline({
     return (
       <section className="hero">
         <div className="hero-body">
-          <span className="eyebrow">{day.date} · {day.wave} · {day.totals.campaigns} campaigns</span>
+          <span className="eyebrow">{day.date} · {day.pass_label} · {day.totals.campaigns} campaigns</span>
           <h2 className="hero-h">
             {n(missing)}{' '}
             <span className="hero-h-dim">
-              {missing === 1 ? 'campaign has' : 'campaigns have'} no plan for this wave.
+              {missing === 1 ? 'campaign has' : 'campaigns have'} no plan for this pass.
             </span>
           </h2>
           <p className="hero-sub">
-            The rest of the wave has been dialled — {n(day.totals.posted)} calls went on the clock.
+            The rest of the pass has been dialled — {n(day.totals.posted)} calls went on the clock.
             These have no plan at all, so nothing of theirs can be approved. Building writes one and
             dials nothing; the campaigns that already went out answer “already ran” and are left
             exactly as they are, note included.
@@ -839,7 +801,7 @@ export function Headline({
     return (
       <section className="hero">
         <div className="hero-body">
-          <span className="eyebrow">{day.date} · {day.wave}</span>
+          <span className="eyebrow">{day.date} · {day.pass_label}</span>
           <h2 className="hero-h">
             {n(day.totals.posted)} <span className="hero-h-dim">calls on the clock</span>
             {day.totals.failed > 0 && (
@@ -847,7 +809,7 @@ export function Headline({
             )}
           </h2>
           <p className="hero-sub">
-            This wave has been approved. {day.totals.dropped > 0 && (
+            This pass has been approved. {day.totals.dropped > 0 && (
               <>{n(day.totals.dropped)} did not fit before {closesAt(day)} and return in tomorrow’s
               plan. </>
             )}
@@ -865,7 +827,7 @@ export function Headline({
     <section className="hero">
       <div className="hero-body">
         <span className="eyebrow">
-          {day.date} · {day.wave} · {day.totals.campaigns} campaigns
+          {day.date} · {day.pass_label} · {day.totals.campaigns} campaigns
         </span>
         <h2 className="hero-h">
           {n(day.totals.ready)} <span className="hero-h-dim">calls ready. Nothing is dialled yet.</span>
@@ -969,7 +931,7 @@ function Buckets({
   if (day.buckets.length === 0) {
     return (
       <Card title="Which buckets to call">
-        <Empty title="No bucket has anything ready" note="Nothing in this wave’s plan to pick from." />
+        <Empty title="No bucket has anything ready" note="Nothing in this pass’s plan to pick from." />
       </Card>
     );
   }
@@ -1423,7 +1385,7 @@ function PickCampaigns({
 export function Stranded({ day }: { day: DayView }) {
   if (day.stranded.length === 0) return null;
   // NOT the sum of the rows' `slots`. An unapproved plan is built again for the
-  // same leads every morning it sits, so that sum multiplies one backlog by the
+  // same leads every day it sits, so that sum multiplies one backlog by the
   // days it waited — 544 people read as "7,616 calls never dialled", a number
   // nobody could act on and nothing else in the console agreed with. The rows
   // below still carry their own `slots`, which is true of each run.
@@ -1439,7 +1401,7 @@ export function Stranded({ day }: { day: DayView }) {
         </b>{' '}
         {day.stranded
           .slice(0, 4)
-          .map((r) => `${r.name} · ${r.run_date} ${waveLabel(r.kind)} (${n(r.slots)})`)
+          .map((r) => `${r.name} · ${r.run_date} ${passLabel(r.kind)} (${n(r.slots)})`)
           .join(', ')}
         {day.stranded.length > 4 && ` and ${day.stranded.length - 4} more`}. Those leads return
         in a later plan; they were not called on the day they were planned for.
@@ -1459,10 +1421,9 @@ export function Proof({ day, onReload }: { day: DayView; onReload: () => void })
 
   const peak = Math.max(...hours.map(([, v]) => v));
   const outside = outsideBand(day.spread);
-  const unresolved = straddlesBand(day.spread);
   // The spread counts `simulated` rows beside `posted` ones, so under DRY_RUN
   // these bars are drawn entirely from calls that never left the building. The
-  // shape is still worth showing — it is the schedule this wave WOULD have
+  // shape is still worth showing — it is the schedule this pass WOULD have
   // dialled — but every sentence over it has to stay in the conditional, and
   // the bars cannot wear the same green a live day earns.
   const live = !day.dry_run;
@@ -1496,18 +1457,14 @@ export function Proof({ day, onReload }: { day: DayView; onReload: () => void })
           <div
             key={h}
             style={{ flex: 1, textAlign: 'center' }}
-            title={unresolved.some(([u]) => u === h)
-              ? `${h}:00 — ${n(v)} calls, split by the band edge; the call log has the minute`
-              : `${h}:00 — ${n(v)} calls`}
+            title={`${h}:00 — ${n(v)} calls`}
           >
             <div
               style={{
                 height: `${(v / peak) * 48}px`,
                 background: outside.some(([o]) => o === h)
                   ? 'var(--bad)'
-                  : unresolved.some(([u]) => u === h)
-                    ? 'var(--warn)'
-                    : live ? 'var(--ok)' : 'var(--faint)',
+                  : live ? 'var(--ok)' : 'var(--faint)',
                 borderRadius: 2,
               }}
             />
@@ -1523,22 +1480,12 @@ export function Proof({ day, onReload }: { day: DayView; onReload: () => void })
         </p>
       )}
 
-      {unresolved.length > 0 && (
-        <p className="hero-sub" style={{ color: 'var(--warn)' }}>
-          {unresolved.map(([h]) => `${h}:00`).join(' and ')} {unresolved.length === 1 ? 'is' : 'are'}
-          {' '}cut in half by the {day.spread.band.start}–{day.spread.band.end} band, and these bars
-          count whole hours — so this card cannot say which of those{' '}
-          {n(unresolved.reduce((s, [, v]) => s + v, 0))} calls kept the band. The call log keeps the
-          minute.
-        </p>
-      )}
-
       {!live && (
         <div className="warnbox">
           <AlertTriangle />
           <span>
             The server is in dry run. Nothing on this card was dialled — these are the calls this
-            wave <b>would</b> have placed. The warehouse has no interaction to read back, so the
+            pass <b>would</b> have placed. The warehouse has no interaction to read back, so the
             counts below stay where they are however often you check.
           </span>
         </div>
@@ -1594,7 +1541,7 @@ function Stopped({ day }: { day: DayView }) {
 /** One campaign's share of the day: everything the merge below actually adds up.
  *
  *  Narrower than `ApproveResult` because a campaign whose request threw has no
- *  date, wave or dry-run flag of its own — and never needed one, since all four
+ *  date, pass or dry-run flag of its own — and never needed one, since all four
  *  are read off the day rather than off a part. */
 export type ResultPart =
   Pick<ApproveResult, 'buckets' | 'approved' | 'posted' | 'failed' | 'not_dialled' | 'campaigns'>;
@@ -1609,7 +1556,7 @@ export function mergeResults(parts: ResultPart[], day: DayView): ApproveResult {
   const base: ApproveResult = {
     date: day.date,
     kind: day.kind,
-    wave: day.wave,
+    pass_label: day.pass_label,
     dry_run: day.dry_run,
     buckets: 'all',
     approved: 0,
@@ -1927,7 +1874,7 @@ export function ApproveDay({
           k="Who this dials"
           v={args[4] === undefined ? 'every agent — the whole roster' : agentLabel(agent)}
         />
-        <Fact k="Day" v={`${day.date} · ${day.wave}`} />
+        <Fact k="Day" v={`${day.date} · ${day.pass_label}`} />
         <Fact k="Campaigns" v={day.totals.campaigns} />
         <Fact k="Buckets" v={buckets.length === 0 ? 'all of them' : shown.join(', ')} />
         <Fact k="Selected" v={n(ready)} />
@@ -2057,13 +2004,8 @@ export function DialResult({
   const total = res.posted + notScheduled;
   const pct = (x: number) => (total ? `${(x / total) * 100}%` : '0%');
 
-  // A campaign that dialled most of its wave and had slots refused for leaving
-  // the band did not finish cleanly: those leads were not called and will not be
-  // until the day is re-planned. Listing it here is also what keeps it out of
-  // "Every selected lead is on the clock" below.
-  const band = outOfBand(res.campaigns);
   const problems = res.campaigns.filter(
-    (c) => c.status !== 'approved' || (c.failed ?? 0) > 0 || (c.out_of_band ?? 0) > 0);
+    (c) => c.status !== 'approved' || (c.failed ?? 0) > 0);
   const clean = res.campaigns.length - problems.length;
   // `already_committed` DID dial, on an earlier approve, and approving it again
   // is a deliberate no-op — re-running it would say the same thing twice. Its
@@ -2158,48 +2100,19 @@ export function DialResult({
         {res.not_dialled > 0 && (
           <>{n(res.not_dialled)} did not fit before the window shut — back in the next plan</>
         )}
-        {band.count > 0 && (
-          <>
-            {' · '}
-            <b style={{ color: 'var(--warn)' }}>
-              {n(band.count)} left the {res.wave} band and {band.count === 1 ? 'was' : 'were'} not
-              dialled
-            </b>
-          </>
-        )}
         {/* Earned, not assumed. A campaign that was skipped, refused or never
             started contributes nothing to `notScheduled` — the totals of a
             campaign that produced no result are all zero — so the counts alone
-            cannot tell a clean day from a day that did nothing. A campaign with
-            strays is inside `problems`, so this sentence is withheld for it
-            too — no separate `band.count` term, which could only ever repeat
-            what `problems` already said. */}
+            cannot tell a clean day from a day that did nothing. */}
         {notScheduled === 0 && problems.length === 0 && !short
           && 'Every selected lead is on the clock.'}
         {res.dry_run && ' Nothing reached Formi: the server is in dry run.'}
       </p>
 
-      {/* `out_of_band` is younger than this bundle's field list. A server that
-          does not send it is not a server reporting none — and the strays are
-          already inside `not_dialled`, wearing the one explanation this screen
-          has for that number. Saying so is cheaper than a wrong reason. */}
-      {!band.known && res.not_dialled > 0 && (
-        <div className="warnbox">
-          <AlertTriangle />
-          <span>
-            This server does not report calls refused for leaving the wave’s band, so some of
-            those {n(res.not_dialled)} may have been dropped for that rather than for the window
-            shutting. Either way they were not called and this wave cannot be re-planned now that
-            it has dialled — they come back in the next wave’s plan.
-          </span>
-        </div>
-      )}
-
       {problems.length > 0 && (
         <div className="grid" style={{ gap: 0, marginTop: 4 }}>
           {problems.map((c) => {
             const refused = c.failed ?? 0;
-            const strays = c.out_of_band ?? 0;
             return (
               <div className="dialrow" key={c.campaign_id}>
                 <AlertTriangle
@@ -2209,14 +2122,7 @@ export function DialResult({
                 <b className="trunc">{c.name}</b>
                 <span className="dialrow-why">
                   {refused > 0 && `${n(refused)} refused by Formi`}
-                  {refused > 0 && strays > 0 && ' · '}
-                  {/* A stray is not a retry: Formi never saw it. The lead comes
-                      back by re-planning the day, not by sending it again. */}
-                  {strays > 0
-                    && `${n(strays)} ${strays === 1 ? 'call' : 'calls'} outside the band — `
-                       + 'this wave has already dialled, so they come back in the next wave’s '
-                       + 'plan, not by re-planning this one'}
-                  {refused === 0 && strays === 0 && (c.detail || WHY[c.status] || c.status)}
+                  {refused === 0 && (c.detail || WHY[c.status] || c.status)}
                 </span>
                 {refused > 0 && c.run_id != null && (
                   <button

@@ -121,7 +121,7 @@ export const mockDay = (date: string, kind: string, agent_id?: number): DayView 
     date,
     kind,
     agent_id: agent_id ?? null,
-    wave: kind === 'auto_pm' ? 'afternoon' : 'morning',
+    pass_label: kind === 'auto_pm' ? 'recall pass' : 'first pass',
     now: '09:00',
     dry_run: true,
     window: { start: '09:00', end: '20:00' },
@@ -138,12 +138,9 @@ export const mockDay = (date: string, kind: string, agent_id?: number): DayView 
     capacity_before_close: ready,
     // Offline the day has not been approved, so nothing is on the clock yet and
     // the proof card stays off screen — a fixture must never look like evidence
-    // that calls went out. The band is still this wave's own half of the day.
-    spread: {
-      band: kind === 'auto_pm' ? { start: '13:30', end: '20:00' }
-                               : { start: '09:00', end: '13:30' },
-      hours: {},
-    },
+    // that calls went out. The band is the whole dialling day, the same for
+    // both passes — neither owns half of it any more.
+    spread: { band: { start: '09:00', end: '20:00' }, hours: {} },
     buckets: [
       { bucket: 'M0', label: 'Mandatory day', ready: Math.round(ready * 0.31), best_rank: 0 },
       { bucket: 'F5', label: 'Critical window', ready: Math.round(ready * 0.28), best_rank: 0 },
@@ -474,7 +471,7 @@ function buildItems(runId: number, seed: number, count: number): PlanItem[] {
     const dte = hi === lo ? hi : lo + Math.floor(r() * (hi - lo + 1));
     const intensive = isIntensive(p.bucket);
     const slotNo = intensive && r() < 0.45 ? 2 : 1;
-    // urgent buckets front-load; second slots land in the afternoon
+    // urgent buckets front-load; second slots land later in the day
     const base = intensive ? (slotNo === 2 ? 0.55 : 0.03) : 0.18;
     const frac = Math.min(0.995, base + r() * (intensive ? 0.4 : 0.78));
     const minute = startMin + Math.floor(frac * span);

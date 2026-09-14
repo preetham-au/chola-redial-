@@ -550,46 +550,38 @@ def _cfg(start: str, end: str, per_minute: int = 10, red=None):
 
 
 def test_the_days_window_is_the_envelope_and_says_when_it_is_not_shared():
-    """The envelope, and the band it is clipped to.
+    """Earliest start, latest end, and a flag when those are not one campaign's.
 
-    Every case is read through a wave, because there is no unbanded day any more:
-    the header names the hours THIS approval can reach. The afternoon keeps each
-    campaign's own close, so it is where "latest end" is still visible; the
-    morning keeps each campaign's own opening, so it is where "earliest start" is.
+    No pass argument: until 14 Sep 2026 each half of the day was clipped to its
+    own 13:30 band, so this had to be read through a wave to see a campaign's
+    real close at all. Both passes get the campaigns' whole envelope now, so the
+    day has one window and the question is only whether they all keep it.
     """
-    from api.day import AFTERNOON, MORNING, _day_window
+    from api.day import _day_window
 
     same = _day_window({1: _cfg("09:30", "19:00"), 2: _cfg("09:30", "19:00")},
-                       {1: 0, 2: 0}, floor=600, today=True, kind=AFTERNOON)
-    assert same["window"] == {"start": "13:30", "end": "19:00"}, \
-        "the afternoon cannot start at 09:30 however early the campaign opens"
+                       {1: 0, 2: 0}, floor=600, today=True)
+    assert same["window"] == {"start": "09:30", "end": "19:00"}, \
+        "two campaigns that agree are the window, not a default"
     assert same["varies"] is False
 
     mixed = _day_window({1: _cfg("09:30", "19:00"), 2: _cfg("09:00", "20:00")},
-                        {1: 0, 2: 0}, floor=600, today=True, kind=AFTERNOON)
-    assert mixed["window"] == {"start": "13:30", "end": "20:00"}, "latest end"
+                        {1: 0, 2: 0}, floor=600, today=True)
+    assert mixed["window"] == {"start": "09:00", "end": "20:00"}, \
+        "earliest start, latest end -- no call goes out beyond either"
     assert mixed["varies"] is True, "the screen must not imply a shared close time"
-
-    morning = _day_window({1: _cfg("09:30", "19:00"), 2: _cfg("09:00", "20:00")},
-                          {1: 0, 2: 0}, floor=600, today=True, kind=MORNING)
-    assert morning["window"] == {"start": "09:00", "end": "13:30"}, \
-        "earliest start, and the morning cannot promise the 19:00 or the 20:00"
-    assert morning["varies"] is True
 
 
 def test_the_day_is_open_while_any_campaign_can_still_dial():
-    from api.day import AFTERNOON, _day_window
+    from api.day import _day_window
 
-    # Read through the afternoon: at 19:30 the morning band is shut for everyone,
-    # so there would be no disagreement left for this test to see.
     late = 19 * 60 + 30           # 19:30 — past the 19:00 campaign, inside the 20:00 one
     configs = {1: _cfg("09:30", "19:00"), 2: _cfg("09:00", "20:00")}
-    assert _day_window(configs, {}, floor=late, today=True, kind=AFTERNOON)["open"] is True
-    assert _day_window({1: configs[1]}, {}, floor=late, today=True,
-                       kind=AFTERNOON)["open"] is False
+    assert _day_window(configs, {}, floor=late, today=True)["open"] is True
+    assert _day_window({1: configs[1]}, {}, floor=late, today=True)["open"] is False
 
     shut = 20 * 60
-    assert _day_window(configs, {}, floor=shut, today=True, kind=AFTERNOON)["open"] is False
+    assert _day_window(configs, {}, floor=shut, today=True)["open"] is False
 
 
 def test_capacity_is_capped_per_campaign_before_it_is_summed():
@@ -599,26 +591,24 @@ def test_capacity_is_capped_per_campaign_before_it_is_summed():
     exist: the roomy campaign's spare minutes would silently cover the shut one's
     backlog.
     """
-    from api.day import AFTERNOON, _day_window
+    from api.day import _day_window
 
     # 18:00. Campaign 1 has 60 minutes left at 10/min = 600 slots for 5000 leads;
     # campaign 2 has 120 minutes at 10/min = 1200 slots but only 10 leads waiting.
-    # The afternoon band leaves both closes alone, so the arithmetic is the band's
-    # as well as the campaign's.
     span = _day_window({1: _cfg("09:30", "19:00"), 2: _cfg("09:00", "20:00")},
-                       {1: 5000, 2: 10}, floor=18 * 60, today=True, kind=AFTERNOON)
+                       {1: 5000, 2: 10}, floor=18 * 60, today=True)
     assert span["capacity"] == 600 + 10
 
     # Its own max_per_minute, not the first campaign's.
     slow = _day_window({1: _cfg("09:30", "19:00", per_minute=1)},
-                       {1: 5000}, floor=18 * 60, today=True, kind=AFTERNOON)
+                       {1: 5000}, floor=18 * 60, today=True)
     assert slow["capacity"] == 60
 
 
 def test_a_day_with_nothing_armed_still_answers_with_a_window():
-    from api.day import MORNING, _day_window
+    from api.day import _day_window
 
-    empty = _day_window({}, {}, floor=600, today=True, kind=MORNING)
+    empty = _day_window({}, {}, floor=600, today=True)
     assert empty["open"] is False and empty["capacity"] == 0
     assert empty["window"] == {"start": "09:00", "end": "20:00"}
 
@@ -661,11 +651,6 @@ def test_one_campaigns_edited_window_does_not_become_the_days(client):
     09:00-20:00 today, so reading the first one's was accidentally right; one PUT
     on one campaign is all it takes for the header to name a close time the other
     campaigns do not keep.
-
-    Read through the AFTERNOON wave, which is the half of the day whose close is
-    the campaign's own: the morning band ends at 13:30 for everyone, so a narrowed
-    18:00 and an untouched 20:00 both clip to the same minute and there is no
-    disagreement left for this test to see.
     """
     conn = _db()
     ids = [r["id"] for r in conn.execute(
@@ -678,7 +663,7 @@ def test_one_campaigns_edited_window_does_not_become_the_days(client):
 
     shared = client.get(f"/api/day?date={TODAY.isoformat()}&kind=auto_pm").json()
     assert shared["window_varies"] is False
-    assert shared["window"] == {"start": "13:30", "end": "20:00"}
+    assert shared["window"] == {"start": "09:00", "end": "20:00"}
 
     # The LOWER id is edited, so a run reading campaigns[0] would report 18:00 for
     # both campaigns — the failure this is here to catch — and the higher one is
@@ -691,9 +676,9 @@ def test_one_campaigns_edited_window_does_not_become_the_days(client):
     try:
         day = client.get(f"/api/day?date={TODAY.isoformat()}&kind=auto_pm").json()
         assert day["window_varies"] is True, "the screen must say the campaigns disagree"
-        assert day["window"] == {"start": "13:30", "end": "20:00"}, (
-            "the envelope — no call goes out before the band opens or after 20:00, "
-            "and the edited campaign's 18:00 is not the day's close")
+        assert day["window"] == {"start": "09:00", "end": "20:00"}, (
+            "the envelope — no call goes out before 09:00 or after 20:00, and the "
+            "edited campaign's 18:00 is not the day's close")
     finally:
         # The `client` fixture is session-scoped and a config PUT appends a
         # version rather than replacing one, so a narrowed window left behind

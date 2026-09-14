@@ -1,4 +1,4 @@
-"""The clock: switch a campaign on once and its plan is ready every morning.
+"""The clock: switch a campaign on once and its plans are ready every day.
 
 `campaigns.autopilot` means "include this campaign in the daily plan". Twice a
 day this module re-syncs those campaigns' leads and PREPARES a plan for each —
@@ -9,9 +9,15 @@ Two passes, two run kinds, because `_write_run` refuses to replace a run for the
 same (campaign, date, kind) once it has been acted on — which is exactly the
 "already prepared today" guard, so no extra bookkeeping column is needed:
 
-    auto      morning   the day's plan, every schedulable bucket
-    auto_pm   afternoon a second plan, built AFTER a re-sync so it only reaches
-                        leads whose disposition still says nobody picked up
+    auto      first pass   the day's plan, every schedulable bucket
+    auto_pm   recall pass  a second plan, built AFTER a re-sync so it only
+                           reaches leads whose last call still says nobody was
+                           reached
+
+The two preparation times below are when each plan is BUILT, not hours either
+pass may dial in. Both dial anywhere in the campaign's own window; what makes
+the recall pass a recall is the re-sync in front of it, which is why it is
+prepared later rather than earlier. See api/day.py's PASS_LABEL.
 
 A campaign leaves the daily plan when it is paused here, when it is paused or
 killed in Formi (see `sync.upsert_campaign`), or when no lead is left with a RED
@@ -58,7 +64,7 @@ def remaining_leads(conn: sqlite3.Connection, campaign_id: int,
 
     Asked of the WAREHOUSE, not the local store, on purpose: a sync only pulls
     the leads inside today's RED window, so a campaign whose cohort renews next
-    month is locally empty and would be retired on its first morning. The
+    month is locally empty and would be retired on its first day. The
     warehouse sees the leads that are still ahead of the window too.
 
     None (a warehouse we could not reach) is not zero — it never stops anything.
@@ -103,9 +109,9 @@ def _note(conn: sqlite3.Connection, campaign_id: int, text: str) -> None:
 def _resync(campaign_id: int, day: date) -> int:
     """Re-pull this campaign's leads from the warehouse. Raises on any failure.
 
-    The afternoon pass depends on this: the whole point of two passes is that the
-    second one sees the morning's dispositions, and a stale local copy would dial
-    everyone a second time regardless of whether they answered.
+    The recall pass depends on this: the whole point of two passes is that the
+    second one sees how the day's earlier calls went, and a stale local copy
+    would dial everyone a second time regardless of whether they answered.
     """
     from engine import metabase_source as ms          # noqa: PLC0415 — heavy import
     from engine.sync import refresh_campaign_leads    # noqa: PLC0415
@@ -117,7 +123,7 @@ def _resync(campaign_id: int, day: date) -> int:
 
 
 def _resync_status(day: date, agent_id: Optional[int] = None) -> list[int]:
-    """Re-read Formi's campaign status before a wave is planned. Raises on failure.
+    """Re-read Formi's campaign status before a pass is planned. Raises on failure.
 
     Without this the console only learns about a pause on the next full sync: a
     campaign paused in Formi at 11:00 was still in the 15:00 plan, and approving
@@ -143,7 +149,7 @@ def _resync_status(day: date, agent_id: Optional[int] = None) -> list[int]:
 
 
 def run_pass(kind: str, day: Optional[date] = None) -> dict[str, Any]:
-    """Prepare one wave across every campaign in the daily plan. Dials nothing.
+    """Prepare one pass across every campaign in the daily plan. Dials nothing.
 
     Delegates the whole of it to `day.prepare_day`, which is also what the
     operator's Prepare button calls — one code path, so a pass fired by the clock

@@ -325,12 +325,12 @@ export function ConfigScreen({ focusBucket = null }: { focusBucket?: string | nu
               </div>
               <span className="field-hint">
                 {second.length
-                  ? 'Only these dispositions earn the afternoon call. Read at PLAN time, so it ' +
-                    'reflects the LAST call’s outcome — to gate on this morning’s ' +
-                    'result, sync dispositions after the first wave and plan the afternoon as its ' +
+                  ? 'Only these dispositions earn the recall call. Read at PLAN time, so it ' +
+                    'reflects the LAST call’s outcome — to gate on the earlier call’s ' +
+                    'result, sync dispositions after the first pass and plan the recall as its ' +
                     'own run.'
                   : 'Every lead in the twice-a-day buckets gets both calls. Pick dispositions to ' +
-                    'give the afternoon call only to leads that were not reached.'}
+                    'give the recall call only to leads that were not reached.'}
               </span>
             </div>
 

@@ -96,15 +96,16 @@ enforced server-side.
   // planned | simulated | posted | failed | skipped | expired
   // expired = its slot fell inside Formi's 5-minute floor by the time the day was
   // approved, so it was retired instead of posted. Not an error, and not a call.
-  // skipped  = its time sat outside the wave the run belongs to by the time the
-  // run was dialled (a hand-edited time can leave the band), so the dial path
-  // left it alone rather than sending an 18:45 call from a morning run.
+  // skipped  = historical only. Until 14 Sep 2026 each run was banded to half
+  // the day and the dial path retired a slot whose time had left that band.
+  // Both passes dial the campaign's whole window now, so nothing writes this
+  // any more; rows dialled before that date still carry it.
   "status": "planned",
   "http_status": null, "response": null }
 
 // Run
 { "id": 4, "campaign_id": 1, "run_date": "2026-08-28",
-  "kind": "auto",                // auto (morning wave) | auto_pm (afternoon) | manual
+  "kind": "auto",                // auto (first pass) | auto_pm (recall pass) | manual
   "status": "planned",           // planned | committed | paused
   "config_version": 3, "created_at": "…",
   "counts": { "evaluated": 9812, "planned": 1284, "slots": 1602,
@@ -129,7 +130,7 @@ enforced server-side.
 | `DELETE` | `/api/campaigns/{id}` | removes the campaign with its leads, config and runs |
 
 **The platform-pause latch.** Pausing a campaign in the Formi platform pauses it
-here too, on the EDGE into `paused` — the next sync or wave cancels its queued
+here too, on the EDGE into `paused` — the next sync or pass cancels its queued
 calls and sets `stopped_reason: "paused in the Formi platform"`. Un-pausing it in
 Formi does **not** start calls again here. That is deliberate and was asked for:
 the campaign stays held until somebody hits `POST /api/campaigns/{id}/resume` on
@@ -176,10 +177,15 @@ campaigns' leads and PREPARES a plan for each — and stops there, leaving the r
 `planned`. There is no path from a pass to Formi.
 
 Pass times come from `AUTOPILOT_AM` (default `10:00`) and `AUTOPILOT_PM`
-(default `15:00`), IST. Two waves because the client's rule is "second call only
-if the first is not answered": the afternoon plan is built *after* a re-sync, so
-it only reaches leads whose disposition still says nobody picked up. Each wave
-needs its own approval.
+(default `15:00`), IST. These are when a plan is BUILT, not a band it may dial
+in — both passes reach the campaign's whole window.
+
+Two passes because the client's rule is "second call only if the first is not
+answered": the second plan is built *after* a re-sync, so it only reaches leads
+whose last call still says nobody picked up (no pick, hung up, under
+`short_call_seconds`, or a `second_call_dispositions` slug) and whose
+`same_day_gap_hours` since that call have passed. Each pass needs its own
+approval.
 
 The same tick settles the dial log every 10 minutes between 09:00 and 21:00 (see
 Call log). Verification is read-only and cannot place a call.
@@ -194,9 +200,17 @@ than planning against stale leads.
 |---|---|---|
 | `GET` | `/api/autopilot` | `{passes, dials: false, now, fired_today, campaigns[]}`. `dials` is always `false` and is said out loud so a screen can repeat it. `now` is the server's IST clock as `HH:MM` — pass times are IST and the browser is not, so "has 10:00 gone by?" is only answerable here. A pass whose `at` is `<= now` and is absent from `fired_today` was missed; it fires once a day and is never retried. |
 | `POST` | `/api/campaigns/{id}/autopilot` | `{ "on": true \| false }` → the campaign; **409** if disabled. Switching it on never places a call. |
-| `POST` | `/api/autopilot/run` | `{ "kind": "auto" \| "auto_pm", "date"? }` — prepare a wave now; safe to repeat, an already-approved wave answers `already_ran` |
+| `POST` | `/api/autopilot/run` | `{ "kind": "auto" \| "auto_pm", "date"? }` — prepare a pass now; safe to repeat, an already-approved pass answers `already_ran` |
 
-Run kinds: `auto` (morning wave), `auto_pm` (afternoon wave), `manual`.
+Run kinds: `auto` (first pass), `auto_pm` (recall pass), `manual`.
+
+**Which pass a plan is, is decided by the previous call, not by the clock.**
+`auto` until this campaign has posted calls today, `auto_pm` after that
+(`api/day.py`'s `kind_for_campaign`). It is per campaign: one campaign's dials
+do not use up another's first pass, and yesterday's do not carry over. Until
+14 Sep 2026 the two kinds were clock bands either side of a 13:30 boundary —
+that was asked to go, because "twice a day" means "again after the first call",
+not "again after lunch".
 
 ### The day
 
@@ -212,17 +226,17 @@ One page for the whole day across every campaign in the plan, and one approval.
 `nothing_to_dial` · `part_prepared` · `approved`, so the screen has one thing to
 switch on rather than four counters to interpret.
 
-`part_prepared` is a wave where some campaigns have been acted on and at least
+`part_prepared` is a pass where some campaigns have been acted on and at least
 one has no run at all — a campaign whose `_prepare_one` failed, or one armed
-after the wave was approved. It answered `approved` until 14 Sep 2026, which is
+after the pass was approved. It answered `approved` until 14 Sep 2026, which is
 the same lie `nothing_to_dial` was: the approved hero offers only the call log,
 so that campaign's leads had no route onto the clock. Offer Build on it;
 `_prepare_one` answers `already_ran` for the campaigns that already dialled and
 leaves their `autopilot_note` alone.
 
-`nothing_to_dial` is a wave that HAS been planned and holds nothing ready — every
-run `planned`, every one of them empty, which is what an afternoon looks like
-after a morning that booked every lead. It used to be reported as `approved`,
+`nothing_to_dial` is a pass that HAS been planned and holds nothing ready — every
+run `planned`, every one of them empty, which is what a recall pass looks like
+after a first pass that booked every lead. It used to be reported as `approved`,
 which said somebody had dialled it and hid both Build and Approve; the leads a
 later re-sync pulls in then have no way onto the clock. Offer Build (re-prepare,
 usually with `resync`) on it. Same word `_approve_one` uses for one campaign in
@@ -247,19 +261,20 @@ nothing to list anywhere. An agent with nothing armed answers `200` with
 
 ```jsonc
 // GET /api/day
-{ "date": "2026-09-09", "kind": "auto", "wave": "morning",
+{ "date": "2026-09-09", "kind": "auto", "pass_label": "first pass",
   // What this answer is narrowed to; null when it is the whole day. A screen can
   // tell "one agent's day" from "every agent's" without keeping its own copy of
   // what it asked for.
   "agent_id": 125,
   "now": "11:04", "dry_run": true,
-  // The campaigns' windows clipped to this WAVE'S BAND, so the header names
-  // the hours this approval can actually reach. `auto` ends at WAVE_BOUNDARY
-  // (13:30), `auto_pm` starts there.
-  "window": { "start": "09:00", "end": "13:30" }, "window_open": true,
+  // The ENVELOPE of the armed campaigns' own dial windows — earliest start,
+  // latest end. No call goes out beyond either. `window_varies` (below) says
+  // whether that is one campaign's window or several disagreeing.
+  "window": { "start": "09:00", "end": "20:00" }, "window_open": true,
   "status": "awaiting_approval",
   "totals": { "campaigns": 4, "ready": 633, "posted": 0, "failed": 0, "dropped": 0 },
-  // A ceiling, not a promise: minutes left in the BAND x max_per_minute.
+  // A ceiling, not a promise: minutes left in the window x max_per_minute,
+  // capped per campaign at the leads it actually has ready, then summed.
   // Approve re-plans, so the real number is decided then — but an operator
   // opening this at 18:00 has to see the day no longer fits BEFORE approving.
   "capacity_before_close": 633,
@@ -280,7 +295,7 @@ nothing to list anywhere. An agent with nothing armed answers `200` with
                    // hand it to a bare `new Date(...)` — ECMA-262 reads an ISO
                    // date-TIME with no offset as the BROWSER's local time, so
                    // west of IST every plan reads 5h30m younger than it is.
-                   // Null on a campaign with no plan for this wave.
+                   // Null on a campaign with no plan for this pass.
                    "plan_built_at": "2026-09-09T09:00:00",
                    // The most recent run_date this campaign actually posted on,
                    // over its whole history. Null means it has never dialled —
@@ -301,7 +316,7 @@ nothing to list anywhere. An agent with nothing armed answers `200` with
   // campaigns holding 491 slots sat like that until the day ended. Bounded to
   // the last 14 days and to the campaigns currently in the daily plan; clamped
   // against the server's today, so asking for tomorrow does not report this
-  // morning's queued plan as abandoned.
+  // today's queued plan as abandoned.
   "stranded": [ { "campaign_id": 1650, "name": "…", "run_date": "2026-09-12",
                   "kind": "auto", "slots": 214 } ],
   // How many distinct LEADS those runs hold, across all of them. Show this, not
@@ -310,55 +325,50 @@ nothing to list anywhere. An agent with nothing armed answers `200` with
   // — 544 leads over a fortnight read as "7,616 calls never dialled". Each row
   // keeps its own `slots`, which is true of that run.
   "stranded_leads": 544,
-  // What the warehouse says happened to THIS WAVE's calls, by verify state.
+  // What the warehouse says happened to THIS PASS's calls, by verify state.
   // Counted through the run each row was dialled from (`dial_log.run_id` →
-  // `runs.kind`), so the afternoon card cannot report the morning's dials, and
+  // `runs.kind`), so the recall card cannot report the first pass's dials, and
   // the agent comes off the campaign because `dial_log.agent_id` is nullable.
-  // A row with no run — a test call — belongs to no wave and is counted in none.
+  // A row with no run — a test call — belongs to no pass and is counted in none.
   "dial_log": { "dialled": 88, "queued": 12, "missing": 1 },
-  // WHICH HOURS the calls actually landed in, against the band they were
-  // approved against. The honest answer to "is it scheduling properly": on
-  // 12 Sep 2026 the `auto` wave's slots were spread across 12:00-20:00 and
-  // `auto_pm`'s across 13:00-20:00 — the same evening twice, under two names —
-  // and no screen said so. Keys are the hour with no leading zero ("9".."19");
+  // WHICH HOURS the calls actually landed in, against the dialling hours they
+  // were approved against. The honest answer to "is it scheduling properly":
+  // on 12 Sep 2026 a day's slots were spread across 12:00-20:00 with no screen
+  // saying so. Keys are the hour with no leading zero ("9".."19");
   // only `posted` and `simulated` slots are counted, since a `planned` one has
   // not been scheduled anywhere yet and a `failed`, `expired` or `skipped` one
   // never was — counting those would put an hour on the chart nobody dialled. Scoped
   // with the rest of the page when `agent_id` is supplied.
-  "spread": { "band": { "start": "09:00", "end": "13:30" },
+  "spread": { "band": { "start": "09:00", "end": "20:00" },
               "hours": { "9": 120, "10": 240, "13": 8 } } }
 ```
 
-An hour in `hours` is only outside `band` when **no minute of it** falls inside:
-with a 13:30 boundary the 13:00 hour is half in for both waves, so `"13"` is
-inside either band, while `"20"` is outside a band closing at `20:00`.
+`band` is the dialling hours every pass is judged against — 09:00-20:00, the
+same two numbers for both. An hour in `hours` is only outside it when **no
+minute of it** falls inside, so `"19"` is inside a band closing at `20:00` and
+`"20"` is not. It is named `band` for the screens that already read it; there is
+no narrower band to compare against any more.
 
-**Each wave dials inside its own half of the day.** `auto` runs from each
-campaign's own opening to `WAVE_BOUNDARY` (env, default `13:30`, range-checked
-at import against the 09:00–20:00 dialling hours) and `auto_pm`
-from there to the campaign's own close — clipped, never widened, so a campaign
-that shuts at 13:00 has no afternoon at all and says so. Without a band the wave
-name meant nothing on the clock: on 12 Sep 2026 the `auto` wave's calls landed
-between 12:00 and 20:00 and `auto_pm`'s between 13:00 and 20:00.
+**Both passes dial the campaign's whole window.** There is no clock boundary and
+no `WAVE_BOUNDARY` env var — it was removed on 14 Sep 2026 with the morning and
+afternoon bands. A pass runs from the campaign's own opening (or the 5-minute
+floor, today) to its own close, and what separates the two passes is the
+previous call, not the hour.
 
-**A dial window is half-open, and `WAVE_BOUNDARY` itself belongs to the
-afternoon.** `end` is the minute a window SHUTS on; no call is placed there. Read
-inclusively, the minute the two bands meet belonged to both of them, so a
-campaign capped at ten calls a minute put twenty on 13:30 the moment it ran both
-waves — with neither run over its own ceiling. It also makes the capacity
-arithmetic true: `end - start` minutes are dialable, which is what
-`capacity_before_close` has always counted.
+**A dial window is half-open.** `end` is the minute a window SHUTS on; no call is
+placed there. It makes the capacity arithmetic true: `end - start` minutes are
+dialable, which is what `capacity_before_close` has always counted.
 
 **Approving late does not dial into the night.** `approve` RE-PLANS each campaign
 from the current minute with the buckets the operator ticked, then commits it, so
-only what genuinely fits before the band shuts is scheduled — best RED band
+only what genuinely fits before the window shuts is scheduled — best RED band
 first. Whatever does not fit is not dialled today and returns in tomorrow's plan
-(`not_dialled` in the response). Approving a wave twice does not dial twice: a run
+(`not_dialled` in the response). Approving a pass twice does not dial twice: a run
 that is no longer `planned` answers `already_committed`.
 
 ```jsonc
 // POST /api/day/approve
-{ "date": "2026-09-09", "kind": "auto", "wave": "morning", "dry_run": true,
+{ "date": "2026-09-09", "kind": "auto", "pass_label": "first pass", "dry_run": true,
   "buckets": ["M0","F5"],        // or "all"
   "approved": 4, "posted": 461, "failed": 0, "not_dialled": 172,
   "campaigns": [ { "campaign_id": 1650, "name": "…", "status": "approved",
@@ -369,7 +379,7 @@ that is no longer `planned` answers `already_committed`.
                  // outcome except not_prepared, where there is no run to act on.
                  { "campaign_id": 1651, "name": "…", "status": "window_closed",
                    "run_id": 914,
-                   "detail": "the 10:00-13:30 morning band has closed (it is 19:24)" } ] }
+                   "detail": "the dial window 09:00-19:00 has closed (it is 19:24)" } ] }
 ```
 
 A per-campaign `status` is one of `approved` · `not_prepared` ·
@@ -425,25 +435,21 @@ moment it is sent — never from an inference afterwards. Rows are pruned after
 | `POST` | `/api/runs/{id}/retry` | sends the slots Formi refused a second time. 409 if the run is not `committed`, if the campaign is paused, or if nothing in the run is `failed`. **Dials.** |
 | `DELETE` | `/api/runs/{id}` | discard a plan. 409 for anything not `planned` — a committed run is dial history and is kept. |
 
-**A per-campaign plan files itself under the wave it dials in, and is banded to
-it.** `POST /api/campaigns/{id}/plan` does not choose a `kind`; the kind is the
-wave that owns the first minute the plan can dial — the 5-minute floor today, the
-window's own opening on any other date — and the window is then clipped to that
-wave's band, exactly as `POST /api/day/prepare` does it. The response's `kind`
-says which. Both halves matter together: `_write_run` replaces the `planned` run
-for the KIND it is given, so a plan filed as `auto` with an all-day window did
-not merely mislabel itself — it deleted the day screen's banded morning plan and
-put 19:5x calls there under the morning's name. A `manual` run has no band and
-keeps the window it was scheduled with.
+**A per-campaign plan files itself under the pass it dials in.**
+`POST /api/campaigns/{id}/plan` does not choose a `kind`; it asks
+`kind_for_campaign` the same question `POST /api/day/prepare` asks — has this
+campaign posted calls today? — and files the run as `auto` or `auto_pm`
+accordingly. The response's `kind` says which. It matters because `_write_run`
+replaces the `planned` run for the KIND it is given: a per-campaign plan filed
+under the wrong kind deletes the day screen's plan for that kind and puts its own
+slots there under that name. A `manual` run is filed as itself and keeps the
+window it was scheduled with.
 
-**The dial path is the last gate: a slot outside its run's wave is not sent.**
-`approve`, `resume` and `retry` all commit through the same code, and a slot can
-leave the band after the plan was written — `PATCH /api/runs/{id}/items/{item}`
-validates a hand-edited time against the campaign's own window, which is wider
-than the band by construction. Those slots are marked `skipped`, counted in
-`dropped`, and reported as `out_of_band` in the response; the rest of the wave
-goes out. If a run has nothing BUT out-of-band slots left it is a **409** asking
-for a re-plan, rather than a silent no-op.
+`dropped` in a commit response counts the slots the plan no longer holds: stale
+ones retired as `expired`. There is no `out_of_band` count — it was removed on
+14 Sep 2026 with the bands that produced it, and a slot outside the campaign's
+own window cannot be written in the first place (`PATCH
+/api/runs/{id}/items/{item}` validates a hand-edited time against it).
 
 `retry` is an approve over a smaller set, not a second dial path: it puts the
 `failed` items back to `planned` and calls the same commit every other dial goes

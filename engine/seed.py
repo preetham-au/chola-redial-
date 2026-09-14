@@ -180,7 +180,7 @@ def generate(today: date | None = None, total: int = TOTAL_LEADS,
                                     datetime.min.time()).replace(
                 hour=rnd.randint(9, 18), minute=rnd.randrange(0, 60))
 
-        # calls_today is rare (the auto run fires in the morning), calls_last_7d
+        # calls_today is rare (most leads see one pass a day), calls_last_7d
         # is bounded so the weekly budget does not veto the entire sparse cohort.
         calls_today = 1 if (attempts and rnd.random() < 0.05) else 0
         calls_last_7d = calls_today + (rnd.randint(0, 2) if attempts else 0)

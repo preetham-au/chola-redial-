@@ -172,7 +172,7 @@ def fetch_fresh_leads(campaign_id: int, config: ms.MetabaseConfig,
     "No history" means nobody has DIALLED them, not that the interactions table
     is empty: scheduling a call in Formi writes a row with a NULL call_stage. So
     `queued_today` is counted here with the same definition
-    `metabase_source.candidate_sql` uses — a campaign uploaded this morning and
+    `metabase_source.candidate_sql` uses — a campaign uploaded today and
     part-scheduled by hand is exactly the case that would otherwise double-dial.
 
     Pages on `v.id`, for the reason `fetch_redial_leads` does: Metabase's
@@ -416,9 +416,9 @@ def refresh_campaign_status(conn: sqlite3.Connection, agents: Sequence[int],
     """Re-read Formi's campaign status for `agents` and honour a fresh pause.
 
     `refresh_campaign_leads` deliberately touches only leads, so between two full
-    syncs a campaign paused in Formi kept its local `paused=0` — and the afternoon
-    wave planned it and dialled it. This is the same pair `sync` uses, on its own,
-    so it can be run before a wave is built: `upsert_campaign` reports the pause
+    syncs a campaign paused in Formi kept its local `paused=0` — and the next
+    pass planned it and dialled it. This is the same pair `sync` uses, on its own,
+    so it can be run before a pass is built: `upsert_campaign` reports the pause
     EDGE and `apply_platform_pause` cancels that campaign's queued calls.
 
     Only campaigns the console already holds are touched. Upserting the rest would
@@ -612,7 +612,7 @@ def refresh_campaign_leads(conn: sqlite3.Connection, campaign_id: int,
 
       * `fetch_redial_leads` starts from `public.interactions`, so it carries the
         cadence counters — and cannot see a lead nobody has dialled yet. On a
-        campaign uploaded this morning that is every lead.
+        campaign uploaded today that is every lead.
       * `fetch_fresh_leads` reads the lead view directly and sees everyone, but
         reports zero history for all of them, which would reset the counters of
         leads that HAVE been called and re-dial them today.

@@ -227,8 +227,7 @@ def _agent_languages() -> dict[int, str]:
         # that was never missing. It was never a deliberate Latin-only rule:
         # `Français`, `Русский`, `العربية` and `日本語` all booted, because those
         # names happen to carry no marks. A guard that stops a live dialler on a
-        # legal value is worse than the typo it prevents, the same reasoning as
-        # api.day's WAVE_BOUNDARY and its unpadded times.
+        # legal value is worse than the typo it prevents.
         #
         # Spaces, hyphens and the apostrophe of `N'Ko` are stripped before the
         # check rather than allowed inside it, so a label that is nothing but
@@ -253,9 +252,9 @@ def _agent_languages() -> dict[int, str]:
 
 # Parsed once at import, and the result thrown away: `list_agents` re-reads the
 # environment so a value changed at runtime is honoured. This call is here only
-# so a malformed one stops the API at BOOT, where the operator is looking, the
-# same way api.day's WAVE_BOUNDARY does. api.main loads the .env before it
-# imports the routers, so the file's value is in os.environ by now.
+# so a malformed one stops the API at BOOT, where the operator is looking,
+# rather than at the first request. api.main loads the .env before it imports
+# the routers, so the file's value is in os.environ by now.
 _agent_languages()
 
 
@@ -490,7 +489,7 @@ def _evaluate(conn: sqlite3.Connection, campaign: sqlite3.Row, day: date,
     # A plan for a FUTURE date is evaluated at the start of its dial window, so it
     # is reproducible whatever time of day the operator asks for it. A plan for
     # TODAY is evaluated at the actual clock: anchoring it to 09:30 when it is
-    # already 15:00 schedules the whole first wave into the past.
+    # already 15:00 schedules the whole pass into the past.
     now = _anchor(day, dcfg)
     leads = load_leads(conn, campaign, day)
     pairs = [(lead, decide(lead, now, red)) for lead in leads]
@@ -625,22 +624,17 @@ def make_plan(campaign_id: int, body: Optional[PlanBody] = None) -> dict[str, An
                      # `now` is the anchor, already clamped INTO the window — report
                      # the real clock or the message reads "it is 11:00" at 16:22.
                      f"closed (it is {now_ist().strftime('%H:%M')}); widen it or plan another date")
-        # Which wave this plan belongs to, and then its half of the day. Both, or
-        # neither: `_write_run` replaces the `planned` run for the KIND it is
-        # given, so a run filed as the morning with an all-day window does not
-        # just mislabel itself -- it deletes the day screen's banded morning plan
-        # and puts 19:5x calls in its place, under the morning's name.
+        # Which pass this plan belongs to. `_write_run` REPLACES the `planned`
+        # run for the kind it is given, so getting this wrong does not just
+        # mislabel the run -- it deletes the day screen's other plan and puts
+        # this one in its place under that plan's name.
         #
-        # The kind is the wave that owns the first minute this plan can dial:
-        # `floor` today, the window's own opening on any other date. That is the
-        # same question `get_day` answers with its `kind` parameter, asked of the
-        # clock instead of the caller, so a 14:00-16:00 window is the afternoon
-        # wherever it is planned from.
-        from .day import _band, kind_for              # noqa: PLC0415 — avoids a cycle
-        kind = kind_for(floor if floor is not None else dcfg.start_min)
-        dcfg = _band(kind, dcfg)
-        # Never empty: the guard above has already refused a floor at or past the
-        # close, so the minute the kind came from is inside the band it picked.
+        # Asked of the call log, not of the clock: a campaign that has already
+        # dialled today is on its recall pass, whatever the hour. The window is
+        # left alone -- neither pass owns half the day, and the engine has
+        # already withheld every lead that has not earned a second call.
+        from .day import kind_for_campaign            # noqa: PLC0415 — avoids a cycle
+        kind = kind_for_campaign(conn, campaign_id, day)
         note = ""
         if buckets:
             note = "buckets=" + ",".join(buckets)
@@ -781,18 +775,6 @@ def patch_item(run_id: int, item_id: int, body: ItemPatch) -> dict[str, Any]:
         return _item_json(conn.execute("SELECT * FROM plan_items WHERE id=?", (item_id,)).fetchone())
 
 
-def _slot_minute(text: Optional[str]) -> Optional[int]:
-    """The minute of the day a stored slot sits on, or None if it carries no time.
-
-    `scheduled_time` is written in one format only -- "YYYY-MM-DDTHH:MM:SS", by
-    `_write_run` and by `patch_item` -- so the two fields are read off the string
-    rather than parsing a datetime the caller has no other use for.
-    """
-    if not text or len(text) < 16:
-        return None
-    return int(text[11:13]) * 60 + int(text[14:16])
-
-
 def _commit(conn: sqlite3.Connection, run: sqlite3.Row, campaign: sqlite3.Row,
             verb: str, source: str = "approve") -> dict[str, Any]:
     """Post this run's still-`planned` slots to Formi. The only path that dials.
@@ -810,7 +792,7 @@ def _commit(conn: sqlite3.Connection, run: sqlite3.Row, campaign: sqlite3.Row,
     # call at a time that has already gone, so they are held out of `items` here
     # and retired below, once this run is known to be dialling at all.
     # The rest of the run still goes out — one stale slot must not block the
-    # afternoon. Re-plan to put the retired leads back on the clock.
+    # rest of the pass. Re-plan to put the retired leads back on the clock.
     # The cutoff is Formi's five-minute floor, not "now": a slot four minutes
     # out is not dialable either, it is a 400 waiting to happen. Retiring it
     # here puts the lead back in the next plan instead of burning it on a
@@ -822,35 +804,16 @@ def _commit(conn: sqlite3.Connection, run: sqlite3.Row, campaign: sqlite3.Row,
         raise HTTPException(
             409, f"every remaining slot in run {run_id} is in the past (it is "
                  f"{now_ist().strftime('%H:%M')}); re-plan before {verb}")
-    # The wave's half of the day, enforced where the dialling happens rather than
-    # in each of approve / resume / retry. A slot can leave its band after the
-    # plan was written -- `patch_item` judges a hand-edited time against the
-    # campaign's own window, which is wider than the band by construction -- and a
-    # run named "morning" that posts an 18:45 call is the lie the bands exist to
-    # stop. Clipped, not refused: the rest of the wave still goes out and the lead
-    # comes back in the next plan, which is how `_commit` already treats a slot
-    # whose time has passed.
+    # There used to be a second refusal here, for slots that had drifted out of
+    # the pass's half of the day, reported to the browser as `out_of_band`. Both
+    # passes now dial the campaign's whole window, so a slot inside that window
+    # is in bounds whichever pass placed it, there is nothing left to clip, and
+    # the field is gone rather than pinned at a permanent 0 that reads like a
+    # measurement.
     #
-    # A `manual` run has no band -- the operator picked those leads and those
-    # hours by hand, and there is no wave for the day to be halved into. It is
-    # left exactly as it is: nothing here widens a band, and nothing here invents
-    # one for a kind that never had it.
-    from .day import KINDS, kind_for                  # noqa: PLC0415 — avoids a cycle
-    strays: list[sqlite3.Row] = []
-    if run["kind"] in KINDS:
-        keep = []
-        for row in items:
-            minute = _slot_minute(row["scheduled_time"])
-            (keep if minute is None or kind_for(minute) == run["kind"] else strays).append(row)
-        items = keep
-    if strays and not items:
-        raise HTTPException(
-            409, f"every remaining slot in run {run_id} falls outside the "
-                 f"{run['kind']} wave's hours; re-plan before {verb}")
-
-    # Both refusals are behind us, so this run is going out and the slots it is
-    # leaving behind can be written down. Retiring the stale ones any earlier
-    # left them `expired` on a run refused for the band a few lines later, with
+    # The refusal above is the only one, so this run is going out and the slots
+    # it is leaving behind can be written down. Retiring the stale ones any
+    # earlier left them `expired` on a run that might still be refused, with
     # `runs.dropped` -- incremented only at the end, on the path that dials --
     # never told about them: a run that placed no call at all, holding slots
     # nothing would ever count. Nothing rolls it back on the day approve either,
@@ -858,10 +821,6 @@ def _commit(conn: sqlite3.Connection, run: sqlite3.Row, campaign: sqlite3.Row,
     if stale:
         conn.executemany("UPDATE plan_items SET status='expired' WHERE id=?",
                          [(r["id"],) for r in stale])
-    if strays:
-        conn.executemany("UPDATE plan_items SET status='skipped' WHERE id=?",
-                         [(r["id"],) for r in strays])
-
     if dry_run():
         # No network I/O whatsoever: record exactly what would have been sent.
         conn.executemany(
@@ -879,12 +838,9 @@ def _commit(conn: sqlite3.Connection, run: sqlite3.Row, campaign: sqlite3.Row,
         posted, failed = _dial_live(conn, campaign, items, source)
     # Counts are cumulative across pause/resume cycles, so a run that went out in
     # two halves still reports how many calls it actually placed.
-    # A slot skipped for falling outside the wave is a lead that did not get
-    # called, exactly like one retired for being in the past, so it is counted
-    # the same way rather than vanishing between `slots` and `posted`.
     conn.execute("UPDATE runs SET status='committed', posted=posted+?, failed=failed+?, "
                  "dropped=dropped+?, dry_run=? WHERE id=?",
-                 (posted, failed, len(stale) + len(strays), int(dry_run()), run_id))
+                 (posted, failed, len(stale), int(dry_run()), run_id))
     conn.commit()
     # Confirm on a background thread that what we just posted is really on the
     # clock. Off the dial path on purpose: the operator gets the run back now,
@@ -895,7 +851,6 @@ def _commit(conn: sqlite3.Connection, run: sqlite3.Row, campaign: sqlite3.Row,
     out["dry_run"] = dry_run()
     out["simulated"] = posted if dry_run() else 0
     out["expired"] = len(stale)
-    out["out_of_band"] = len(strays)
     return out
 
 

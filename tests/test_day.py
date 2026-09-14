@@ -1,4 +1,4 @@
-"""The daily gate: stranded runs, wave bands, agent scoping, proof."""
+"""The daily gate: stranded runs, which pass a plan is, agent scoping, proof."""
 from __future__ import annotations
 
 from dataclasses import replace
@@ -7,10 +7,10 @@ from datetime import timedelta
 import pytest
 
 from api import day as day_module
-from api.day import ARMED, STRANDED_DAYS, WAVE_BOUNDARY, _band
+from api.day import ARMED, STRANDED_DAYS
 from api.db import now_ist, session
 from api.routes_core import FORMI_LEAD_MINUTES
-from engine.dispatcher import DispatchConfig, parse_hhmm
+from engine.dispatcher import DispatchConfig
 
 
 @pytest.fixture(autouse=True)
@@ -113,7 +113,7 @@ def _seed_dial(campaign_id: int, agent_id: int | None, day: str, n: int,
 
     Every row this console writes comes off a plan item, so it carries the id of
     the run it was dialled from (`api/dial_log.py`) -- the run is seeded here for
-    the same reason, and it is what says which wave those calls belonged to.
+    the same reason, and it is what says which pass those calls belonged to.
 
     `agent_id` is written from the campaign at log time, and the column is
     NULLABLE: passing None is the row this console wrote before that column
@@ -228,7 +228,7 @@ def test_stranded_reports_only_campaigns_in_the_daily_plan(client):
 
 
 def test_stranded_ignores_today_when_a_future_day_is_requested(client):
-    """Asking for tomorrow must not report this morning's queued plan as abandoned.
+    """Asking for tomorrow must not report today's queued plan as abandoned.
 
     The date input has no upper bound, so this is one click away. `now_ist`
     rather than `date.today`: the clamp is against the server's IST today.
@@ -268,7 +268,7 @@ def test_stranded_still_looks_back_when_a_far_future_day_is_requested(client):
 def test_stranded_counts_a_lead_once_however_many_days_it_sat(client):
     """544 people never called, not 7,616 calls.
 
-    An unapproved plan is rebuilt for the same leads the next morning, and the
+    An unapproved plan is rebuilt for the same leads the next day, and the
     one after that, so summing `slots` across the stranded runs multiplied one
     backlog by the number of days it sat -- 544 leads over a fortnight rendered
     as "7,616 calls never dialled". The number the operator has to act on is how
@@ -295,196 +295,151 @@ def test_stranded_counts_a_lead_once_however_many_days_it_sat(client):
 
 
 # ---------------------------------------------------------------------------
-# Wave bands
+# Which pass a plan belongs to
 # ---------------------------------------------------------------------------
-# `_band` is pure, but the autouse fixtures above are not: both open the DB, and
-# only the session-scoped `client` fixture creates it. These take `client` so the
-# section can be run on its own (`-k band`) rather than only after a test that
-# happens to have built the database first.
-
-def test_band_clips_morning_to_the_first_half_of_the_day(client):
-    dcfg = DispatchConfig(start_min=9 * 60, end_min=20 * 60)
-    band = _band("auto", dcfg)
-    assert band.start_min == 9 * 60, "morning keeps the campaign's own opening"
-    assert band.end_min == WAVE_BOUNDARY, "morning must stop at the boundary"
+# Until 14 Sep 2026 the clock answered this: before 13:30 was the morning wave,
+# after it the afternoon, and each could only dial its own half of the day. The
+# client's rule was never a time of day -- "call again the same day if the first
+# call did not reach them" -- so the boundary is gone, both passes dial the
+# campaign's whole window, and `kind_for_campaign` asks the CALL LOG instead:
+# has this campaign already dialled today? Who is IN the recall pass is decided
+# per lead by `wants_second_call` (engine/red_engine.py), which these do not
+# re-test; what is pinned here is only which pass a fresh plan is filed under.
 
 
-def test_band_clips_afternoon_to_the_second_half_of_the_day(client):
-    dcfg = DispatchConfig(start_min=9 * 60, end_min=20 * 60)
-    band = _band("auto_pm", dcfg)
-    assert band.start_min == WAVE_BOUNDARY, "afternoon must not start before the boundary"
-    assert band.end_min == 20 * 60, "afternoon keeps the campaign's own close"
+def _posted_run(campaign_id: int, run_date: str, kind: str, status: str,
+                posted: int) -> int:
+    """A run that reached `_commit` and put `posted` calls on the wire."""
+    run_id = _seed_run(campaign_id, run_date, kind, status, 1)
+    with session() as conn:
+        conn.execute("UPDATE runs SET posted=? WHERE id=?", (posted, run_id))
+        conn.commit()
+    return run_id
 
 
-def test_band_never_widens_a_narrow_campaign_window(client):
-    """A campaign that shuts at 13:00 has no afternoon at all."""
-    dcfg = DispatchConfig(start_min=10 * 60, end_min=13 * 60)
-    morning = _band("auto", dcfg)
-    assert (morning.start_min, morning.end_min) == (10 * 60, 13 * 60), \
-        "the band must never open earlier or close later than the campaign itself"
-    afternoon = _band("auto_pm", dcfg)
-    assert afternoon.start_min >= afternoon.end_min, \
-        "an empty band is how 'this wave cannot run here' is expressed"
+@pytest.fixture
+def untouched():
+    """Campaigns nobody else in the suite has dialled today.
 
-
-def test_band_leaves_other_config_untouched(client):
-    dcfg = DispatchConfig(start_min=9 * 60, end_min=20 * 60, max_per_minute=7, max_per_run=99)
-    band = _band("auto", dcfg)
-    assert band.max_per_minute == 7 and band.max_per_run == 99
-    assert band.red_priority == dcfg.red_priority
-
-
-def test_the_boundary_minute_belongs_to_exactly_one_wave(client):
-    """13:30 is the afternoon's first minute, never also the morning's last.
-
-    The dial window was inclusive at both ends, so the minute the bands meet was
-    dialable by BOTH of them. `max_per_minute` is enforced per run, so a campaign
-    capped at 10 calls a minute put 20 on 13:30 the moment it ran both waves --
-    and no run had broken its own ceiling.
-
-    Half-open is the fix, and it is the only one that keeps `_clip` honest: the
-    alternative moves one band's edge off WAVE_BOUNDARY, so the two waves no
-    longer meet and half a minute of the day belongs to neither.
+    Not `_arm`, which hands back the lowest id on each agent: `client` is
+    session-scoped and tests/test_autopilot.py commits REAL runs against those
+    campaigns for TODAY -- runs `clean_runs` rightly leaves alone, because it
+    only sweeps rows it seeded itself. `kind_for_campaign` reads exactly that
+    table, so an `_arm` campaign already answers "has dialled today" before one
+    of these tests writes anything, and the four that expect a first pass fail
+    on the suite while passing on the file. A campaign of their own is what
+    makes the question askable.
     """
-    from api.day import AFTERNOON, MORNING, kind_for
-    from engine.dispatcher import _free_minute
+    made: list[int] = []
 
-    window = DispatchConfig(start_min=9 * 60, end_min=20 * 60)
-    morning, afternoon = _band(MORNING, window), _band(AFTERNOON, window)
-
-    assert kind_for(WAVE_BOUNDARY) == AFTERNOON, "the minute has to belong to somebody"
-    assert _free_minute(WAVE_BOUNDARY, {}, morning) is None, \
-        "the morning is over at the boundary; it must not place a call on it"
-    assert _free_minute(WAVE_BOUNDARY, {}, afternoon) == WAVE_BOUNDARY, \
-        "the afternoon opens ON the boundary, or the minute belongs to nobody"
-    assert _free_minute(WAVE_BOUNDARY - 1, {}, morning) == WAVE_BOUNDARY - 1, \
-        "the minute before it is still the morning's, or the band lost a minute"
-
-    # The same both ways through the function: with no per-minute ceiling it
-    # answers from a different line, and only one of the two used to be fixed.
-    uncapped = _band(MORNING, DispatchConfig(start_min=9 * 60, end_min=20 * 60,
-                                             max_per_minute=0))
-    assert _free_minute(WAVE_BOUNDARY, {}, uncapped) is None, \
-        "an uncapped campaign must respect the same close"
-
-
-def test_prepare_reports_the_band_that_closed_not_the_whole_window(client, pin_clock):
-    """Preparing the morning wave after the boundary must name the BAND.
-
-    Before bands, this said "the 09:00-20:00 window has closed" only after 20:00,
-    and happily planned a 'morning' wave into the evening at any hour before it.
-
-    `pin_clock` rather than a hand-rolled monkeypatch of `day_module.now_ist`:
-    `_prepare_one` reads the clock twice, once for `_evaluate` and once for
-    `_floor_min`, and patching the one name in one module left the other on the
-    real clock -- working only while the two happened to agree on the date.
-    """
-    import api.day as day_module
-
-    _arm()
-    now = pin_clock(15)
-
-    out = day_module.prepare_day(now.date(), "auto")
-    closed = [c for c in out["campaigns"] if c["status"] == "window_closed"]
-
-    assert closed, "the morning band is shut at 15:00 - every campaign must say so"
-    assert "13:30" in closed[0]["detail"], \
-        f"the detail must name the band, got {closed[0]['detail']!r}"
-    assert "20:00" not in closed[0]["detail"], \
-        "naming the full window hides the fact that the morning band is what shut"
-    # The wording, not just the hours -- `_approve_one`'s twin is pinned the same
-    # way in test_api.py. Without this the detail reverts to "window has closed"
-    # with the band's hours in front of it, which reads as the campaign's whole
-    # day having ended, and the suite stays green.
-    assert "morning band has closed" in closed[0]["detail"], \
-        f"the detail must say which BAND shut, got {closed[0]['detail']!r}"
-
-
-def test_a_campaign_with_no_afternoon_band_neither_prepares_nor_approves(client):
-    """A campaign that shuts at 13:00 cannot run the afternoon wave at all.
-
-    Dated TOMORROW on purpose: `_floor_min` returns None for a day that is not
-    today, so the clock guard cannot fire and the empty band is the only thing
-    left that can close this window. Without it `dispatch` would be handed a
-    window whose start is past its end.
-
-    Both halves, because they are two separate guards in two functions and the
-    approve one is the one that reaches Formi. `_prepare_one`/`_approve_one`
-    rather than the day-wide passes, which have no campaign filter and would
-    write runs for every other armed campaign as a side effect.
-    """
-    import api.day as day_module
-
-    campaign_id = _arm()[0]
-    tomorrow = now_ist().date() + timedelta(days=1)
-    config = client.get(f"/api/campaigns/{campaign_id}/config").json()
-    saved = client.put(f"/api/campaigns/{campaign_id}/config",
-                       json={**config, "dial_window": {"start": "09:00", "end": "13:00"}})
-    assert saved.status_code == 200, saved.text
-    try:
-        prepared = day_module._prepare_one(campaign_id, tomorrow, "auto_pm", False)
-        # An approve needs a `planned` run in front of it, or it stops at
-        # `not_prepared` before ever reaching the band.
-        _seed_run(campaign_id, tomorrow.isoformat(), "auto_pm", "planned", 3)
+    def make(count: int = 1) -> list[int]:
         with session() as conn:
-            campaign = conn.execute("SELECT * FROM campaigns WHERE id=?",
-                                    (campaign_id,)).fetchone()
-            approved = day_module._approve_one(conn, campaign, tomorrow, "auto_pm", [])
-    finally:
-        # Session-scoped `client`: a narrowed window left behind would shorten
-        # this campaign's day for every test after it.
-        client.put(f"/api/campaigns/{campaign_id}/config", json=config)
+            for _ in range(count):
+                cid = 90010 + len(made)
+                conn.execute(
+                    "INSERT INTO campaigns (id, agent_id, warehouse_id, name, autopilot) "
+                    "VALUES (?, 90130, ?, 'pass fixture', 0)", (cid, 99000 + cid))
+                made.append(cid)
+            conn.commit()
+        return made[-count:]
 
-    assert prepared["status"] == "window_closed", prepared
-    assert "no afternoon band" in prepared["detail"], prepared["detail"]
-    assert approved["status"] == "window_closed", approved
-    assert "no afternoon band" in approved["detail"], approved["detail"]
-    assert approved.get("posted") is None, "an empty band must never reach Formi"
+    yield make
+    # Every table that REFERENCES campaigns(id) first, or the FK refuses.
+    with session() as conn:
+        for cid in made:
+            runs = "(SELECT id FROM runs WHERE campaign_id=?)"
+            conn.execute(f"DELETE FROM plan_items WHERE run_id IN {runs}", (cid,))
+            conn.execute(f"DELETE FROM decisions WHERE run_id IN {runs}", (cid,))
+            conn.execute("DELETE FROM config WHERE campaign_id=?", (cid,))
+            conn.execute("DELETE FROM runs WHERE campaign_id=?", (cid,))
+            conn.execute("DELETE FROM leads WHERE campaign_id=?", (cid,))
+            conn.execute("DELETE FROM campaigns WHERE id=?", (cid,))
+        conn.commit()
 
 
-def test_the_window_a_campaign_has_no_band_for_reports_no_hours(client):
-    """The header must not invert when a campaign has no hours in this wave.
+def test_a_campaign_that_has_not_dialled_today_gets_the_first_pass(untouched):
+    campaign_id = untouched()[0]
+    today = now_ist().date()
+    with session() as conn:
+        assert day_module.kind_for_campaign(conn, campaign_id, today) == day_module.FIRST_PASS
 
-    Clipping alone leaves start past end. `capacity` and `open` both read that as
-    zero either way, but `window` is a STRING on the operator's screen and
-    "13:30-13:00" is not a window anybody can act on.
+
+def test_a_campaign_that_already_dialled_today_gets_the_recall_pass(untouched):
+    """The whole rule: the second plan of the day is a recall, not an afternoon."""
+    campaign_id = untouched()[0]
+    today = now_ist().date()
+    _posted_run(campaign_id, today.isoformat(), day_module.FIRST_PASS, "committed", 12)
+    with session() as conn:
+        assert day_module.kind_for_campaign(conn, campaign_id, today) == day_module.RECALL_PASS
+
+
+def test_a_first_pass_that_was_paused_after_dialling_still_counts_as_dialled(untouched):
+    """`posted > 0`, not `status`. Pausing does not un-call the calls it made.
+
+    Read off the status instead and a campaign paused mid-dial is handed a
+    SECOND first pass, which re-plans the leads it has already rung.
     """
-    from api.day import AFTERNOON, _day_window
-
-    span = _day_window({1: {"dial_window": {"start": "09:00", "end": "13:00"},
-                            "max_per_minute": 10}},
-                       {1: 500}, floor=10 * 60, today=True, kind=AFTERNOON)
-
-    assert span["window"] == {"start": "13:30", "end": "13:30"}, \
-        "a band with no hours in it must not be reported as a backwards window"
-    assert span["open"] is False, "there is no afternoon here to open"
-    assert span["capacity"] == 0, "no hours means no capacity, whatever is ready"
+    campaign_id = untouched()[0]
+    today = now_ist().date()
+    _posted_run(campaign_id, today.isoformat(), day_module.FIRST_PASS, "paused", 8)
+    with session() as conn:
+        assert day_module.kind_for_campaign(conn, campaign_id, today) == day_module.RECALL_PASS
 
 
-def test_the_morning_header_never_reports_an_hour_past_the_boundary(client):
-    """A campaign that opens after the boundary must not stretch the morning header.
+def test_a_plan_that_was_built_but_never_approved_is_still_the_first_pass(untouched):
+    """A `planned` run has dialled nobody, so the day has not started.
 
-    14:00-20:00 is a legal window (WINDOW_FLOOR/WINDOW_CEIL are 09:00/20:00), and
-    in the morning it clips to start=14:00, end=13:30. Collapsing that forward
-    onto `start` made the ENVELOPE end at 14:00 -- the morning wave's header
-    promising half an hour past the boundary that defines it, which is the same
-    lie ("morning" slots landing in the evening) the bands were added to kill.
-    Collapsed toward the band, the campaign contributes 13:30 and the header
-    stays inside the morning.
+    This is the common case the boundary used to get wrong on its own: a plan
+    prepared at 10:00 and left unapproved until 14:00 became an "afternoon"
+    wave, half its hours already gone, for leads no one had called yet.
     """
-    from api.day import MORNING, _day_window
-    from engine.dispatcher import hhmm, parse_hhmm
+    campaign_id = untouched()[0]
+    today = now_ist().date()
+    _seed_run(campaign_id, today.isoformat(), day_module.FIRST_PASS, "planned", 5)
+    with session() as conn:
+        assert day_module.kind_for_campaign(conn, campaign_id, today) == day_module.FIRST_PASS
 
-    span = _day_window({1: {"dial_window": {"start": "14:00", "end": "20:00"},
-                            "max_per_minute": 10},
-                        2: {"dial_window": {"start": "09:00", "end": "20:00"},
-                            "max_per_minute": 10}},
-                       {1: 500, 2: 500}, floor=10 * 60, today=True, kind=MORNING)
 
-    assert parse_hhmm(span["window"]["end"]) <= WAVE_BOUNDARY, \
-        (f"the morning header says {span['window']['end']}, past the "
-         f"{hhmm(WAVE_BOUNDARY)} boundary that defines the morning")
-    assert span["window"] == {"start": "09:00", "end": hhmm(WAVE_BOUNDARY)}, span["window"]
+def test_another_campaigns_calls_do_not_use_up_this_campaigns_first_pass(untouched):
+    """Per campaign, not per day. Panels hold many campaigns and they start apart."""
+    dialled, quiet = untouched(2)
+    today = now_ist().date()
+    _posted_run(dialled, today.isoformat(), day_module.FIRST_PASS, "committed", 30)
+    with session() as conn:
+        assert day_module.kind_for_campaign(conn, quiet, today) == day_module.FIRST_PASS
+
+
+def test_yesterdays_calls_do_not_carry_into_todays_first_pass(untouched):
+    """Every day starts over, and a back-dated or future plan is always the first.
+
+    Keyed on `run_date`, so nothing posted on another date can answer for this
+    one -- which is also what makes a plan built for tomorrow a first pass.
+    """
+    campaign_id = untouched()[0]
+    today = now_ist().date()
+    yesterday = today - timedelta(days=1)
+    _posted_run(campaign_id, yesterday.isoformat(), day_module.FIRST_PASS, "committed", 40)
+    with session() as conn:
+        assert day_module.kind_for_campaign(conn, campaign_id, today) == day_module.FIRST_PASS
+        assert day_module.kind_for_campaign(
+            conn, campaign_id, today + timedelta(days=1)) == day_module.FIRST_PASS
+
+
+def test_both_passes_dial_the_campaigns_whole_window(client):
+    """No half-days. The recall pass may place a call at 09:05, the first at 19:55.
+
+    The 13:30 band is what the client said was still on screen after they asked
+    for the previous call to decide the second one. Its absence is the fix, so
+    it is asserted rather than left to the deleted code not coming back.
+    """
+    from api.day import DEFAULT_WINDOW, _day_window
+
+    config = {1: {"dial_window": dict(DEFAULT_WINDOW), "max_per_minute": 10}}
+    span = _day_window(config, {1: 500}, floor=None, today=False)
+
+    assert span["window"] == DEFAULT_WINDOW, span["window"]
+    assert not hasattr(day_module, "WAVE_BOUNDARY"),         "the clock boundary is gone; a pass is decided by the previous call"
+    assert not hasattr(day_module, "WAVE_BAND"), "and so are the per-pass bands"
 
 
 def test_pin_clock_can_be_called_twice(client, pin_clock):
@@ -506,173 +461,6 @@ def test_pin_clock_can_be_called_twice(client, pin_clock):
     for module in (api.db, day_module, routes_core):
         assert module.now_ist().hour == 15, \
             f"{module.__name__} is still on the first pinned hour: {module.now_ist()}"
-
-
-def test_wave_boundary_set_in_the_env_file_reaches_the_band_logic(client, tmp_path):
-    """A WAVE_BOUNDARY in the .env must reach `_band`, not merely os.environ.
-
-    `api.main` used to import the routers BEFORE calling `load_env()`, and
-    `api.day` freezes WAVE_BOUNDARY into a module constant at import. So the one
-    tunable this feature has was inert: the operator moved the boundary, got no
-    error and no warning, and both waves kept dialling to 13:30.
-
-    A subprocess because import ORDER is the thing under test and this session
-    imported `api.day` long ago. The value goes in the .env FILE, not a shell
-    export: an export already worked before the fix, so exporting one tests the
-    single path that was never broken.
-    """
-    import os
-    import subprocess
-    import sys
-    from pathlib import Path
-
-    root = Path(__file__).resolve().parent.parent
-    env_file = tmp_path / "boundary.env"
-    env_file.write_text("WAVE_BOUNDARY=11:15\n", encoding="utf-8")
-
-    probe = (
-        "import api.main;"                      # the import IS the thing under test
-        "from api.day import AFTERNOON, MORNING, _band;"
-        "from engine.dispatcher import DispatchConfig, hhmm;"
-        "d = DispatchConfig(start_min=9*60, end_min=20*60);"
-        "print(hhmm(_band(MORNING, d).end_min), hhmm(_band(AFTERNOON, d).start_min))"
-    )
-    env = {k: v for k, v in os.environ.items() if k != "WAVE_BOUNDARY"}
-    # Not "" -- load_env uses setdefault, so an empty-but-present key would shadow
-    # the file and this test would pass on the default for the wrong reason.
-    env.update(REDIAL_ENV_FILE=str(env_file), PYTHONPATH=str(root))
-
-    out = subprocess.run([sys.executable, "-c", probe], cwd=str(root), env=env,
-                         capture_output=True, text=True)
-
-    assert out.returncode == 0, out.stderr
-    assert out.stdout.split() == ["11:15", "11:15"], (
-        f"{env_file.read_text().strip()} in the .env never reached the band "
-        f"logic; the bands report {out.stdout.strip()!r}")
-
-
-# WAVE_BOUNDARY -> may the API boot on it? `None` is the variable unset.
-# Unpadded is legal and has always booted. Everything else here is a time nobody
-# typed: `int()` eats a sign, leading zeros and any Unicode digit, so `+13:30`,
-# `013:30` and `13:3` ending in an Arabic-Indic zero all used to boot as 13:30
-# and `13:005` as 13:05 -- the operator sets one boundary and the day runs on
-# another. `09:00`/`20:00` sit ON the dialling edges, which gives one wave the
-# whole day and the other an empty band.
-BOUNDARY_BOOTS = ((None, True), ("13:30", True), ("9:30", True), ("13:5", True),
-                  ("13:70", False), ("00:00", False), ("25:00", False),
-                  ("+13:30", False), ("013:30", False), ("13:005", False),
-                  ("13:3٠", False), ("1330", False), ("13.30", False),
-                  ("13:30:00", False), ("09:00", False), ("20:00", False))
-
-
-def test_the_wave_boundary_guard_refuses_only_impossible_times(client, tmp_path):
-    """`9:30` and `13:5` must boot; `13:70`, `00:00` and `25:00` must not.
-
-    The first version of this guard compared `hhmm(parse_hhmm(raw))` against the
-    raw string, so it refused every unpadded value too -- both of those name a
-    real time and both booted before the guard existed. On a box running with
-    DRY_RUN=0, an API that will not start on a legal value is worse than the
-    silent 14:10 the guard was written to catch.
-
-    One subprocess for the whole matrix, because the guard runs at MODULE level
-    in api.day: each value needs its own fresh import chain, and this session
-    imported api.day long ago.
-    """
-    import os
-    import subprocess
-    import sys
-    from pathlib import Path
-
-    root = Path(__file__).resolve().parent.parent
-    # A file rather than `python -c`: the probe is a loop, and a multi-line -c
-    # argument is a quoting question this test has no reason to ask.
-    probe = tmp_path / "boundary_matrix.py"
-    probe.write_text(
-        "import os, sys\n"
-        f"CASES = {[v for v, _ in BOUNDARY_BOOTS]!r}\n"
-        "for value in CASES:\n"
-        "    for name in [m for m in sys.modules if m.split('.')[0] in ('api', 'engine')]:\n"
-        "        del sys.modules[name]\n"
-        "    os.environ.pop('WAVE_BOUNDARY', None)\n"
-        "    if value is not None:\n"
-        "        os.environ['WAVE_BOUNDARY'] = value\n"
-        "    try:\n"
-        "        import api.main\n"
-        "        from api.day import WAVE_BOUNDARY\n"
-        "        from engine.dispatcher import hhmm\n"
-        "        print(f'{value}\\tBOOT\\t{hhmm(WAVE_BOUNDARY)}')\n"
-        "    except Exception as exc:\n"
-        "        print(f'{value}\\tREFUSED\\t{type(exc).__name__}: {exc}')\n",
-        encoding="utf-8")
-    # A .env that does not exist, so the unset case is genuinely unset: `load_env`
-    # uses setdefault, and a file carrying WAVE_BOUNDARY would answer for it.
-    env = {k: v for k, v in os.environ.items() if k != "WAVE_BOUNDARY"}
-    # UTF-8 on both ends of the pipe: one case is a non-ASCII digit, and on a
-    # Windows console the child would die encoding its own answer.
-    env.update(REDIAL_ENV_FILE=str(tmp_path / "absent.env"), PYTHONPATH=str(root),
-               PYTHONIOENCODING="utf-8")
-
-    out = subprocess.run([sys.executable, str(probe)], cwd=str(root), env=env,
-                         capture_output=True, text=True, encoding="utf-8")
-
-    assert out.returncode == 0, out.stderr
-    seen = dict(line.split("\t", 1) for line in out.stdout.splitlines() if "\t" in line)
-    for value, boots in BOUNDARY_BOOTS:
-        answer = seen.get(str(value), "")
-        if boots:
-            assert answer.startswith("BOOT"), \
-                f"WAVE_BOUNDARY={value} is a legal time and must boot; it answered {answer!r}"
-        else:
-            assert answer.startswith("REFUSED"), \
-                f"WAVE_BOUNDARY={value} is impossible and must refuse; it answered {answer!r}"
-            assert str(value) in answer, \
-                f"the refusal for {value!r} must name the value the operator typed: {answer!r}"
-
-
-def test_a_campaign_closing_exactly_on_the_boundary_has_no_afternoon_band(client):
-    """start == end is an empty band too, and only `>=` catches it.
-
-    A campaign whose window ends exactly at WAVE_BOUNDARY clips to
-    start == end == WAVE_BOUNDARY in the afternoon. With the guards written `>`
-    instead of `>=` this sails through, and on a future date (`_floor_min`
-    returns None, so the clock guard cannot fire either) the run that gets
-    written stamps every one of its slots on the same single minute --
-    the collapse `api/routes_core.py`'s `floor >= end_min` exists to prevent.
-
-    Dated TOMORROW for exactly that reason: it removes the clock guard, leaving
-    the empty-band check as the only thing that can close this window.
-    """
-    from engine.dispatcher import hhmm
-
-    import api.day as day_module
-
-    campaign_id = _arm()[0]
-    tomorrow = now_ist().date() + timedelta(days=1)
-    config = client.get(f"/api/campaigns/{campaign_id}/config").json()
-    saved = client.put(f"/api/campaigns/{campaign_id}/config",
-                       json={**config, "dial_window": {"start": "09:00",
-                                                       "end": hhmm(WAVE_BOUNDARY)}})
-    assert saved.status_code == 200, saved.text
-    try:
-        prepared = day_module._prepare_one(campaign_id, tomorrow, "auto_pm", False)
-        with session() as conn:
-            written = conn.execute(
-                "SELECT COUNT(*) AS n FROM runs WHERE campaign_id=? AND run_date=? "
-                "AND kind='auto_pm'", (campaign_id, tomorrow.isoformat())).fetchone()["n"]
-        _seed_run(campaign_id, tomorrow.isoformat(), "auto_pm", "planned", 3)
-        with session() as conn:
-            campaign = conn.execute("SELECT * FROM campaigns WHERE id=?",
-                                    (campaign_id,)).fetchone()
-            approved = day_module._approve_one(conn, campaign, tomorrow, "auto_pm", [])
-    finally:
-        client.put(f"/api/campaigns/{campaign_id}/config", json=config)
-
-    assert prepared["status"] == "window_closed", prepared
-    assert "no afternoon band" in prepared["detail"], prepared["detail"]
-    assert written == 0, \
-        "a zero-width band must not write a run whose every slot shares one minute"
-    assert approved["status"] == "window_closed", approved
-    assert approved.get("posted") is None, "a zero-width band must never reach Formi"
 
 
 # ---------------------------------------------------------------------------
@@ -1089,13 +877,13 @@ def test_dial_log_is_scoped_to_its_agent(client):
         f"{dialled() - before[None]}, not 7")
 
 
-def test_the_dial_log_is_scoped_to_its_wave(client):
-    """The afternoon card must not present the morning's calls as its own proof.
+def test_the_dial_log_is_scoped_to_its_pass(client):
+    """The recall card must not present the first pass's calls as its own proof.
 
-    These counts are rendered inside the wave's proof card, under the wave's own
-    title, eyebrow and band. Scoped by date and agent but not by kind, a morning
-    that dialled 1,900 read as the afternoon's the moment the afternoon card was
-    opened -- a number that looks wave-scoped and is not.
+    These counts are rendered inside the pass's proof card, under that pass's own
+    title and eyebrow. Scoped by date and agent but not by kind, a first pass that
+    dialled 1,900 read as the recall's the moment the recall card was opened -- a
+    number that looks pass-scoped and is not.
 
     A delta, not an absolute: `client` is session-scoped.
     """
@@ -1111,10 +899,10 @@ def test_the_dial_log_is_scoped_to_its_wave(client):
     _seed_dial(campaign_id, agent, today, 1, kind="auto_pm")
 
     assert dialled("auto") - before["auto"] == 4, (
-        f"the morning dialled 4 and the afternoon 1; the morning card moved by "
-        f"{dialled('auto') - before['auto']} — it is counting the other wave")
+        f"the first pass dialled 4 and the recall 1; the first pass's card moved by "
+        f"{dialled('auto') - before['auto']} — it is counting the other pass")
     assert dialled("auto_pm") - before["auto_pm"] == 1, (
-        f"the afternoon card moved by {dialled('auto_pm') - before['auto_pm']}, not 1")
+        f"the recall card moved by {dialled('auto_pm') - before['auto_pm']}, not 1")
 
 
 def test_a_dial_log_row_with_no_agent_still_counts_for_its_campaigns_agent(client):
@@ -1208,33 +996,6 @@ def _boot(tmp_path, line: str) -> "object":
     env.update(REDIAL_ENV_FILE=str(env_file), PYTHONPATH=str(root))
     return subprocess.run([sys.executable, "-c", "import api.main"], cwd=str(root),
                           env=env, capture_output=True, text=True)
-
-
-def test_a_wave_boundary_outside_the_dialling_hours_stops_the_api_at_boot(client, tmp_path):
-    """`WAVE_BOUNDARY=00:00` used to boot cleanly and shut the morning down.
-
-    `parse_hhmm` accepted it, nothing compared it against the dialling hours, and
-    every campaign got a morning band with no minutes in it -- a silent, total
-    morning shutdown on a box with DRY_RUN=0.
-    """
-    out = _boot(tmp_path, "WAVE_BOUNDARY=00:00")
-
-    assert out.returncode != 0, (
-        "WAVE_BOUNDARY=00:00 booted; every campaign now has an empty morning band "
-        "and nothing anywhere says so")
-    assert "WAVE_BOUNDARY" in out.stderr, out.stderr
-    assert "09:00" in out.stderr and "20:00" in out.stderr, (
-        f"the error must name the legal range, not just refuse: {out.stderr}")
-
-    # `parse_hhmm` bounds only the TOTAL minutes, so this one is INSIDE the
-    # range once read -- it is 14:10 -- and the range check alone lets it
-    # through. A boundary set to a time nobody typed is the same failure.
-    typo = _boot(tmp_path, "WAVE_BOUNDARY=13:70")
-
-    assert typo.returncode != 0, (
-        "WAVE_BOUNDARY=13:70 booted as 14:10; the operator typed one boundary and "
-        "got another, with no error")
-    assert "WAVE_BOUNDARY" in typo.stderr and "13:70" in typo.stderr, typo.stderr
 
 
 def test_a_malformed_agent_language_stops_the_api_at_boot(client, tmp_path):
@@ -1359,8 +1120,8 @@ def test_last_dialled_is_the_most_recent_day_that_posted(client):
 # Where did the calls actually land?
 # ---------------------------------------------------------------------------
 
-def test_spread_reports_the_hours_posted_calls_actually_landed_in(client, monkeypatch):
-    """"Is it scheduling properly" is answered by the hours, not by the wave name.
+def test_spread_reports_the_hours_posted_calls_actually_landed_in(client):
+    """"Is it scheduling properly" is answered by the hours, not by the pass name.
 
     Seeds its own campaign on its own agent and asks for that agent only. The
     `client` fixture is session-scoped (tests/conftest.py:21) and
@@ -1368,12 +1129,6 @@ def test_spread_reports_the_hours_posted_calls_actually_landed_in(client, monkey
     campaigns 1-11; `spread` is a sum over every armed campaign, so an unscoped
     read here would be counting somebody else's hours alongside these four rows.
     """
-    # The band is the thing the spread is judged against, so it is pinned rather
-    # than read off the environment: WAVE_BOUNDARY is env-driven (api/day.py:82)
-    # and WAVE_BAND is built from it at import, so setting the env var here would
-    # be too late. Pinning the band is what keeps the assertion below meaningful.
-    monkeypatch.setitem(day_module.WAVE_BAND, "auto", (None, parse_hhmm("13:30")))
-
     campaign_id, agent_id = 90002, 90125
     with session() as conn:
         conn.execute("INSERT INTO campaigns (id, agent_id, warehouse_id, name, autopilot) "
@@ -1398,7 +1153,7 @@ def test_spread_reports_the_hours_posted_calls_actually_landed_in(client, monkey
         assert spread["hours"]["10"] == 2, "both 10:xx calls belong to the 10:00 hour"
         assert spread["hours"]["19"] == 1
         assert "11" not in spread["hours"], "a planned slot has not been scheduled anywhere yet"
-        assert spread["band"] == {"start": "09:00", "end": "13:30"}, \
+        assert spread["band"] == {"start": "09:00", "end": "20:00"}, \
             "the band is what the spread has to be judged against"
     finally:
         # Every table that REFERENCES campaigns(id) first (api/schema.sql), or the
@@ -1412,21 +1167,28 @@ def test_spread_reports_the_hours_posted_calls_actually_landed_in(client, monkey
             conn.commit()
 
 
-def test_spread_names_the_afternoon_band_the_afternoon_is_judged_against(client, monkeypatch):
-    """The band comes from the WAVE, not from a constant. Same day, other half."""
-    monkeypatch.setitem(day_module.WAVE_BAND, "auto_pm", (parse_hhmm("13:30"), None))
-    spread = client.get("/api/day?kind=auto_pm").json()["spread"]
-    assert spread["band"] == {"start": "13:30", "end": "20:00"}
+def test_both_passes_are_judged_against_the_same_band(client):
+    """The recall pass is not a time of day, so it does not get a narrower band.
+
+    Until 14 Sep 2026 the two passes were a morning and an afternoon split at
+    13:30, and each was judged against its own half. The pass is decided by the
+    previous call now, so both dial the campaign's whole window and the spread
+    has one band to report. A recall pass answering 13:30-20:00 would be the old
+    split surviving under the new name.
+    """
+    first = client.get("/api/day?kind=auto").json()["spread"]["band"]
+    recall = client.get("/api/day?kind=auto_pm").json()["spread"]["band"]
+    assert first == recall == {"start": "09:00", "end": "20:00"}
 
 # ---------------------------------------------------------------------------
-# Which wave a run belongs to
+# Which pass a per-campaign build files itself under
 #
 # `_write_run` replaces any `planned` run for (campaign, date, KIND), so the kind
-# a writer picks decides which wave's plan it destroys. The per-campaign
-# `POST /api/campaigns/{id}/plan` used to hardcode `kind="auto"` with an UNBANDED
-# config: opening Plan Review and pressing Build deleted the day screen's banded
-# morning run and left an all-day one in its place, filed as the morning. Approve
-# then posted 19:5x calls under the name "morning wave".
+# a writer picks decides which pass's plan it destroys. The per-campaign
+# `POST /api/campaigns/{id}/plan` used to hardcode `kind="auto"`: opening Plan
+# Review and pressing Build deleted the day screen's run whichever pass it was,
+# and filed the replacement as the first pass even on a campaign that had
+# already dialled one. It asks `kind_for_campaign`, same as the day screen.
 # ---------------------------------------------------------------------------
 
 def _tomorrow() -> str:
@@ -1453,9 +1215,8 @@ def _items(client, run_id: int) -> list[dict]:
     return client.get(f"/api/runs/{run_id}/items?page_size=2000").json()["items"]
 
 
-def test_a_per_campaign_plan_is_banded_to_the_wave_it_files_itself_under(client, monkeypatch):
-    """Build on Plan Review must produce the same banded run the day screen would."""
-    monkeypatch.setitem(day_module.WAVE_BAND, "auto", (None, parse_hhmm("13:30")))
+def test_a_per_campaign_plan_for_a_day_with_no_calls_is_the_first_pass(client):
+    """Build on Plan Review must file itself under the pass the day screen would."""
     campaign_id = _arm()[0]
     day = _tomorrow()
     replaced = _seed_run(campaign_id, day, "auto", "planned", 3)
@@ -1464,90 +1225,45 @@ def test_a_per_campaign_plan_is_banded_to_the_wave_it_files_itself_under(client,
     assert built.status_code == 200, built.text
     built = built.json()
     try:
-        # Before the empty-plan skip below, both of them: a wrongly banded plan
-        # can come back with no slots at all, and a test that skips on that is a
-        # test that goes quiet exactly when the bug is present.
-        assert built["kind"] == "auto", "a plan that opens before the boundary is the morning"
+        # Before the empty-plan skip below: a plan filed under the wrong pass can
+        # come back with no slots at all, and a test that skips on that is a test
+        # that goes quiet exactly when the bug is present.
+        assert built["kind"] == "auto", \
+            "nothing has been dialled tomorrow, so tomorrow's plan is a first pass"
         # It really does replace the day screen's run -- which is why the run it
-        # leaves behind has to be the same shape.
+        # leaves behind has to be filed the same way.
         assert client.get(f"/api/runs/{replaced}").status_code == 404
         items = _items(client, built["id"])
         if not items:
             pytest.skip("nothing due tomorrow in the seed")
         latest = max(i["scheduled_time"][11:16] for i in items)
-        # The band's close, not one minute inside it: which wave owns 13:30
-        # itself is `_free_minute`'s question, asserted where it is answered.
-        assert latest <= "13:30", \
-            f"a run filed as the morning wave put a call at {latest}"
+        assert latest <= "20:00", f"a plan put a call at {latest}, past the window"
     finally:
         _drop_run(built["id"])
 
 
-def test_a_per_campaign_plan_after_the_boundary_leaves_the_morning_alone(client, monkeypatch):
-    """A window that opens after the boundary is the AFTERNOON wave, and files itself so.
+def test_a_per_campaign_plan_after_a_first_pass_is_the_recall_pass(client):
+    """Build on a campaign that has already dialled today must not overwrite it.
 
-    The two halves of the day are two runs. Writing this one as `auto` did not
+    The two passes of a day are two runs. Filing this one as `auto` does not
     merely mislabel it: `_write_run` deletes the `planned` run for the kind it is
-    given, so the morning's plan went with it.
+    given, and the first pass's row is the record of what already went out.
     """
-    monkeypatch.setitem(day_module.WAVE_BAND, "auto_pm", (parse_hhmm("13:30"), None))
     campaign_id = _arm()[0]
-    day = _tomorrow()
-    morning = _seed_run(campaign_id, day, "auto", "planned", 3)
+    day = now_ist().date().isoformat()
+    first = _posted_run(campaign_id, day, "auto", "committed", 4)
 
-    built = client.post(f"/api/campaigns/{campaign_id}/plan",
-                        json={"date": day, "start": "14:00", "end": "18:00"})
+    built = client.post(f"/api/campaigns/{campaign_id}/plan", json={"date": day})
     assert built.status_code == 200, built.text
     built = built.json()
     try:
-        # Before the empty-plan skip, and for the same reason as its twin above:
-        # filed as `auto`, this plan is banded to a morning that its own
-        # 14:00-18:00 window has no minutes in, so it comes back EMPTY -- and a
-        # skip on empty would have reported that as nothing to test.
-        assert built["kind"] == "auto_pm", "14:00-18:00 is not a morning"
-        assert client.get(f"/api/runs/{morning}").status_code == 200, \
-            "planning the afternoon must not delete the morning's plan"
-        items = _items(client, built["id"])
-        if not items:
-            pytest.skip("nothing due tomorrow in the seed")
-        earliest = min(i["scheduled_time"][11:16] for i in items)
-        assert earliest >= "13:30", f"an afternoon run put a call at {earliest}"
+        assert built["kind"] == "auto_pm", \
+            "this campaign has dialled today already, so its next plan is a recall"
+        assert client.get(f"/api/runs/{first}").status_code == 200, \
+            "planning the recall must not delete the first pass's run"
     finally:
         _drop_run(built["id"])
-
-
-def test_approving_a_run_never_dials_a_slot_outside_its_own_wave(client, pin_clock,
-                                                                 monkeypatch):
-    """The dial path is the last place a stray slot can be caught, so it is caught there.
-
-    A slot can leave its band after the plan was written: `patch_item` validates a
-    hand-edited time against the campaign's own window, which is wider than the
-    band by construction. A morning run posting an 18:45 call is the exact lie the
-    bands exist to stop, so `_commit` skips it and dials the rest.
-    """
-    monkeypatch.setitem(day_module.WAVE_BAND, "auto", (None, parse_hhmm("13:30")))
-    campaign_id = _arm()[0]
-    # 09:00, so the seeded 10:0x slots are still ahead of Formi's five-minute
-    # floor and it is the BAND, not the clock, deciding what goes out.
-    today = pin_clock(9).date().isoformat()
-    run_id = _seed_run(campaign_id, today, "auto", "planned", 3)
-    before = _items(client, run_id)
-    stray = before[0]["id"]
-    with session() as conn:
-        conn.execute("UPDATE plan_items SET scheduled_time=? WHERE id=?",
-                     (f"{today}T18:45:00", stray))
-        conn.commit()
-
-    done = client.post(f"/api/runs/{run_id}/approve")
-    assert done.status_code == 200, done.text
-    done = done.json()
-
-    after = {i["id"]: i for i in _items(client, run_id)}
-    assert after[stray]["status"] == "skipped", \
-        "18:45 is not a morning call, whatever the run says it is"
-    assert done["counts"]["posted"] == len(before) - 1, "the rest of the wave still goes out"
-    assert done["out_of_band"] == 1, "the operator has to be told a lead was left behind"
-    assert all(i["status"] == "simulated" for i in after.values() if i["id"] != stray)
+        _drop_run(first)
 
 
 # ---------------------------------------------------------------------------
@@ -1555,10 +1271,10 @@ def test_approving_a_run_never_dials_a_slot_outside_its_own_wave(client, pin_clo
 # ---------------------------------------------------------------------------
 
 def _arm_replannable(day: str, kind: str) -> int:
-    """Arm a campaign whose `kind` wave has not been acted on yet on `day`.
+    """Arm a campaign whose `kind` pass has not been acted on yet on `day`.
 
     Not `_arm`: `client` is session-scoped, so by the time this file runs the
-    earlier ones have already committed today's morning wave for the campaign
+    earlier ones have already committed today's first pass for the campaign
     `_arm` picks -- and `_write_run` rightly refuses to rewrite a run somebody
     has dialled. A test about re-planning needs a campaign that can be re-planned.
 
@@ -1573,32 +1289,30 @@ def _arm_replannable(day: str, kind: str) -> int:
             "(SELECT campaign_id FROM runs WHERE run_date=? AND kind=? AND status!='planned') "
             "ORDER BY id", (day, kind)).fetchone()
         if row is None:
-            pytest.skip(f"every campaign has already dialled its {kind} wave for {day}")
+            pytest.skip(f"every campaign has already dialled its {kind} pass for {day}")
         conn.execute("UPDATE campaigns SET autopilot=1, enabled=1, paused=0, hidden=0 "
                      "WHERE id=?", (row["id"],))
         conn.commit()
     return int(row["id"])
 
 
-def test_approving_replans_from_the_current_minute_not_the_plan_on_file(client, pin_clock,
-                                                                        monkeypatch):
-    """Approve rebuilds the plan from NOW; the morning's slots are not re-dialled at noon.
+def test_approving_replans_from_the_current_minute_not_the_plan_on_file(client, pin_clock):
+    """Approve rebuilds the plan from NOW; a 10:0x slot is not re-dialled at noon.
 
     This is `approve_day`'s central promise -- "approving late does not dial into
     the night", because each campaign is re-planned from the current minute and
     only what still fits goes out. The whole of it is `_approve_one`'s
     `_write_run(...)` and the `fresh` row it reads back: drop those two lines for
-    `fresh = run` and the console dials the stale plan instead, sending this
-    morning's 10:0x slots at noon. Every other approve test was still green.
+    `fresh = run` and the console dials the stale plan instead, sending the
+    10:0x slots at noon. Every other approve test was still green.
     """
-    monkeypatch.setitem(day_module.WAVE_BAND, "auto", (None, parse_hhmm("13:30")))
     today = pin_clock(9).date().isoformat()
     campaign_id = _arm_replannable(today, "auto")
-    # The plan on file, built this morning: slots at 10:0x, all of them now past.
+    # The plan on file, built at 09:0x: slots at 10:0x, all of them now past.
     stale = _seed_run(campaign_id, today, "auto", "planned", 3)
 
-    # Noon. Inside the morning band (13:30) so the wave is still dialable, and
-    # two hours past every slot the plan on file holds.
+    # Noon: still inside the dial window, and two hours past every slot the plan
+    # on file holds.
     pin_clock(12)
     body = client.post("/api/day/approve",
                        json={"date": today, "campaign_ids": [campaign_id]}).json()
@@ -1617,59 +1331,6 @@ def test_approving_replans_from_the_current_minute_not_the_plan_on_file(client, 
         _drop_run(run_id)
 
 
-def test_a_day_approve_reports_the_slots_it_refused_for_leaving_the_band(client, pin_clock,
-                                                                        monkeypatch):
-    """`_commit` counts out-of-band slots; the day-level approve has to pass that on.
-
-    The per-run endpoints return `_commit`'s result whole, so `/approve`,
-    `/resume` and `/retry` have always carried `out_of_band` to the browser. The
-    day-level approve builds its own per-campaign dict and left the field out, so
-    a skipped stray survived only inside `dropped` -- a number that also holds
-    slots retired for being in the past. Two different things to do about them,
-    and the operator was told neither.
-
-    The stray is forced through `kind_for` rather than by hand-editing a slot:
-    `_approve_one` RE-PLANS before it commits, so a time written into
-    `plan_items` first is deleted with the run it belonged to. Declaring the
-    first slot of the fresh plan to belong to the other wave puts `_commit` in
-    exactly the state it guards -- a run named "morning" holding a call the
-    boundary says is the afternoon's.
-    """
-    monkeypatch.setitem(day_module.WAVE_BAND, "auto", (None, parse_hhmm("13:30")))
-    today = pin_clock(9).date().isoformat()
-    campaign_id = _arm_replannable(today, "auto")
-    # `_approve_one` approves a PLANNED run and re-plans it; with nothing on file
-    # it answers `not_prepared` and never reaches `_commit`.
-    _seed_run(campaign_id, today, "auto", "planned", 3)
-
-    seen = {"n": 0}
-
-    def the_first_slot_belongs_to_the_afternoon(minute: int) -> str:
-        seen["n"] += 1
-        return "auto_pm" if seen["n"] == 1 else "auto"
-
-    monkeypatch.setattr(day_module, "kind_for", the_first_slot_belongs_to_the_afternoon)
-    body = client.post("/api/day/approve",
-                       json={"date": today, "campaign_ids": [campaign_id]}).json()
-
-    one = next(c for c in body["campaigns"] if c["campaign_id"] == campaign_id)
-    if one["status"] != "approved":
-        # Every remaining slot out of band is a 409 by design. A one-slot plan
-        # has none to spare, and that is a different test.
-        pytest.skip(f"the fresh plan held too few slots to spare one: {one}")
-    try:
-        assert one["out_of_band"] == 1, \
-            "a slot refused for leaving its band has to reach the operator, not hide in `dropped`"
-        # And it is one lead, said once. `out_of_band` is a BREAKDOWN of
-        # `dropped`, not a number beside it, so the day's "not scheduled" total
-        # has to read 1 -- adding the detail back on top would charge this stray
-        # twice, which is what `expired` did until 14 Sep 2026.
-        assert body["not_dialled"] == 1, \
-            f"one stray, counted once: not_dialled={body['not_dialled']}"
-    finally:
-        _drop_run(one["run_id"])
-
-
 def test_a_day_approve_counts_each_lead_it_did_not_dial_exactly_once(client, pin_clock,
                                                                      monkeypatch):
     """`not_dialled` is the operator's only measure of how much of a day never went out.
@@ -1677,7 +1338,7 @@ def test_a_day_approve_counts_each_lead_it_did_not_dial_exactly_once(client, pin
     It was `expired + dropped`, and `_commit` writes `dropped = dropped + stale +
     strays` while ALSO reporting `expired = stale` -- so every slot retired for
     being in the past was counted twice in the one number the approve modal shows
-    as "not scheduled". A wave with 340 stale slots reported 680: inflated by
+    as "not scheduled". A pass with 340 stale slots reported 680: inflated by
     exactly the commonest reason a slot does not go out.
 
     Getting a stale slot into a day-level approve takes the same kind of push as
@@ -1702,7 +1363,6 @@ def test_a_day_approve_counts_each_lead_it_did_not_dial_exactly_once(client, pin
     guarantees what this test needs and nothing more: a run holding both kinds of
     slot at once.
     """
-    monkeypatch.setitem(day_module.WAVE_BAND, "auto", (None, parse_hhmm("13:30")))
     today = pin_clock(9, 45).date().isoformat()
     campaign_id = _arm_replannable(today, "auto")
     # `_approve_one` approves a PLANNED run; with nothing on file it answers
@@ -1757,24 +1417,21 @@ def test_a_day_approve_counts_each_lead_it_did_not_dial_exactly_once(client, pin
             _drop_run(one["run_id"])
 
 
-def test_a_day_approve_counts_the_leads_of_a_campaign_that_never_dialled(client, pin_clock,
-                                                                         monkeypatch):
+def test_a_day_approve_counts_the_leads_of_a_campaign_that_never_dialled(client, pin_clock):
     """A closed window is not zero leads; it is every lead, un-dialled.
 
     `not_dialled` summed `dropped`, which only the APPROVED return carried. Every
     other outcome -- `window_closed`, `not_prepared`, `already_*`, `error` --
     answered with no such key, so `.get(..., 0)` scored it zero however many
-    leads it was holding. A 19:45 afternoon wave is past every campaign's
-    `end_min`, so all twelve answer `window_closed` and the status bar the
-    operator asked for read "0 scheduled · 0 not scheduled" over 2,000 leads that
-    were never called.
+    leads it was holding. A 19:45 approve is past every campaign's `end_min`, so
+    all twelve answer `window_closed` and the status bar the operator asked for
+    read "0 scheduled · 0 not scheduled" over 2,000 leads that were never called.
 
-    The morning band shuts at 13:30, so approving the morning wave at 14:00 is
-    that state exactly, with nothing else pushed: `_approve_one` returns before
-    it re-plans and before it dials.
+    Approving at 21:00 is that state exactly, with nothing else pushed: the
+    window shuts at 20:00, so `_approve_one` returns before it re-plans and
+    before it dials.
     """
-    monkeypatch.setitem(day_module.WAVE_BAND, "auto", (None, parse_hhmm("13:30")))
-    today = pin_clock(14).date().isoformat()
+    today = pin_clock(21).date().isoformat()
     campaign_id = _arm(1)[0]
     _seed_run(campaign_id, today, "auto", "planned", 7)
 
@@ -1793,12 +1450,12 @@ def test_a_day_approve_counts_the_leads_of_a_campaign_that_never_dialled(client,
 # "Approved" has to mean somebody approved it
 # ---------------------------------------------------------------------------
 
-def test_a_planned_wave_with_nothing_ready_is_not_reported_as_approved(client):
+def test_a_planned_pass_with_nothing_ready_is_not_reported_as_approved(client):
     """Plans that came back empty are not an approval -- nobody dialled anything.
 
-    The afternoon wave after a morning that booked every lead: every run is
+    A recall pass after a first pass that booked every lead: every run is
     `planned` and every one holds zero slots. The ladder fell straight through to
-    `approved`, so the screen said "this wave has been approved" and offered
+    `approved`, so the screen said "this pass has been approved" and offered
     neither Build nor Approve -- and the leads a 16:00 re-sync pulled in could
     then never be planned or approved at all. `_stranded` does not catch it
     either: it only reports runs with `slots > 0`.
@@ -1811,7 +1468,7 @@ def test_a_planned_wave_with_nothing_ready_is_not_reported_as_approved(client):
     campaign_id, agent_id = 90003, 90126
     with session() as conn:
         conn.execute("INSERT INTO campaigns (id, agent_id, warehouse_id, name, autopilot) "
-                     "VALUES (?, ?, 99003, 'empty wave fixture', 1)", (campaign_id, agent_id))
+                     "VALUES (?, ?, 99003, 'empty pass fixture', 1)", (campaign_id, agent_id))
         conn.commit()
     today = now_ist().date().isoformat()
     try:
@@ -1835,12 +1492,12 @@ def test_a_planned_wave_with_nothing_ready_is_not_reported_as_approved(client):
             conn.commit()
 
 
-def test_a_wave_holding_one_unbuilt_campaign_is_not_reported_as_approved(client):
+def test_a_pass_holding_one_unbuilt_campaign_is_not_reported_as_approved(client):
     """Eight committed runs and one campaign that never built is not an approval.
 
     `statuses` is a SET over the whole panel, so {committed, not_prepared} matched
     no arm of the ladder and fell through to `approved` -- the hero then read
-    "this wave has been approved", offered only the call log, and the unbuilt
+    "this pass has been approved", offered only the call log, and the unbuilt
     campaign's leads had no route onto the clock at all: the picker's Save is
     greyed out for a campaign that is already armed.
 
@@ -1862,7 +1519,7 @@ def test_a_wave_holding_one_unbuilt_campaign_is_not_reported_as_approved(client)
 
         assert sorted(c["run_status"] for c in body["campaigns"]) == ["committed", "not_prepared"]
         assert body["status"] == "part_prepared", \
-            "a wave holding a campaign with no plan has not been approved"
+            "a pass holding a campaign with no plan has not been approved"
     finally:
         # Same four deletes, in the same order, for both fixture campaigns.
         with session() as conn:
@@ -1903,72 +1560,3 @@ def test_an_auto_timed_test_call_is_free_of_the_dial_window(client, pin_clock, h
     expected = (now + timedelta(minutes=FORMI_LEAD_MINUTES)).strftime("%Y-%m-%dT%H:%M:00")
     assert body["would_post"]["body"]["scheduled_time"] == expected, \
         f"a {hour:02d}:00 rehearsal must go out at {hour:02d}:{FORMI_LEAD_MINUTES:02d} today"
-
-
-# ---------------------------------------------------------------------------
-# A refusal that writes nothing
-# ---------------------------------------------------------------------------
-
-def test_a_commit_refused_for_leaving_the_band_retires_no_slots(client, pin_clock, monkeypatch):
-    """The all-strays 409 must not leave the run's stale slots `expired` behind it.
-
-    `_commit` retired the stale slots BEFORE it judged the band, and on the day
-    approve nothing takes that back: the 409 is caught by `_approve_one`, whose
-    `failing()` writes the campaign's note and COMMITS the same connection a
-    moment later. The run kept slots marked `expired` while `runs.dropped` was
-    never incremented -- `slots` stopped equalling `posted + failed + dropped`
-    for a run that did not place a single call. (On `/resume` and `/retry` the
-    same UPDATE is rolled back when the connection closes, so the day approve is
-    where this has to be asked.)
-
-    The state is the minute rolling over between the re-plan and the commit:
-    `_write_run` plans from `_floor_min`, `_commit` re-reads the clock for its
-    own cutoff, and both take it from `_earliest_dialable`. Advanced on the
-    second call only, that race is exactly reproduced -- the plan's first minutes
-    are in the past by the time it is dialled.
-    """
-    from api import routes_core
-
-    monkeypatch.setitem(day_module.WAVE_BAND, "auto", (None, parse_hhmm("13:30")))
-    today = pin_clock(12).date().isoformat()
-    campaign_id = _arm_replannable(today, "auto")
-    # `_approve_one` approves a PLANNED run and re-plans it; with nothing on file
-    # it answers `not_prepared` and never reaches `_commit`.
-    _seed_run(campaign_id, today, "auto", "planned", 3)
-
-    dialable, seen = routes_core._earliest_dialable, {"n": 0}
-
-    def the_minute_rolls_over_before_the_commit(now):
-        seen["n"] += 1
-        return dialable(now if seen["n"] == 1 else now + timedelta(minutes=2))
-
-    monkeypatch.setattr(routes_core, "_earliest_dialable",
-                        the_minute_rolls_over_before_the_commit)
-    # Every slot that is still dialable belongs to the other wave, which is the
-    # 409 under test. Forced through `kind_for` rather than by hand-editing a
-    # time, because the re-plan deletes any time written before it.
-    monkeypatch.setattr(day_module, "kind_for", lambda minute: "auto_pm")
-
-    body = client.post("/api/day/approve",
-                       json={"date": today, "campaign_ids": [campaign_id]}).json()
-    one = next(c for c in body["campaigns"] if c["campaign_id"] == campaign_id)
-    assert one["status"] == "not_dialled", f"the band refusal did not fire: {one}"
-    assert "outside" in one["detail"], one["detail"]
-
-    with session() as conn:
-        run = conn.execute(
-            "SELECT * FROM runs WHERE campaign_id=? AND run_date=? AND kind='auto' "
-            "ORDER BY id DESC", (campaign_id, today)).fetchone()
-        statuses = [r["status"] for r in conn.execute(
-            "SELECT status FROM plan_items WHERE run_id=?", (run["id"],))]
-    try:
-        expired = statuses.count("expired")
-        assert expired == 0, (
-            f"a refused approve retired {expired} slot(s) anyway, and they stay that "
-            f"way -- the run holds {run['slots']} slots and reports dropped="
-            f"{run['dropped']}")
-        assert run["dropped"] == 0, (
-            f"nothing was dialled and nothing was counted as dropped, but dropped is "
-            f"{run['dropped']}")
-    finally:
-        _drop_run(run["id"])

@@ -22,10 +22,11 @@ from pydantic import BaseModel
 from .db import (DEFAULT_CONFIG, db_path, dry_run, init_db, leads_source,
                  load_env, save_env_value, session)
 # Before anything reads os.environ -- which means before the ROUTER imports, not
-# after them. `api.day` resolves WAVE_BOUNDARY into a module constant at import
-# time, so while this call sat below those imports a WAVE_BOUNDARY set in .env
-# was loaded after that constant had already frozen at its default: no error, no
-# warning, both waves still dialling to 13:30 on a live dialler.
+# after them. Routers read the environment AT IMPORT: `api.routes_core` calls
+# `_agent_languages()` at module level so a malformed AGENT_LANGUAGES stops the
+# API at boot. With this call below those imports the .env is loaded after that
+# read has already happened, and the file's value is silently ignored -- no
+# error, no warning, on a live dialler.
 #
 # Real environment variables still win (`load_env` uses setdefault), so a test
 # that exports LEADS_SOURCE=seed is not overridden by the .env on disk.

@@ -11,8 +11,8 @@ Four rules, in the order they are applied:
                   are placed first. When `max_per_run` bites it is the
                   far-from-expiry leads that get shed, never the ones about to
                   lapse. The shed count is returned, not swallowed.
-  2. ONE SLOT   — one call per lead per wave. F5/E0/F6 allow two a day, but the
-                  second is the afternoon wave's, not this one's: see the note
+  2. ONE SLOT   — one call per lead per pass. F5/E0/F6 allow two a day, but the
+                  second is the recall pass's, not this one's: see the note
                   where it used to be booked, below.
   3. ROTATION   — a lead dialled yesterday at 09:00 is not dialled at 09:00
                   today. Ported from schedule_redials.py: today's minute-of-day
@@ -245,7 +245,7 @@ def dispatch(
     `floor_min` is the earliest minute-of-day a slot may take. It defaults to the
     dial-window start, which is right for a plan built for a FUTURE date. For a
     plan built for today the caller passes the current time instead: otherwise a
-    plan generated at 15:00 emits its whole first wave from 09:30, i.e. entirely
+    plan generated at 15:00 emits its whole pass from 09:30, i.e. entirely
     in the past, and every one of those slots is undialable the moment it lands.
     """
     ordered = [(lead, dec) for lead, dec in pairs if dec.schedule]
@@ -282,7 +282,7 @@ def dispatch(
         desired[index] = start if len(blank) < 2 else \
             start + int(round(k * (span - 1) / (len(blank) - 1)))
 
-    # --- rules 1 + 4: place the wave's call in priority order, staggered -----
+    # --- rules 1 + 4: place the pass's call in priority order, staggered -----
     load: dict[int, int] = {}
     result = DispatchResult(slots=[])
     for index, (lead, dec) in enumerate(ordered):
@@ -298,22 +298,23 @@ def dispatch(
 
     # --- the second daily slot for F5/E0/F6 ------------------------------------
     # Not booked here, on purpose. This loop used to place slot 2 at slot 1 +
-    # `same_day_gap_hours` at the moment the morning plan was built, gated on
+    # `same_day_gap_hours` at the moment the first plan was built, gated on
     # `wants_second_call(lead["stage"])` -- and at that moment `stage` is still
-    # the outcome of YESTERDAY's call. The afternoon was committed before the
-    # morning had happened.
+    # the outcome of YESTERDAY's call. The second call was committed before the
+    # first had happened.
     #
     # It also silently made itself the only answer. A pre-booked slot 2 sits on
     # Formi's clock, so it counts in `queued_today`, and `evaluate` skips any
     # lead with a queued interaction (ALREADY_SCHEDULED_TODAY) rather than
-    # double-book them. The afternoon wave therefore found nothing to do for
+    # double-book them. The recall pass therefore found nothing to do for
     # exactly the leads it existed to reconsider.
     #
-    # So the second call is now the AFTERNOON wave's first call: prepare
-    # `auto_pm` with resync=True and `evaluate` judges it on this morning's real
-    # disposition and call duration. The spacing that used to be this loop's
-    # `first.minute + gap` is enforced there by the same_day_gap_hours cadence
-    # check, and the count by the per-window daily cap.
+    # So the second call is now the RECALL PASS's first call: prepare `auto_pm`
+    # with resync=True and `evaluate` judges it on the real disposition and call
+    # duration of the call that already went out today. The spacing that used to
+    # be this loop's `first.minute + gap` is enforced there by the
+    # same_day_gap_hours cadence check, and the count by the per-window daily
+    # cap.
 
     result.dropped = dropped
     result.slots.sort(key=lambda s: (s.minute, s.priority, _lead_key(s.lead), s.slot_no))
@@ -325,12 +326,11 @@ def _free_minute(wanted: int, load: dict[int, int], dcfg: DispatchConfig,
     """First minute >= `wanted` under the per-minute ceiling, or None.
 
     The window is half-open: `end_min` is when it SHUTS, so no call is placed on
-    it. Inclusive, the minute where two windows meet belonged to both of them --
-    the morning band ends at WAVE_BOUNDARY and the afternoon's begins there, so a
-    campaign capped at ten calls a minute put twenty on 13:30 the moment it ran
-    both waves, with neither run over its own ceiling. It also makes the capacity
-    arithmetic true: `end - start` minutes are dialable, which is what
-    `_day_window` has always counted.
+    it. That makes the capacity arithmetic true -- `end - start` minutes are
+    dialable, which is what `_day_window` has always counted -- and it is why
+    two adjacent windows can never both claim the minute where they meet, which
+    is how a campaign capped at ten calls a minute once put twenty on 13:30 with
+    neither run over its own ceiling.
     """
     minute = max(wanted, dcfg.start_min if floor_min is None else floor_min)
     if not dcfg.max_per_minute:

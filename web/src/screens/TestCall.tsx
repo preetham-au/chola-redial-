@@ -439,7 +439,7 @@ export function TestCall() {
                   value={when}
                   disabled={!phone}
                   // Same bounds the server enforces. Any date is fine — rehearsing
-                  // tomorrow morning is legitimate — but never a past minute and
+                  // tomorrow is legitimate — but never a past minute and
                   // never outside dialling hours.
                   min={nowLocal()}
                   onChange={(e) => setWhen(e.target.value)}

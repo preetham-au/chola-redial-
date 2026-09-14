@@ -434,7 +434,7 @@ class RedConfig:
     treat_unknown_as_dnp: bool = False
 
     # --- auto-run allow-list ------------------------------------------------
-    # Which disposition CLASSES the unattended morning run may schedule. The
+    # Which disposition CLASSES the unattended daily run may schedule. The
     # default is deliberately narrow: only leads that never picked up (DNP) and
     # leads never dialled at all (FRESH). Connected dispositions -- positive
     # followup, link sent, appointment fixed, premium quotation, CMRL
@@ -477,9 +477,9 @@ class RedConfig:
     # already been reached is called once and left alone.
     #
     # This reads the disposition as it stands WHEN THE PLAN IS BUILT, which is
-    # the outcome of the previous call, not of this morning's. To gate on
-    # today's first call, sync the dispositions after the morning wave and plan
-    # the afternoon as a separate run -- by then the slug is today's answer.
+    # the outcome of the PREVIOUS call. To gate on a call placed earlier today,
+    # sync the dispositions after the first pass and plan the recall pass as a
+    # separate run -- by then the slug is today's answer.
     # That is now how the second call is produced: `dispatch` no longer
     # pre-schedules one, and `evaluate` applies this gate when `calls_today`
     # says the lead has already been dialled since midnight.
@@ -1139,11 +1139,11 @@ def decide(lead: dict[str, Any], now: datetime, config: RedConfig = DEFAULT_CONF
     meta["calls_per_day"] = window.calls_per_day
 
     if window.intensive:
-        # F5 / E0 / F6: one call per wave, never two pre-booked at once. The
-        # second call of the day is the AFTERNOON wave's first call -- prepared
+        # F5 / E0 / F6: one call per pass, never two pre-booked at once. The
+        # second call of the day is the RECALL PASS's first call -- prepared
         # with `resync=True`, so by the time this runs again `stage`,
-        # `calls_today` and `last_call_duration_sec` are this morning's real
-        # outcome rather than yesterday's guess at it.
+        # `calls_today` and `last_call_duration_sec` are the real outcome of the
+        # call that already went out today rather than yesterday's guess at it.
         cap = min(window.calls_per_day, config.calls_per_day_cap) or 1
         if calls_today >= cap and not config.allow_second_daily_slot:
             return out(SKIP_DAILY_CAP,
@@ -1157,7 +1157,7 @@ def decide(lead: dict[str, Any], now: datetime, config: RedConfig = DEFAULT_CONF
             return out(SKIP_REACHED,
                        f"{SKIP_REACHED} bucket={window.bucket} disposition={stage or '(none)'} "
                        f"duration={'none' if duration_sec is None else f'{duration_sec}s'} "
-                       f"— this morning's call reached them", **base)
+                       f"— the earlier call today reached them", **base)
         if (hours_since is not None and hours_since < config.same_day_gap_hours
                 and not config.skip_cadence):
             return out(SKIP_CADENCE,

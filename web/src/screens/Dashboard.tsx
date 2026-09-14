@@ -167,7 +167,7 @@ function Autopilot() {
         on ? 'info' : 'ok',
         on
           ? `${next.name} is out of the daily plan. Nothing is planned for it.`
-          : `${next.name} is in the daily plan. Its plan is ready each morning and waits for you to approve the day.`,
+          : `${next.name} is in the daily plan. Its plan is ready each day and waits for you to approve the day.`,
       );
     } catch (e) {
       toast('bad', (e as Error).message);
@@ -179,13 +179,13 @@ function Autopilot() {
   return (
     <Card
       title="In the daily plan"
-      eyebrow={on ? 'planned every morning · never dialled without your approval' : 'not planned'}
+      eyebrow={on ? 'planned every day · never dialled without your approval' : 'not planned'}
     >
       <div className="row" style={{ gap: 14, alignItems: 'flex-start' }}>
         <p className="hero-sub" style={{ margin: 0, flex: 1 }}>
           {on
-            ? 'Morning and afternoon, this campaign re-syncs and its plan is built for you. It goes out only when you approve the day. It leaves the plan when every policy is past the grace window, or when it is paused here or in Formi.'
-            : 'Put this campaign in the daily plan and its calls are worked out for you each morning. Switching it on never places a call — you approve the day.'}
+            ? 'Twice a day — a first pass, then a recall for the leads it did not reach — this campaign re-syncs and its plan is built for you. It goes out only when you approve the day. It leaves the plan when every policy is past the grace window, or when it is paused here or in Formi.'
+            : 'Put this campaign in the daily plan and its calls are worked out for you each day. Switching it on never places a call — you approve the day.'}
           {campaign.autopilot_note ? (
             <>
               {' '}

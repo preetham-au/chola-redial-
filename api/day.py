@@ -1,6 +1,6 @@
 """The daily approval gate: one plan for the day, one decision, one screen.
 
-Nothing in this console dials on its own. Each morning a pass PREPARES a plan for
+Nothing in this console dials on its own. A scheduled pass PREPARES a plan for
 every campaign that is in the daily plan (`campaigns.autopilot`) and leaves it
 `planned`; this module is what the operator opens. One page holds the whole day —
 how many leads are ready, split by RED band and by bucket — and one Approve puts
@@ -24,10 +24,7 @@ scheduled; the rest is not dialled today and comes back in tomorrow's plan.
 from __future__ import annotations
 
 import logging
-import os
-import re
 import sqlite3
-from dataclasses import replace
 from datetime import date, timedelta
 from typing import Any, Optional
 
@@ -35,8 +32,7 @@ from fastapi import APIRouter, Body, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from engine.dispatcher import (
-    DEFAULT_RED_PRIORITY, WINDOW_CEIL, WINDOW_FLOOR, DispatchConfig, hhmm, parse_hhmm,
-    red_rank,
+    DEFAULT_RED_PRIORITY, WINDOW_CEIL, WINDOW_FLOOR, hhmm, parse_hhmm, red_rank,
 )
 
 from .db import dry_run, now_ist, session
@@ -48,118 +44,52 @@ from .routes_core import (
 router = APIRouter()
 log = logging.getLogger("redial.day")
 
-# The run kinds a day is made of. Two waves, because the client's rule is "second
-# call only if the first is not answered": the afternoon plan is built AFTER a
-# re-sync, so it only reaches leads whose disposition still says nobody picked up.
-# Both are prepared, neither dials — each needs its own approval.
+# The two passes a day is made of. The client's rule is "second call only if the
+# first is not answered", so the recall pass is built AFTER a re-sync and only
+# reaches leads whose last call still says nobody was reached. Both are prepared,
+# neither dials — each needs its own approval.
 #
-# There is no per-wave call cap any more. A `_evaluate_wave` wrapper used to pin
-# `calls_per_day_cap=1` on its way out of `_evaluate` — but `_evaluate` has
-# already run `decide` by then, so the engine never saw it; the only thing it
-# reached was the dispatcher's habit of pre-booking the day's second slot, and
-# that is gone (see the note where it used to be booked, in dispatcher.py). One
-# call per lead per wave is now structural, so the operator's `calls_per_day_cap`
-# is left alone and means what it says: calls per lead per DAY.
-MORNING, AFTERNOON = "auto", "auto_pm"
-KINDS = (MORNING, AFTERNOON)
-
-WAVE_LABEL = {MORNING: "morning", AFTERNOON: "afternoon"}
-
-# Where the morning stops and the afternoon starts. One boundary for the whole
-# console, not one per campaign: the screen has to be able to SAY which band it
-# is approving ("the morning band, 09:00-13:30"), and a per-campaign boundary
-# makes that sentence unwritable.
+# WHICH LEADS, NOT WHICH HOURS. Until 14 Sep 2026 these were a morning and an
+# afternoon, split at a 13:30 clock boundary: the first pass could only dial
+# 09:00-13:30 and the second only 13:30-20:00. That band is gone. It was never
+# what made the second call correct -- on 12 Sep the engine gave 200 leads a
+# second call out of 3,553, entirely through `wants_second_call` and
+# `same_day_gap_hours`, and the boundary contributed nothing but a ceiling on
+# when each pass could dial. Both passes now dial anywhere in the campaign's own
+# window, and the recall pass holds exactly the leads the PREVIOUS CALL earned it
+# for: no pick, hung up, under `short_call_seconds`, or a disposition named in
+# `second_call_dispositions`, and at least `same_day_gap_hours` after that call.
+# See engine/red_engine.py's `wants_second_call`.
 #
-# Until 13 Sep 2026 the two waves were labels with no clock behind them. Approve
-# re-plans from the current minute, so the morning wave approved at noon dialled
-# into the evening -- on 12 Sep the `auto` wave's calls landed between 12:00 and
-# 20:00 and the `auto_pm` wave's between 13:00 and 20:00, which is the same day
-# twice. The band is what makes the name true.
-#
-# 13:30 sits between autopilot's own two preparation times (AUTOPILOT_AM 10:00,
-# AUTOPILOT_PM 15:00, see autopilot.py) so each wave is still prepared inside the
-# band it dials into.
-_WAVE_BOUNDARY_RAW = (os.environ.get("WAVE_BOUNDARY") or "13:30").strip()
-WAVE_BOUNDARY = parse_hhmm(_WAVE_BOUNDARY_RAW, "WAVE_BOUNDARY")
-# `parse_hhmm` only bounds the TOTAL, so it reads `13:70` as 14:10 rather than
-# refusing it. A boundary quietly set to a time nobody typed is the same failure
-# as one set outside the hours, and it is the likelier typo of the two.
-#
-# The SHAPE of the whole value is checked, in ASCII digits, because `int()` is
-# far more forgiving than an operator typing a clock time means it to be: it eats
-# a sign (`+13:30`), leading zeros (`013:30`, `13:005`) and any Unicode digit --
-# `13:3` ending in an Arabic-Indic zero is `isdigit()` to Python and 810 minutes
-# to `int()`. Every one of those booted as a time nobody typed. Checking only the
-# minute field left all four through.
-#
-# Unpadded stays legal: `9:30` and `13:5` name a real time and booted fine before
-# any of these guards existed. Comparing `hhmm(WAVE_BOUNDARY)` against the raw
-# string refused them, and a guard that stops a live dialler on a legal value is
-# worse than the bug it prevents. The hour needs no range check of its own:
-# `parse_hhmm` bounds the total at 24:00 and the dialling-hours check below is
-# stricter still.
-if not re.fullmatch(r"[0-9]{1,2}:[0-9]{1,2}", _WAVE_BOUNDARY_RAW):
-    raise ValueError(f"WAVE_BOUNDARY must be HH:MM in plain ASCII digits, got "
-                     f"{_WAVE_BOUNDARY_RAW!r} (it would be read as "
-                     f"{hhmm(WAVE_BOUNDARY)})")
-_WAVE_BOUNDARY_MM = _WAVE_BOUNDARY_RAW.partition(":")[2]
-if int(_WAVE_BOUNDARY_MM) >= 60:
-    raise ValueError(f"WAVE_BOUNDARY must be HH:MM, got {_WAVE_BOUNDARY_RAW!r} "
-                     f"(minutes {_WAVE_BOUNDARY_MM!r} are not 00-59; it would be "
-                     f"read as {hhmm(WAVE_BOUNDARY)})")
-# Inside the dialling hours, and strictly: a boundary ON or outside either edge
-# gives one wave the whole day and the other an empty band for EVERY campaign,
-# and nothing downstream says so -- `_clip` just returns a band with no minutes
-# in it. `WAVE_BOUNDARY=00:00` booted cleanly and shut the morning down across
-# the board. Raised here, at import, so a typo stops the API where the operator
-# can see it rather than on a box with DRY_RUN=0.
-if not WINDOW_FLOOR < WAVE_BOUNDARY < WINDOW_CEIL:
-    raise ValueError(
-        f"WAVE_BOUNDARY {hhmm(WAVE_BOUNDARY)} must be strictly between "
-        f"{hhmm(WINDOW_FLOOR)} and {hhmm(WINDOW_CEIL)}, the permitted dialling hours")
-WAVE_BAND = {MORNING: (None, WAVE_BOUNDARY), AFTERNOON: (WAVE_BOUNDARY, None)}
+# The stored strings are unchanged so the `runs` rows written under the old names
+# are still this day's rows and still readable.
+FIRST_PASS, RECALL_PASS = "auto", "auto_pm"
+KINDS = (FIRST_PASS, RECALL_PASS)
 
+PASS_LABEL = {FIRST_PASS: "first pass", RECALL_PASS: "recall pass"}
 
-def _clip(start: int, end: int, kind: str) -> tuple[int, int]:
-    """(start, end) clipped to this wave's half of the day. Never widened.
+def kind_for_campaign(conn: sqlite3.Connection, campaign_id: int, day: date) -> str:
+    """Which pass a fresh plan for this campaign belongs to: the day's first, or
+    the recall after it.
 
-    `None` on a side of the band means "this wave does not move that edge", so
-    the campaign's own opening (morning) or close (afternoon) is kept.
+    Asked of the CALL LOG, not of the clock. A campaign that has not put a call
+    out today cannot be on its recall pass however late in the day it is planned,
+    and one that dialled at 09:10 is on its recall pass at 09:40 -- the engine,
+    not this function, then decides whether any individual lead has earned that
+    second call and whether `same_day_gap_hours` has elapsed.
+
+    `posted > 0` rather than the run's status, so a first pass that was dialled
+    and later paused still counts as having happened. Its calls are on Formi's
+    clock; pausing the run does not take them back.
+
+    On a date that is not today there is nothing posted, so a back-dated or
+    forward-dated plan is always the first pass. That is right: the recall pass
+    only means anything against calls that exist.
     """
-    lo, hi = WAVE_BAND[kind]
-    return (max(start, lo if lo is not None else 0),
-            min(end, hi if hi is not None else 24 * 60))
-
-
-def kind_for(minute: int) -> str:
-    """Which wave owns this minute of the day. Exactly one of them does.
-
-    Read off WAVE_BAND rather than WAVE_BOUNDARY so there is one source of truth
-    for where the day divides -- a test that pins the band gets this too.
-
-    The boundary minute belongs to the AFTERNOON: the morning's band ends at it
-    and `_free_minute` will not place a call on a window's closing minute, so
-    13:30 is dialled by one wave, not by both.
-    """
-    _, morning_ends = WAVE_BAND[MORNING]
-    return MORNING if minute < morning_ends else AFTERNOON
-
-
-def _band(kind: str, dcfg: DispatchConfig) -> DispatchConfig:
-    """The campaign's own dial window, clipped to this wave's half of the day.
-
-    Narrowing the config is the whole implementation: `dispatch` already receives
-    a DispatchConfig and honours start_min/end_min, so nothing in the dispatcher
-    or in `_write_run` needs to know a band exists.
-
-    CLIPPING, never widening. A campaign that shuts at 13:00 gets an afternoon
-    band whose start is at or past its end -- an empty band, caught by the
-    explicit `start_min >= end_min` check in `_prepare_one` / `_approve_one`.
-    NOT by `floor >= end_min`: on a date that is not today `_floor_min` returns
-    None and that guard never runs.
-    """
-    start, end = _clip(dcfg.start_min, dcfg.end_min, kind)
-    return replace(dcfg, start_min=start, end_min=end)
+    row = conn.execute(
+        "SELECT 1 FROM runs WHERE campaign_id=? AND run_date=? AND kind=? AND posted>0 "
+        "LIMIT 1", (campaign_id, day.isoformat(), FIRST_PASS)).fetchone()
+    return RECALL_PASS if row else FIRST_PASS
 
 
 # Who is in today's plan. One string because the question is asked three times —
@@ -207,10 +137,11 @@ STRANDED_DAYS = 14
 
 class PrepareBody(BaseModel):
     date: Optional[str] = None
-    kind: str = MORNING
+    kind: str = FIRST_PASS
     # Off by default: the hourly sync timer already keeps the local copy fresh,
     # and a warehouse round-trip per campaign turns a button press into minutes.
-    # The scheduled pass sets it — the afternoon wave is worthless without it.
+    # The scheduled pass sets it — the recall pass is worthless without it, as it
+    # is the re-sync that tells it how the day's earlier calls actually went.
     resync: bool = False
     # Narrows the pass to one agent — one language. None = every armed campaign,
     # which is what the scheduled passes use.
@@ -219,7 +150,7 @@ class PrepareBody(BaseModel):
 
 class ApproveBody(BaseModel):
     date: Optional[str] = None
-    kind: str = MORNING
+    kind: str = FIRST_PASS
     # Which buckets to actually call. Empty = every bucket in the plan. The rest
     # are not dialled today; they come back in tomorrow's plan.
     buckets: list[str] = Field(default_factory=list)
@@ -306,7 +237,7 @@ DEFAULT_WINDOW = {"start": "09:00", "end": "20:00"}
 
 
 def _day_window(configs: dict[int, dict[str, Any]], ready: dict[int, int],
-                floor: int, today: bool, kind: str) -> dict[str, Any]:
+                floor: int, today: bool) -> dict[str, Any]:
     """The day's dialling window and its ceiling, from every armed campaign.
 
     `dial_window` and `max_per_minute` are per-campaign, and each is one PUT away
@@ -316,11 +247,11 @@ def _day_window(configs: dict[int, dict[str, Any]], ready: dict[int, int],
     `with_defaults` retires the stale 09:30-19:00 snapshot — and would have named
     a close time the other 68 do not keep the moment one was narrowed.
 
-    The window reported is the ENVELOPE of the campaigns' windows CLIPPED TO THIS
-    WAVE'S BAND: no call goes out before its start or after its end, whichever
-    campaign places it, and this approval cannot reach past the band whatever a
-    campaign's own close says. `varies` says the campaigns do not agree, so the
-    screen can say so instead of implying a shared close.
+    The window reported is the ENVELOPE of the campaigns' own windows: no call
+    goes out before its start or after its end, whichever campaign places it.
+    `varies` says the campaigns do not agree, so the screen can say so instead of
+    implying a shared close. Both passes get the same envelope -- neither owns
+    half the day any more.
 
     `open` is true while ANY campaign can still dial — approving is worth doing
     for the campaigns still open even once the others have shut.
@@ -335,14 +266,8 @@ def _day_window(configs: dict[int, dict[str, Any]], ready: dict[int, int],
     spans, capacity = set(), 0
     for campaign_id, config in configs.items():
         window = config.get("dial_window") or DEFAULT_WINDOW
-        # Clipped to the wave's band, so the screen names the hours this approval
-        # can actually reach rather than the campaign's whole day.
-        start, end = _clip(parse_hhmm(window.get("start", DEFAULT_WINDOW["start"])),
-                           parse_hhmm(window.get("end", DEFAULT_WINDOW["end"])), kind)
-        # No hours in this wave: a point at the boundary (every inverted clip
-        # lands there), not a backwards "13:30-13:00" on the operator's screen.
-        if start > end:
-            start = end = WAVE_BOUNDARY
+        start = parse_hhmm(window.get("start", DEFAULT_WINDOW["start"]))
+        end = parse_hhmm(window.get("end", DEFAULT_WINDOW["end"]))
         spans.add((start, end))
         waiting = ready.get(campaign_id, 0)
         if not today:
@@ -364,7 +289,7 @@ def _day_window(configs: dict[int, dict[str, Any]], ready: dict[int, int],
 # ---------------------------------------------------------------------------
 
 def _plan_rows(conn: sqlite3.Connection, campaign_ids, day: date, kind: str):
-    """The `planned`/`committed` run per campaign for this day and wave."""
+    """The `planned`/`committed` run per campaign for this day and pass."""
     if not campaign_ids:
         return {}
     marks = ",".join("?" * len(campaign_ids))
@@ -387,23 +312,24 @@ def _slot_counts(conn: sqlite3.Connection, run_ids):
 
 def _dialled_today(conn: sqlite3.Connection, day: date, kind: str,
                    agent_id: Optional[int] = None) -> dict[str, int]:
-    """What the log says THIS WAVE actually did, by verify state. 'Did it run?'.
+    """What the log says THIS PASS actually did, by verify state. 'Did it run?'.
 
     Scoped like every other field on this page -- and that has to include the
-    wave. These counts are rendered inside the proof card, under the wave's own
-    title, eyebrow and band: an afternoon card reading "2,080 dialled" when the
-    afternoon posted 300 is the morning's work presented as this wave's proof,
-    which is the same confusion agent scoping exists to remove.
+    pass. These counts are rendered inside the proof card, under the pass's own
+    title and eyebrow: a recall card reading "2,080 dialled" when the recall pass
+    posted 300 is the first pass's work presented as this one's proof, which is
+    the same confusion agent scoping exists to remove.
 
     Both narrowings go through the run rather than through `dial_log`'s own
-    columns. `run_id` says which wave a call belonged to as a fact -- the run it
-    was dialled from -- where classifying `scheduled_time` by band would be a
-    guess for any row a hand-edit or a moved `WAVE_BOUNDARY` left straddling it.
+    columns. `run_id` says which pass a call belonged to as a fact -- the run it
+    was dialled from. There is nothing else that could say it: both passes now
+    dial the campaign's whole window, so the hour a call was booked for carries
+    no information about which pass booked it.
     The agent comes off the campaign for the plainer reason that
     `dial_log.agent_id` is nullable, so scoping on it drops every row written
     before that column was populated.
 
-    A row with no run is not this wave's: a test call belongs to no run and is
+    A row with no run is not this pass's: a test call belongs to no run and is
     nobody's proof that the day ran.
     """
     where = ["substr(d.scheduled_time,1,10)=?", "r.kind=?"]
@@ -429,7 +355,7 @@ def _stranded(conn: sqlite3.Connection, day: date,
     did not get called.
 
     The second return value counts PEOPLE, not slots. An unapproved plan is built
-    again for the same leads the next morning, so summing `slots` over the runs
+    again for the same leads the next day, so summing `slots` over the runs
     multiplies one backlog by the days it sat: 544 leads over a fortnight read as
     "7,616 calls never dialled". The rows keep their own `slots` -- that is what
     each run holds, and it is true per row -- but the headline is the distinct
@@ -439,7 +365,7 @@ def _stranded(conn: sqlite3.Connection, day: date,
     """
     # "Earlier" means earlier than TODAY, not earlier than the day asked about.
     # The date input has no upper bound, so tomorrow is one click away -- and
-    # bounded by the requested day, this morning's `planned` run would be
+    # bounded by the requested day, today's own `planned` run would be
     # reported as never dialled while it is in fact queued and awaiting
     # approval. A plan for a day that has not arrived is waiting, not abandoned.
     #
@@ -525,16 +451,17 @@ def _plan_facts(conn: sqlite3.Connection, runs: dict[int, sqlite3.Row],
     return facts
 
 
-def _spread(conn: sqlite3.Connection, runs: dict[int, sqlite3.Row],
-            kind: str) -> dict[str, Any]:
-    """Which hours the day's calls actually went onto, against the band approved.
+def _spread(conn: sqlite3.Connection, runs: dict[int, sqlite3.Row]) -> dict[str, Any]:
+    """Which hours this pass's calls actually went onto, against the hours allowed.
 
-    This is the honest answer to "is it scheduling properly". On 12 Sep 2026 the
-    `auto` wave's posted slots were spread across 12:00-20:00 and the `auto_pm`
-    wave's across 13:00-20:00 -- the same evening twice, under two names -- and
-    nothing in this console showed it. A count per hour beside the band the
-    operator approved makes a wave that dialled outside its half of the day
-    visible at a glance instead of needing a database query.
+    This is the honest answer to "is it scheduling properly": a count per hour,
+    beside the permitted dialling hours, so a pass that piled every call into one
+    hour or ran up against the close is visible at a glance instead of needing a
+    database query.
+
+    `band` is the permitted dialling hours, the same for both passes. It used to
+    be the pass's half of a day split at 13:30; there is no such split any more,
+    so the only line worth drawing the hours against is the one no call may cross.
 
     Only `posted` and `simulated` items count -- the two statuses that mean a
     call really went onto Formi's clock (or would have, outside DRY_RUN). Every
@@ -546,9 +473,8 @@ def _spread(conn: sqlite3.Connection, runs: dict[int, sqlite3.Row],
     the armed campaigns, get_day), so there is no agent filter here -- a second
     one would be a second chance to disagree with the rest of the answer.
     """
-    lo, hi = WAVE_BAND[kind]
-    band = {"start": hhmm(lo if lo is not None else parse_hhmm(DEFAULT_WINDOW["start"])),
-            "end": hhmm(hi if hi is not None else parse_hhmm(DEFAULT_WINDOW["end"]))}
+    band = {"start": hhmm(max(WINDOW_FLOOR, parse_hhmm(DEFAULT_WINDOW["start"]))),
+            "end": hhmm(min(WINDOW_CEIL, parse_hhmm(DEFAULT_WINDOW["end"])))}
     run_ids = [r["id"] for r in runs.values()]
     if not run_ids:
         return {"band": band, "hours": {}}
@@ -562,7 +488,7 @@ def _spread(conn: sqlite3.Connection, runs: dict[int, sqlite3.Row],
 
 
 @router.get("/api/day")
-def get_day(date: Optional[str] = Query(None), kind: str = Query(MORNING),
+def get_day(date: Optional[str] = Query(None), kind: str = Query(FIRST_PASS),
             agent_id: Optional[int] = Query(None)) -> dict[str, Any]:
     """The whole day on one page: what is ready, in what order, and what it did.
 
@@ -613,7 +539,7 @@ def get_day(date: Optional[str] = Query(None), kind: str = Query(MORNING),
         log = _dialled_today(conn, day, kind, agent_id)
         stranded_runs, stranded_leads = _stranded(conn, day, agent_id)
         facts = _plan_facts(conn, runs, [c["id"] for c in campaigns])
-        spread = _spread(conn, runs, kind)
+        spread = _spread(conn, runs)
 
         from .db import current_config                  # noqa: PLC0415 — avoids a cycle
         # Every armed campaign's own config. There is no campaign whose settings
@@ -666,8 +592,8 @@ def get_day(date: Optional[str] = Query(None), kind: str = Query(MORNING),
     elif "planned" in statuses and ready:
         status = "awaiting_approval"
     elif "planned" in statuses:
-        # Prepared, but the plans came back empty -- the afternoon wave after a
-        # morning that booked every lead reaching it. `approved` was the answer
+        # Prepared, but the plans came back empty -- the recall pass after a
+        # first pass that booked every lead reaching it. `approved` was the answer
         # here until 14 Sep 2026, and it is a lie twice over: nobody approved
         # anything, and the screen that believed it offered neither Build nor
         # Approve, so the leads a later re-sync pulled in could not be planned at
@@ -693,10 +619,10 @@ def get_day(date: Optional[str] = Query(None), kind: str = Query(MORNING),
     # afterwards.
     first_free = _earliest_dialable(now)
     span = _day_window(configs, {c["id"]: c["ready"] for c in listed},
-                       first_free.hour * 60 + first_free.minute, today, kind)
+                       first_free.hour * 60 + first_free.minute, today)
 
     return {
-        "date": day.isoformat(), "kind": kind, "wave": WAVE_LABEL[kind],
+        "date": day.isoformat(), "kind": kind, "pass_label": PASS_LABEL[kind],
         # What this answer is narrowed to. None = every armed campaign, so a
         # screen can tell "one agent's day" from "the whole day" without keeping
         # its own copy of what it asked for.
@@ -741,7 +667,7 @@ def get_day(date: Optional[str] = Query(None), kind: str = Query(MORNING),
 # Preparing
 # ---------------------------------------------------------------------------
 
-def prepare_day(day: Optional[date] = None, kind: str = MORNING,
+def prepare_day(day: Optional[date] = None, kind: str = FIRST_PASS,
                 resync: bool = False, agent_id: Optional[int] = None) -> dict[str, Any]:
     """Build (or rebuild) today's plan for every campaign in the daily plan.
 
@@ -758,7 +684,7 @@ def prepare_day(day: Optional[date] = None, kind: str = MORNING,
     stopped: list[int] = []
     if resync:
         # Before anything is planned, not after: a campaign paused in Formi since
-        # the morning must drop out of this wave, and its queued calls come off
+        # earlier today must drop out of this pass, and its queued calls come off
         # Formi's clock. One warehouse read for the whole pass, not one per
         # campaign. A warehouse we cannot reach is reported, never fatal — the
         # per-campaign lead re-sync below fails loudly enough on its own.
@@ -766,7 +692,8 @@ def prepare_day(day: Optional[date] = None, kind: str = MORNING,
         try:
             stopped = _resync_status(day, agent_id)
         except Exception as exc:                     # noqa: BLE001 — reported, not swallowed
-            log.warning("could not re-read campaign status before the %s wave: %s", kind, exc)
+            log.warning("could not re-read campaign status before the %s: %s",
+                        PASS_LABEL.get(kind, kind), exc)
 
     with session() as conn:
         where, params = _armed(agent_id)
@@ -774,7 +701,7 @@ def prepare_day(day: Optional[date] = None, kind: str = MORNING,
             f"SELECT id FROM campaigns WHERE {where} ORDER BY id", params)]
 
     results = [_prepare_one(campaign_id, day, kind, resync) for campaign_id in ids]
-    return {"date": day.isoformat(), "kind": kind, "wave": WAVE_LABEL[kind],
+    return {"date": day.isoformat(), "kind": kind, "pass_label": PASS_LABEL[kind],
             "campaigns": results, "stopped_in_formi": stopped,
             "ready": sum(r.get("ready", 0) for r in results),
             "prepared": sum(1 for r in results if r["status"] == "prepared")}
@@ -789,7 +716,7 @@ def _prepare_one(campaign_id: int, day: date, kind: str, resync: bool) -> dict[s
             out["resynced"] = _resync(campaign_id, day)
         except Exception as exc:                 # noqa: BLE001 — reported, not swallowed
             # Planning off a stale copy is worse than not planning: yesterday's
-            # counters would re-offer leads that already answered this morning.
+            # counters would re-offer leads that already answered earlier today.
             with session() as conn:
                 _note(conn, campaign_id, f"{day} {kind}: skipped, re-sync failed: {exc}")
             return {**out, "status": "resync_failed", "detail": str(exc)[:200]}
@@ -810,26 +737,20 @@ def _prepare_one(campaign_id: int, day: date, kind: str, resync: bool) -> dict[s
 
         try:
             cfg, red, dcfg, _now, leads, pairs = _evaluate(conn, campaign, day)
-            # The wave's half of the day, not the campaign's whole window: a
-            # 'morning' plan that dials at 19:00 is not a morning plan.
-            dcfg = _band(kind, dcfg)
-            # An empty band is not a closed one, and it is not caught by the
-            # guard below: on a past or future date `_floor_min` returns None and
-            # nothing else looks at the clock.
-            if dcfg.start_min >= dcfg.end_min:
-                return {**out, "status": "window_closed",
-                        "detail": f"this campaign's window has no "
-                                  f"{WAVE_LABEL[kind]} band"}
+            # Both passes get the campaign's whole window. The pass is decided by
+            # the leads' previous call, not by the hour, so there is nothing left
+            # here to narrow -- the engine has already withheld every lead that
+            # has not earned a second call today.
             floor = _floor_min(now_ist(), day, dcfg)
             if floor is not None and floor >= dcfg.end_min:
                 return {**out, "status": "window_closed",
-                        "detail": f"the {hhmm(dcfg.start_min)}-{hhmm(dcfg.end_min)} "
-                                  f"{WAVE_LABEL[kind]} band has closed"}
+                        "detail": f"the dial window {hhmm(dcfg.start_min)}-"
+                                  f"{hhmm(dcfg.end_min)} has closed"}
             run_id = _write_run(conn, campaign, day, kind, cfg["version"], pairs, red, dcfg,
-                                evaluated=len(leads), note=f"{WAVE_LABEL[kind]} plan, awaiting "
+                                evaluated=len(leads), note=f"{PASS_LABEL[kind]}, awaiting "
                                                            f"approval", floor_min=floor)
         except HTTPException as exc:
-            # 409 = this wave already went out today. That IS the "already ran"
+            # 409 = this pass already went out today. That IS the "already ran"
             # guard; preparing again is a no-op rather than a second plan.
             return {**out, "status": "already_ran", "detail": str(exc.detail)}
         except Exception as exc:                 # noqa: BLE001 — one campaign, not the day
@@ -837,7 +758,7 @@ def _prepare_one(campaign_id: int, day: date, kind: str, resync: bool) -> dict[s
 
         ready = conn.execute("SELECT COUNT(*) AS n FROM plan_items WHERE run_id=?",
                              (run_id,)).fetchone()["n"]
-        _note(conn, campaign_id, f"{day} {WAVE_LABEL[kind]}: {ready} ready, awaiting approval")
+        _note(conn, campaign_id, f"{day} {PASS_LABEL[kind]}: {ready} ready, awaiting approval")
     return {**out, "status": "prepared", "run_id": run_id, "ready": ready}
 
 
@@ -880,22 +801,21 @@ def approve_day(body: ApproveBody = Body(default_factory=ApproveBody)) -> dict[s
             results.append(_approve_one(conn, campaign, day, body.kind, buckets))
 
     posted = sum(r.get("posted", 0) for r in results)
-    return {"date": day.isoformat(), "kind": body.kind, "wave": WAVE_LABEL[body.kind],
+    return {"date": day.isoformat(), "kind": body.kind, "pass_label": PASS_LABEL[body.kind],
             "dry_run": dry_run(), "buckets": buckets or "all",
             "approved": sum(1 for r in results if r["status"] == "approved"),
             "posted": posted, "failed": sum(r.get("failed", 0) for r in results),
             # `dropped` is on every row now, not just the approved ones: a
             # campaign that never reached `_commit` still held leads, and scoring
-            # it zero is what made a wave of 12 closed windows read "0 scheduled ·
+            # it zero is what made a pass of 12 closed windows read "0 scheduled ·
             # 0 not scheduled" over 2,000 leads. See `_unspent`.
             #
             # `dropped` is already the whole of it. `_commit` adds the slots it
-            # retired for being in the past and the strays it refused for leaving
-            # the band to the count `_write_run` left behind for the leads
-            # `max_per_run` shed, so the run row carries one number meaning "did
-            # not dial". `expired` and `out_of_band` are that number's BREAKDOWN,
-            # not extra to it: adding `expired` back on top charged every retired
-            # slot twice, and a wave with 340 stale slots told the operator 680
+            # retired for being in the past to the count `_write_run` left behind
+            # for the leads `max_per_run` shed, so the run row carries one number
+            # meaning "did not dial". `expired` is that number's BREAKDOWN, not
+            # extra to it: adding `expired` back on top charged every retired
+            # slot twice, and a pass with 340 stale slots told the operator 680
             # leads were not scheduled -- inflated by exactly the commonest
             # reason a slot does not go out.
             "not_dialled": sum(r.get("dropped", 0) for r in results),
@@ -944,7 +864,7 @@ def _approve_one(conn: sqlite3.Connection, campaign: sqlite3.Row, day: date, kin
             _note(conn, campaign["id"],
                   f"{day} {kind}: NOT dialled — {status}" + (f": {detail}" if detail else ""))
         # `dropped` is the day's "not scheduled" number, and only the approved
-        # return ever carried one -- so a 19:45 wave where every campaign answers
+        # return ever carried one -- so a 19:45 pass where every campaign answers
         # `window_closed` told the operator 0 leads had missed out over 2,000 that
         # had. Wrong in the reassuring direction, which is the worst of the two.
         extra.setdefault("dropped", _unspent(plan))
@@ -966,15 +886,11 @@ def _approve_one(conn: sqlite3.Connection, campaign: sqlite3.Row, day: date, kin
 
     try:
         cfg, red, dcfg, now, leads, pairs = _evaluate(conn, campaign, day)
-        dcfg = _band(kind, dcfg)
-        if dcfg.start_min >= dcfg.end_min:
-            return failing("window_closed", run_id=run["id"],
-                           detail=f"this campaign's window has no {WAVE_LABEL[kind]} band")
         floor = _floor_min(now, day, dcfg)
         if floor is not None and floor >= dcfg.end_min:
             return failing("window_closed", run_id=run["id"],
-                           detail=f"the {hhmm(dcfg.start_min)}-{hhmm(dcfg.end_min)} "
-                                  f"{WAVE_LABEL[kind]} band has closed "
+                           detail=f"the dial window {hhmm(dcfg.start_min)}-"
+                                  f"{hhmm(dcfg.end_min)} has closed "
                                   f"(it is {now_ist().strftime('%H:%M')})")
         note = f"approved {now_ist().strftime('%H:%M')}"
         if buckets:
@@ -1002,12 +918,5 @@ def _approve_one(conn: sqlite3.Connection, campaign: sqlite3.Row, day: date, kin
     return {**out, "status": "approved", "run_id": result["id"],
             "posted": posted, "failed": failed,
             "dropped": result["counts"]["dropped"], "expired": result["expired"],
-            # Slots `_commit` refused for having drifted outside this wave's
-            # band. They are inside `dropped` already, but only as part of a
-            # number that also holds slots retired for being in the past -- two
-            # different things to do about them, and the operator was told
-            # neither. The per-run endpoints have always passed this through;
-            # a day-level approve dropped it on the floor.
-            "out_of_band": result["out_of_band"],
             "simulated": result["simulated"], "run": _run_json(
                 conn.execute("SELECT * FROM runs WHERE id=?", (result["id"],)).fetchone())}

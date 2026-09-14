@@ -125,8 +125,9 @@ export interface Run {
   id: number;
   campaign_id: number;
   run_date: string;
-  /** `auto` is the morning pass, `auto_pm` the afternoon one (`make_plan` in
-   *  `api/routes_core.py` writes both); `manual` is an operator-built run. */
+  /** `auto` is the day's first pass, `auto_pm` the recall pass after it
+   *  (`make_plan` in `api/routes_core.py` writes both); `manual` is an
+   *  operator-built run. */
   kind: 'auto' | 'auto_pm' | 'manual';
   status: RunStatus;
   config_version: number;
@@ -183,15 +184,15 @@ export interface AutopilotStatus {
    order, and whether it has been dialled. Nothing goes out until the day is
    approved, so `status` is the only thing an operator has to read. */
 
-/** `nothing_to_dial` is a plan that was built and came back EMPTY — the
- *  afternoon wave after a morning that booked every lead reaching it. `approved`
+/** `nothing_to_dial` is a plan that was built and came back EMPTY — the recall
+ *  pass after a first pass that booked every lead reaching it. `approved`
  *  was the server's answer here until 14 Sep 2026, and it was wrong twice over:
  *  nobody approved anything, and the screen that believed it offered neither
  *  Build nor Approve, so leads a later re-sync pulled in could not be planned at
  *  all. It is what `_approve_one` already calls this state for one campaign. */
 /** `part_prepared` is the same defect one state over: some campaigns acted on and
  *  at least one with no run at all — a campaign whose prepare failed, or one
- *  armed after the wave was approved. `{committed, not_prepared}` is a SET that
+ *  armed after the pass was approved. `{committed, not_prepared}` is a SET that
  *  matched no arm of the server's ladder and fell through to `approved`, whose
  *  hero offers only the call log; the picker's Save is greyed out for a campaign
  *  that is already armed, so those leads had no route onto the clock at all. */
@@ -257,7 +258,8 @@ export interface StrandedRun {
 }
 
 export interface DaySpread {
-  /** The hours this wave is allowed to dial into. */
+  /** The hours a pass is allowed to dial into. The same for both passes —
+   *  neither owns half the day. */
   band: DialWindow;
   /** Hour of day ("9".."19") -> calls actually put on the clock. */
   hours: Record<string, number>;
@@ -266,7 +268,8 @@ export interface DaySpread {
 export interface DayView {
   date: string;
   kind: string;
-  wave: string;
+  /** "first pass" / "recall pass" — `PASS_LABEL` in api/day.py. */
+  pass_label: string;
   /** What this answer is narrowed to. Null when the day is not scoped to one
    *  agent, in which case every list here spans every armed campaign. Absent
    *  from a server that predates per-agent scoping — which cannot narrow, so an
@@ -305,7 +308,7 @@ export interface DayView {
    *  called — nothing else in this console reports them. */
   stranded: StrandedRun[];
   /** How many distinct PEOPLE those runs hold. An unapproved plan is rebuilt for
-   *  the same leads the next morning, so summing the rows' `slots` multiplies one
+   *  the same leads the next day, so summing the rows' `slots` multiplies one
    *  backlog by the days it sat — 544 leads over a fortnight read as "7,616 calls
    *  never dialled". Each row's `slots` is still true of that row; this is the
    *  only number that is true of the backlog. */
@@ -315,7 +318,8 @@ export interface DayView {
 export interface PrepareResult {
   date: string;
   kind: string;
-  wave: string;
+  /** "first pass" / "recall pass" — `PASS_LABEL` in api/day.py. */
+  pass_label: string;
   ready: number;
   prepared: number;
   campaigns: Array<{
@@ -349,7 +353,8 @@ export interface PrepareResult {
 export interface ApproveResult {
   date: string;
   kind: string;
-  wave: string;
+  /** "first pass" / "recall pass" — `PASS_LABEL` in api/day.py. */
+  pass_label: string;
   dry_run: boolean;
   buckets: string[] | 'all';
   approved: number;
@@ -368,15 +373,6 @@ export interface ApproveResult {
     /** Present whenever a run exists to act on — which is every outcome except
      *  `not_prepared`, where there is nothing to retry. */
     run_id?: number;
-    /** Slots the dial path refused for having drifted outside this wave's band —
-     *  leads that were NOT called. They are inside `not_dialled` already, but
-     *  only as part of a number that also holds slots retired for being in the
-     *  past, and the two want different things done about them.
-     *
-     *  Optional because it is newer than this field list: a bundle that ships
-     *  ahead of the API sees nothing here. Absent is not zero — read it through
-     *  `outOfBand`, which says which of the two it is. */
-    out_of_band?: number;
   }>;
 }
 

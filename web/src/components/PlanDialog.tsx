@@ -197,7 +197,7 @@ export function PlanDialog({
       ) : (
         <p className="cell-dim" style={{ marginBottom: 0 }}>
           {isToday && start > (saved?.start ?? '09:30')
-            ? `Nothing is placed before ${start} — the morning has already gone. `
+            ? `Nothing is placed before ${start} — those hours have already gone. `
             : ''}
           Slots are spread across this range. Nothing is dialled until you approve.
         </p>
