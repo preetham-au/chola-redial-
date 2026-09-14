@@ -23,6 +23,7 @@ import {
   dispLabel,
   isIntensive,
   narrowedBuckets,
+  shortCallHint,
 } from '../lib/domain';
 import { useAsync, useCampaign, useStore } from '../lib/store';
 import { useCampaignPause } from '../components/AgentBar';
@@ -331,6 +332,18 @@ export function ConfigScreen({ focusBucket = null }: { focusBucket?: string | nu
                   : 'Every lead in the twice-a-day buckets gets both calls. Pick dispositions to ' +
                     'give the afternoon call only to leads that were not reached.'}
               </span>
+            </div>
+
+            <div style={{ marginTop: 12 }}>
+              <Num
+                label="Short call (s)"
+                hint="0 = chase every undispositioned call"
+                v={draft.short_call_seconds ?? 0}
+                onChange={(v) => patch({ short_call_seconds: v })}
+                min={0}
+                max={120}
+              />
+              <span className="field-hint">{shortCallHint(draft.short_call_seconds)}</span>
             </div>
           </Card>
         </div>

@@ -62,6 +62,11 @@ export interface Config {
   /** Who earns the SECOND daily call in F5/F6/M0. Absent or empty = everyone in
    *  those buckets, which is the historic behaviour. */
   second_call_dispositions?: string[];
+  /** Fallback when the first call recorded NO disposition: chase it only if it
+   *  ran under this many seconds. `0` / `null` switches the duration filter off,
+   *  so EVERY undispositioned call is chased. Never consulted when a disposition
+   *  is present. Absent on an older server. */
+  short_call_seconds?: number | null;
   mandatory_days: number[];
   /** Dispositions a mandatory day may NOT override. Absent on an older server. */
   never_dial?: string[];

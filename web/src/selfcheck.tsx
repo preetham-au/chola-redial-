@@ -68,6 +68,7 @@ import {
   n,
   narrowedBuckets,
   passState,
+  shortCallHint,
 } from './lib/domain';
 import type {
   Agent, ApproveResult, Campaign, Config, DayCampaign, DaySpread, DialWindow, PrepareResult,
@@ -1145,6 +1146,25 @@ ok(
      passState('15:00', fired, 'auto_pm', '15:00') === 'missed');
   ok('a server too old to send its clock claims nothing',
      passState('15:00', fired, 'auto_pm', '') === 'waiting');
+}
+
+// --- the short-call fallback says which way round it is ---------------------
+// A zero here is the AGGRESSIVE setting -- the filter is off and every
+// undispositioned call is chased -- which is the opposite of how an operator
+// reads a zero. 16 live campaigns are stored that way. The two branches must
+// not be swappable without this going red, so each is pinned on a word that
+// appears in one of them only.
+{
+  ok('a threshold names the seconds and says it only applies without a disposition',
+     shortCallHint(15).includes('under 15s') && shortCallHint(15).includes('NO disposition'));
+  ok('a threshold does NOT claim the filter is off',
+     !shortCallHint(15).includes('OFF'));
+  ok('zero says the filter is off and everything is chased',
+     shortCallHint(0).includes('OFF') && shortCallHint(0).includes('whatever its length'));
+  ok('an older config storing null reads the same as zero',
+     shortCallHint(null) === shortCallHint(0));
+  ok('zero never names a second count that would imply a threshold',
+     !/\d+s/.test(shortCallHint(0)));
 }
 
 // --- RED band ranges read in the client's terms, not raw dte ---------------

@@ -413,6 +413,24 @@ export function dialWindowError(start: string, end: string): string | null {
   return null;
 }
 
+/**
+ * The fallback is consulted ONLY when a call recorded no disposition at all.
+ * A threshold chases just the calls that ran under it; `0` (or null, which an
+ * older stored config may hold) switches the duration filter OFF, so every
+ * undispositioned call is chased however long it ran. The off case is the
+ * MORE aggressive one, which is the opposite of how a zero usually reads —
+ * hence the explicit wording rather than a bare number.
+ */
+export function shortCallHint(seconds: number | null | undefined): string {
+  if (!seconds) {
+    return 'The duration filter is OFF, so every call that recorded no disposition is ' +
+      'chased again whatever its length. Set a threshold to chase only the short ones.';
+  }
+  return `Only used when a call recorded NO disposition: under ${seconds}s nobody was ` +
+    'really reached, so it is chased again. A call with a disposition is taken at its ' +
+    'word however long it ran.';
+}
+
 export const fmt = new Intl.NumberFormat('en-IN');
 
 export function n(v: number | null | undefined): string {
