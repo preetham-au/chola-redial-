@@ -133,6 +133,30 @@ def leads_source() -> str:
     return (os.environ.get("LEADS_SOURCE") or "seed").strip().lower()
 
 
+def leads_source_effective(conn: sqlite3.Connection) -> str:
+    """"seed" or "warehouse", answered by the data rather than by `.env`.
+
+    `LEADS_SOURCE` is a hand-set string nobody edits after a sync, and its
+    default is "seed", so a box holding thousands of real warehouse leads still
+    reports "seed" unless somebody remembered. Seed campaign ids are 1-16 and
+    warehouse ids are 1400+ (see `purge_campaigns`), so the campaign table
+    settles it without being asked. The env var is the fallback for an empty
+    table only.
+
+    This is not cosmetic. On 14 Sep 2026 the production box had the shipped
+    `LEADS_SOURCE=seed` default with 22 real campaigns on it, and the one thing
+    that reads it -- `dial_log.verify_day` -- returned "no warehouse" on every
+    pass since the feature shipped. 1,364 real calls that day sat at
+    `verified='pending'` forever: the console could say what Formi ACCEPTED and
+    could never say what Formi DIALLED, which is the whole question the dial log
+    exists to answer.
+    """
+    row = conn.execute("SELECT COUNT(*) AS n, MAX(id) AS top FROM campaigns").fetchone()
+    if not row["n"]:
+        return leads_source()
+    return "warehouse" if (row["top"] or 0) >= 1000 else "seed"
+
+
 def formi_token() -> str | None:
     """The bearer for a live Formi write, or None if nothing is configured.
 
@@ -324,6 +348,23 @@ SUPERSEDED_FREQUENCY = {
 SUPERSEDED_WINDOWS = {("09:30", "19:00")}
 
 
+# Every `never_dial` list this app has shipped as a default and has since
+# extended. Same reasoning as the two above, and the same proof: a campaign
+# storing one of these verbatim never had it edited, so it is an old default
+# rather than an operator's choice.
+#
+# This is not cosmetic. On 14 Sep 2026, 85 of the 101 saved configs held the
+# first list below -- the one from before `policy_expired` was added -- so the
+# mandatory days would have overridden that exclusion on every one of them. A
+# new slug in NEVER_DIAL reaches nothing without this.
+SUPERSEDED_NEVER_DIAL = {
+    ("do_not_call", "dnc", "dnd", "renewed", "already_paid_to_chola",
+     "wrong_number", "number_not_working", "invalid_number"),
+    ("do_not_call", "dnc", "dnd", "renewed", "already_paid_to_chola",
+     "wrong_number", "number_not_working", "invalid_number", "policy_expired"),
+}
+
+
 def _signature(table: Any) -> tuple:
     try:
         return tuple((str(r["bucket"]), int(r["from_dte"]), int(r["to_dte"]),
@@ -342,16 +383,20 @@ def with_defaults(body: dict[str, Any]) -> dict[str, Any]:
     rules on all 22 live campaigns), and a value corrected later stays wrong
     there forever.
 
-    Merging the defaults underneath fixes the first. `SUPERSEDED_FREQUENCY`
-    fixes the second for the one value we can prove nobody chose, because it is
-    a verbatim copy of a default we used to ship. An operator's own table does
-    not match any of those, so it is left alone.
+    Merging the defaults underneath fixes the first. `SUPERSEDED_FREQUENCY`,
+    `SUPERSEDED_WINDOWS` and `SUPERSEDED_NEVER_DIAL` fix the second for the
+    values we can prove nobody chose, because each is a verbatim copy of a
+    default we used to ship. An operator's own list does not match any of those,
+    so it is left alone.
     """
     if _signature(body.get("frequency_table")) in SUPERSEDED_FREQUENCY:
         body = {**body, "frequency_table": DEFAULT_CONFIG["frequency_table"]}
     saved_window = body.get("dial_window") or {}
     if (str(saved_window.get("start")), str(saved_window.get("end"))) in SUPERSEDED_WINDOWS:
         body = {**body, "dial_window": dict(DEFAULT_CONFIG["dial_window"])}
+    saved_never = body.get("never_dial")
+    if isinstance(saved_never, list) and tuple(saved_never) in SUPERSEDED_NEVER_DIAL:
+        body = {**body, "never_dial": list(DEFAULT_CONFIG["never_dial"])}
     return {**DEFAULT_CONFIG, **body}
 
 

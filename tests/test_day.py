@@ -1560,3 +1560,67 @@ def test_an_auto_timed_test_call_is_free_of_the_dial_window(client, pin_clock, h
     expected = (now + timedelta(minutes=FORMI_LEAD_MINUTES)).strftime("%Y-%m-%dT%H:%M:00")
     assert body["would_post"]["body"]["scheduled_time"] == expected, \
         f"a {hour:02d}:00 rehearsal must go out at {hour:02d}:{FORMI_LEAD_MINUTES:02d} today"
+
+
+def test_a_stored_never_dial_list_we_used_to_ship_is_brought_up_to_date():
+    """A saved config is a snapshot, so a new protected slug reaches nobody.
+
+    On 14 Sep 2026, 85 of the 101 saved configs held the eight-slug list this
+    app shipped before `policy_expired` was added -- and `with_defaults` merges
+    the defaults UNDERNEATH the body, so every one of those campaigns would have
+    let a mandatory day override that exclusion. Adding a slug to NEVER_DIAL is
+    only half the change; this is the other half.
+
+    An operator's own list is not one of the shipped ones, so it is left alone.
+    That is the line between a migration and overwriting somebody's decision.
+    """
+    from api.db import DEFAULT_CONFIG, SUPERSEDED_NEVER_DIAL, with_defaults
+
+    for shipped in SUPERSEDED_NEVER_DIAL:
+        merged = with_defaults({"never_dial": list(shipped)})
+        assert merged["never_dial"] == DEFAULT_CONFIG["never_dial"], shipped
+        assert "not_interested" in merged["never_dial"]
+        assert "policy_expired" in merged["never_dial"]
+
+    mine = ["dnd", "renewed"]
+    assert with_defaults({"never_dial": mine})["never_dial"] == mine, \
+        "a list nobody shipped is the operator's own -- never replace it"
+
+
+def test_verification_follows_the_data_not_the_env_var(client):
+    """`LEADS_SOURCE` defaults to "seed", and that switched verification off.
+
+    Found on 14 Sep 2026. The production box had never set `LEADS_SOURCE`, so
+    `verify_day` took its "no warehouse" exit on every pass since the dial log
+    shipped: 1,364 real calls that day sat at `verified='pending'` forever. The
+    console could say what Formi ACCEPTED and could never say what Formi
+    DIALLED -- the one question the dial log exists to answer.
+
+    So the campaign table decides it, exactly as `/api/health` already did:
+    seed ids are 1-16, warehouse ids 1400+ (`api.db.purge_campaigns`).
+    """
+    import os
+    import sqlite3
+
+    from api.db import leads_source_effective, session
+
+    assert os.environ["LEADS_SOURCE"] == "seed", "this test is about that default"
+
+    # A scratch table, not the suite's: whether a warehouse-id campaign is
+    # already in the shared DB depends on which tests ran first, and the rule
+    # under test is about ids, not about this file's fixtures.
+    scratch = sqlite3.connect(":memory:")
+    scratch.row_factory = sqlite3.Row
+    scratch.execute("CREATE TABLE campaigns (id INTEGER PRIMARY KEY)")
+    assert leads_source_effective(scratch) == "seed", "an empty table falls back to the env"
+    scratch.execute("INSERT INTO campaigns (id) VALUES (14)")
+    assert leads_source_effective(scratch) == "seed", "seed ids are 1-16"
+    scratch.execute("INSERT INTO campaigns (id) VALUES (1400)")
+    assert leads_source_effective(scratch) == "warehouse", \
+        "a real warehouse campaign must beat the env var's seed default"
+    scratch.close()
+
+    # And the endpoint an operator reads before a live dial agrees with it.
+    with session() as conn:
+        expected = leads_source_effective(conn)
+    assert client.get("/api/health").json()["leads_source"] == expected

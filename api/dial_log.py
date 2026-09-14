@@ -27,7 +27,7 @@ from typing import Any, Iterable, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 
-from .db import leads_source, now_ist, now_iso, session
+from .db import leads_source_effective, now_ist, now_iso, session
 
 router = APIRouter()
 log = logging.getLogger("redial.dial_log")
@@ -195,12 +195,15 @@ def verify_day(day: Optional[str] = None) -> dict[str, Any]:
     local log, so it is unaffected by DRY_RUN and can never place a call.
     """
     day = _day(day)
-    if leads_source() == "seed":
-        return {"date": day, "checked": 0, "skipped": "no warehouse (LEADS_SOURCE=seed)"}
     if not _verifying.acquire(blocking=False):
         return {"date": day, "checked": 0, "skipped": "a verify pass is already running"}
     try:
         with session() as conn:
+            # Asked of the campaign table, not of LEADS_SOURCE: that env var
+            # defaults to "seed", and a production box that never set it turned
+            # verification off silently for every call it ever placed.
+            if leads_source_effective(conn) == "seed":
+                return {"date": day, "checked": 0, "skipped": "no warehouse (seed data)"}
             open_rows = conn.execute(
                 "SELECT id, campaign_id, lead_uuid, scheduled_time FROM dial_log "
                 f"WHERE dry_run=0 AND verified IN ({','.join('?' * len(OPEN))}) "

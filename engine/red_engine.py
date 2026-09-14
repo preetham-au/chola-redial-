@@ -385,6 +385,11 @@ NEVER_DIAL: tuple[str, ...] = (
     "wrong_number", "number_not_working", "invalid_number",
     # the renewal window has closed — there is nothing left for RED−1/RED to save
     "policy_expired",
+    # the customer has said no. Operator's decision of 14 Sep 2026: on 14 Sep the
+    # mandatory-day override put 8 calls into leads marked `not_interested` at
+    # dte 0 and dte 1. A last chance to save a policy is not a reason to ring
+    # somebody who has already refused it, so these two join the exceptions.
+    "not_interested", "firm_decision_to_discontinue",
 )
 
 
@@ -403,10 +408,11 @@ class RedConfig:
     # cases excluding the renewed and DND cases, calls need to be initiated on
     # RED−1 and RED date, irrespective of the disposition status" -- so on those
     # two days an exclusion or a hold is not a veto, it is a preference. These
-    # are the exceptions, and they are the three kinds that stay exceptions:
-    # consent withdrawn, the policy already renewed, and a number known to be
-    # wrong. Dialling one of those on RED−1 is not a last chance to save the
-    # policy, it is a complaint or a stranger's phone ringing.
+    # are the exceptions, and they are the four kinds that stay exceptions:
+    # consent withdrawn, the policy already renewed, a number known to be wrong,
+    # and a customer who has refused. Dialling one of those on RED−1 is not a
+    # last chance to save the policy, it is a complaint or a stranger's phone
+    # ringing.
     never_dial: frozenset[str] = frozenset(NEVER_DIAL)
 
     # Hard per-calendar-day ceiling inside the intensive windows.

@@ -73,13 +73,19 @@ enforced server-side.
   // On a mandatory day the client's rule inverts the exclusion ladder: "for all
   // cases excluding the renewed and DND cases, calls needs to be initiated on
   // RED−1 and RED date, irrespective of the disposition status". So RED−1 and
-  // RED dial a `not_interested` or `human_review` lead, and `never_dial` lists
-  // the only slugs that still veto — consent, already renewed, bad number.
+  // RED dial a `human_review` lead, and `never_dial` lists the only slugs that
+  // still veto — consent, already renewed, bad number, renewal window closed,
+  // and (from 14 Sep 2026) a customer who has refused.
   // `extra_exclusions` slugs are added to this set automatically.
   // `other_language` and unmapped dispositions also still veto: a call no agent
   // can hold, or one whose disposition we do not recognise, is not a last chance.
+  //
+  // A campaign whose stored `never_dial` is verbatim one of the lists this app
+  // used to ship is upgraded to the current default on read — see
+  // `SUPERSEDED_NEVER_DIAL` in api/db.py. A list the operator edited is not.
   "never_dial": ["do_not_call","dnc","dnd","renewed","already_paid_to_chola",
-                 "wrong_number","number_not_working","invalid_number"],
+                 "wrong_number","number_not_working","invalid_number",
+                 "policy_expired","not_interested","firm_decision_to_discontinue"],
   "calls_per_day_cap": 2,
   "same_day_gap_hours": 3.0,
   "shift_from_last_hours": 2.0,   // time rotation: yesterday 09:00 -> today 11:00

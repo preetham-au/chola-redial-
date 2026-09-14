@@ -609,10 +609,15 @@ def test_a_rejected_stage_write_stops_and_carries_formis_reason():
 # the disposition status." The exclusion ladder used to run first, so ~400
 # not_interested/lost leads and 2.7k in human_review silently lost the two days
 # that matter most.
+#
+# `not_interested` and `firm_decision_to_discontinue` were on this list until
+# 14 Sep 2026, when the operator moved them to `never_dial` -- see the test
+# below. `lost` stays: it is the pipeline's own word for a stalled lead, not the
+# customer's word for no.
 
 @pytest.mark.parametrize("dte", [1, 0])
 @pytest.mark.parametrize("stage", [
-    "not_interested", "lost", "firm_decision_to_discontinue",   # were EXCLUDED
+    "lost",                                                      # was EXCLUDED
     "ai_qualified_lead", "lead_transferred_to_sales",
     "human_review", "agent_number", "chola_field_executive",     # were HOLD
     "requested_human_agent_connect", "alternate_contact_given",
@@ -630,15 +635,18 @@ def test_a_mandatory_day_overrides_an_exclusion_or_a_hold(stage, dte):
     "do_not_call", "dnc", "dnd",                    # consent — regulatory
     "renewed", "already_paid_to_chola",             # already renewed
     "wrong_number", "number_not_working", "invalid_number",   # not this customer
+    "policy_expired",                               # renewal window closed
+    "not_interested", "firm_decision_to_discontinue",         # they said no
 ])
 def test_consent_renewal_and_bad_numbers_survive_a_mandatory_day(stage, dte):
-    """The two exceptions the client named, plus numbers that reach a stranger."""
+    """The two exceptions the client named, plus numbers that reach a stranger,
+    a window that has closed, and a customer who has already refused."""
     decision = decide(lead(stage=stage, red=(TODAY + timedelta(days=dte)).isoformat()),
                       NOW, DEFAULT_CONFIG)
     assert decision.action != SCHEDULE, f"{stage} at dte={dte} would be dialled"
 
 
-@pytest.mark.parametrize("stage", ["not_interested", "human_review"])
+@pytest.mark.parametrize("stage", ["lost", "human_review"])
 def test_the_override_lasts_exactly_two_days(stage):
     """RED−2 and RED+1 are ordinary days: the exclusion holds again."""
     for dte in (2, -1):
@@ -921,6 +929,27 @@ def test_an_expired_policy_is_not_called_even_on_its_red_date():
     decision = decide(lead(stage="policy_expired", red=TODAY.isoformat()),
                       NOW, SHIPPED)
     assert decision.schedule is False
+
+
+def test_a_refused_lead_is_not_called_even_on_its_red_date():
+    """"Not interested" and "will not renew" outrank the mandatory days.
+
+    Operator's decision of 14 Sep 2026, taken from that day's own dial log: the
+    RED-1/RED override placed 8 calls into leads already marked
+    `not_interested`, all in bucket M0. EXCLUDED alone does not stop that --
+    those two days override an exclusion by design -- so both slugs are on
+    `never_dial`, which is the only thing they do not override.
+
+    Companion to the `policy_expired` test above. Same mechanism, different
+    reason: that one is "too late to save", this one is "they said no".
+    """
+    for slug in ("not_interested", "firm_decision_to_discontinue"):
+        assert slug in DEFAULT_CONFIG.never_dial, slug
+        for dte in (1, 0):                      # RED-1 and RED itself
+            decision = decide(
+                lead(stage=slug, red=(TODAY + timedelta(days=dte)).isoformat()),
+                NOW, SHIPPED)
+            assert decision.schedule is False, f"{slug} dialled at dte={dte}"
 
 
 def test_an_abstained_lead_is_still_called_on_its_red_date():

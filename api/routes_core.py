@@ -1110,9 +1110,15 @@ def post_rate_per_sec() -> float:
 #
 # The console gains nothing by the hurry. Every slot in the run is scheduled for
 # minutes or hours later -- filing them over a minute instead of two seconds
-# changes no call's time by one second. 5/s is slow enough to be invisible to
-# Formi and fast enough that 3000 slots take ten minutes rather than all day.
-DEFAULT_POST_RATE = 5.0
+# changes no call's time by one second.
+#
+# Raised from 5/s to 10/s on 14 Sep 2026 at the operator's request. The measured
+# cost of 5/s that day: 1,364 slots took 9.9 minutes wall-clock, and the busiest
+# minute hit 295 POSTs -- 4.9/s, i.e. the pacing was the binding constraint, not
+# Formi's latency. 10/s halves that and is still two orders off the unthrottled
+# burst this exists to prevent. Turn it down without a deploy by setting
+# FORMI_POST_RATE_PER_SEC on the box.
+DEFAULT_POST_RATE = 10.0
 # Rows per commit. The whole run used to land in one transaction written after
 # the last POST, so a timeout or a restart half way through lost every plan_items
 # row for calls that had ALREADY been placed -- and a re-approve then posted them
