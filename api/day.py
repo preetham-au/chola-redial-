@@ -843,6 +843,10 @@ def _dial_walk(day: date, kind: str, buckets: list[str], campaign_ids: list[int]
         for campaign_id in campaign_ids:
             if _dial_state["stopped"]:
                 break
+            # Held outside the try so the error row below can still say which
+            # campaign it was -- an unnamed failure in a list of twenty-two is
+            # a number the operator has to go and look up.
+            name = ""
             try:
                 # A connection per campaign, not one held for the whole walk: an
                 # approve can run ten minutes, and a writer holding SQLite open
@@ -862,14 +866,15 @@ def _dial_walk(day: date, kind: str, buckets: list[str], campaign_ids: list[int]
                             {"campaign_id": campaign_id, "name": "",
                              "status": "no_result"})
                         continue
+                    name = campaign["name"]
                     _dial_state["current"] = {"campaign_id": campaign_id,
-                                              "name": campaign["name"]}
+                                              "name": name}
                     result = _approve_one(conn, campaign, day, kind, buckets)
                 _dial_state["results"].append(result)
             except Exception as exc:             # noqa: BLE001 — one campaign, not the day
                 log.exception("dial walk failed on campaign %s", campaign_id)
                 _dial_state["results"].append(
-                    {"campaign_id": campaign_id, "name": "", "status": "error",
+                    {"campaign_id": campaign_id, "name": name, "status": "error",
                      "detail": f"{type(exc).__name__}: {exc}"[:200]})
             finally:
                 _dial_state["done"] += 1

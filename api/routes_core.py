@@ -821,6 +821,10 @@ def _commit(conn: sqlite3.Connection, run: sqlite3.Row, campaign: sqlite3.Row,
     if stale:
         conn.executemany("UPDATE plan_items SET status='expired' WHERE id=?",
                          [(r["id"],) for r in stale])
+        # Committed here, not with the counts at the end: everything between
+        # this line and there is minutes of network I/O, and an open write
+        # transaction across it locks every other writer out. See `flush`.
+        conn.commit()
     if dry_run():
         # No network I/O whatsoever: record exactly what would have been sent.
         conn.executemany(
@@ -1133,11 +1137,33 @@ def _dial_live(conn: sqlite3.Connection, campaign: sqlite3.Row, items,
 
     posted = failed = 0
     logged: list = []
+    marks: list[tuple] = []
     gap = 1.0 / rate if (rate := post_rate_per_sec()) else 0.0
     due = time.monotonic()
 
     def flush() -> None:
+        """The whole transaction: both writes and the commit, back to back.
+
+        Nothing may open this transaction earlier. SQLite allows exactly one
+        writer, and the per-slot UPDATE used to run inside the loop -- so the
+        write lock was held from the first POST of a batch to the last, fifty
+        paced posts later, longer still if any of them retried a 45s timeout.
+        Every other writer in the process waits on that, and `connect()` gives
+        up after 15 seconds.
+
+        On 14 Sep 2026 that cost four campaigns of a dial walk: the background
+        verify was re-sending Formi's lost slots down this same loop, the walk
+        reached campaign 1800, and `database is locked` failed it and the three
+        behind it. Marks are accumulated in memory instead and written in one
+        burst with no network between, so the lock is held for milliseconds.
+
+        The crash window is unchanged: up to one batch of calls placed with
+        their slots still `planned`, which a re-approve would send again.
+        """
+        conn.executemany(
+            "UPDATE plan_items SET status=?, http_status=?, response=? WHERE id=?", marks)
         dial_log.write(conn, logged)
+        marks.clear()
         logged.clear()
         conn.commit()
 
@@ -1158,8 +1184,7 @@ def _dial_live(conn: sqlite3.Connection, campaign: sqlite3.Row, items,
         status = response.status_code if response is not None else None
         body = response.text[:300] if response is not None else \
             f"no response after {attempts} attempts"
-        conn.execute("UPDATE plan_items SET status=?, http_status=?, response=? WHERE id=?",
-                     ("posted" if ok else "failed", status, body, item["id"]))
+        marks.append(("posted" if ok else "failed", status, body, item["id"]))
         logged.append(dial_log.row(
             campaign, item, source=source, url=_schedule_path(campaign["agent_id"],
                                                               item["lead_uuid"]),

@@ -26,6 +26,7 @@ inside the grace window and a stage that is not terminal.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import sqlite3
 from datetime import date, datetime, timedelta
@@ -42,6 +43,8 @@ from .db import current_config, now_ist, session
 # direction can be a plain import.
 from .day import _scope
 from .routes_core import _campaign, _campaign_json
+
+log = logging.getLogger("redial.autopilot")
 
 router = APIRouter()
 
@@ -98,8 +101,21 @@ def _stop(conn: sqlite3.Connection, campaign_id: int, why: str) -> None:
 
 
 def _note(conn: sqlite3.Connection, campaign_id: int, text: str) -> None:
-    conn.execute("UPDATE campaigns SET autopilot_note=? WHERE id=?", (text[:300], campaign_id))
-    conn.commit()
+    """Leave the campaign's one-line explanation of what just happened.
+
+    Best effort on purpose. `_approve_one`'s `failing()` calls this from inside
+    an exception handler, so a note that raises replaces a reportable failure
+    with an unreportable one: on 14 Sep 2026 four campaigns came back with no
+    name, no run_id and no reason, because this UPDATE hit the same lock that
+    had just failed their dial. The note is bookkeeping; the result is the
+    truth, and losing the first must not cost the second.
+    """
+    try:
+        conn.execute("UPDATE campaigns SET autopilot_note=? WHERE id=?",
+                     (text[:300], campaign_id))
+        conn.commit()
+    except Exception as exc:            # noqa: BLE001 -- see above
+        log.warning("could not note campaign %s (%s): %s", campaign_id, exc, text[:80])
 
 
 # ---------------------------------------------------------------------------

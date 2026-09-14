@@ -1813,3 +1813,70 @@ def test_a_stopped_dial_leaves_the_rest_planned_and_approvable(client):
                 "ORDER BY id DESC", (campaign_id, day)).fetchone()
             assert run["status"] == "planned", \
                 "a campaign the walk never reached must still be approvable"
+
+
+class _Ok:
+    """The narrowest thing `_dial_live` will accept as a successful POST."""
+
+    status_code = 200
+    text = "{}"
+
+
+def test_dialling_does_not_hold_the_database_while_it_posts(client, monkeypatch):
+    """A dial in flight must leave the database writable by everyone else.
+
+    `_dial_live` used to UPDATE each slot inside the posting loop, so Python
+    opened a write transaction on the first POST of a batch and held it until
+    the flush fifty paced posts later -- longer if any of them retried a 45s
+    timeout. SQLite allows one writer, so for that whole stretch nothing else
+    in the process could write.
+
+    On 14 Sep 2026 that cost four campaigns of a dial walk. The background
+    verify was re-sending the slots Formi had lost, down this same loop; the
+    walk reached campaign 1800, waited out `connect()`'s fifteen seconds on
+    `DELETE FROM plan_items`, and died -- as did 1804, 1805 and 1807 behind it.
+
+    The probe below is the other writer. One second, not fifteen: the question
+    is whether the lock is free WHILE a call is being placed, not whether it
+    frees up eventually.
+    """
+    import sqlite3
+
+    from api import routes_core
+    from api.db import db_path
+
+    blocked: list[str] = []
+    with session() as conn:
+        campaign = conn.execute("SELECT * FROM campaigns LIMIT 1").fetchone()
+
+    def _post(*_args):
+        other = sqlite3.connect(db_path(), timeout=1)
+        try:
+            other.execute("UPDATE campaigns SET autopilot_note='probe' WHERE id=?",
+                          (campaign["id"],))
+            other.commit()
+        except sqlite3.OperationalError as exc:
+            blocked.append(str(exc))
+        finally:
+            other.close()
+        return _Ok(), 1
+
+    monkeypatch.setenv("FORMI_POST_RATE_PER_SEC", "0")      # no pacing; this is not that test
+    monkeypatch.setattr(routes_core, "_formi_post", _post)
+
+    # plan_items ids that do not exist: the UPDATE matches nothing, which is all
+    # this needs. It is the transaction the loop holds that is under test.
+    items = [{"id": -900 - i, "lead_uuid": f"lock-{i}", "lead_name": "x",
+              "phone": "9000000000", "scheduled_time": "2026-09-14T10:00:00",
+              "slot_no": 1, "bucket": "F5", "campaign_id": campaign["id"]}
+             for i in range(5)]
+    conn = sqlite3.connect(db_path())
+    conn.row_factory = sqlite3.Row
+    try:
+        posted, failed = routes_core._dial_live(conn, campaign, items, "test")
+    finally:
+        conn.close()
+
+    assert (posted, failed) == (5, 0), "the probe must not have broken the dial itself"
+    assert not blocked, (
+        f"{len(blocked)} of 5 posts ran with the write lock held: {blocked[0]}")
