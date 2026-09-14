@@ -188,6 +188,74 @@ WHERE i.campaign_id = {int(campaign_id)}
     return updates
 
 
+# How many times a slot Formi accepted and then lost may be sent again. Two,
+# not unlimited: if Formi drops the same slot three times something about that
+# slot or that minute is refusing it, and a console that keeps asking every ten
+# minutes until the window shuts is a loop, not a repair.
+RESEND_LIMIT = 2
+
+
+def _resend_missing(conn: sqlite3.Connection, day: str) -> dict[str, Any]:
+    """Send again what Formi accepted and then lost. Called by the verify pass.
+
+    A 2xx is not proof. On 14 Sep 2026 Formi answered
+    `{"success": true, ..., "task_id": ...}` to all 1,364 calls of one run, by
+    customer name, and then created no interaction for 206 of them -- in three
+    contiguous blocks of slot time (17:17-17:23, 18:17-18:33, 19:51-19:59).
+    The console reported 1,364 posted / 0 failed and was right about every word
+    of it; the calls still did not happen.
+
+    So the pass that discovers the loss also repairs it, using the operator's
+    Retry machinery rather than any new dialling code: put the slot back to
+    `planned` and let `_commit` post it. Slots whose time has already gone are
+    left alone -- `posted` + `missing` is the true record of those, and
+    rewriting them as `expired` would erase the fact that we did send them.
+    """
+    from .routes_core import _campaign, _commit, _earliest_dialable   # noqa: PLC0415 — cycle
+
+    cutoff = _earliest_dialable(now_ist()).strftime("%Y-%m-%dT%H:%M:00")
+    lost = conn.execute("""
+SELECT dl.item_id AS item_id, dl.run_id AS run_id,
+       (SELECT COUNT(*) FROM dial_log d2
+         WHERE d2.item_id = dl.item_id AND d2.dry_run = 0) AS sends
+FROM dial_log dl
+JOIN plan_items pi ON pi.id = dl.item_id
+JOIN runs      r  ON r.id  = dl.run_id
+JOIN campaigns c  ON c.id  = dl.campaign_id
+WHERE dl.dry_run = 0 AND dl.verified = 'missing'
+  AND substr(dl.scheduled_time, 1, 10) = ?
+  AND dl.scheduled_time >= ?
+  AND pi.status = 'posted'
+  AND r.status  = 'committed'
+  AND c.paused = 0 AND c.enabled = 1
+""".strip(), (day, cutoff)).fetchall()
+
+    by_run: dict[int, list[int]] = {}
+    for r in lost:
+        if int(r["sends"]) <= RESEND_LIMIT:
+            by_run.setdefault(int(r["run_id"]), []).append(int(r["item_id"]))
+    if not by_run:
+        return {"resent": 0, "runs": {}}
+
+    done: dict[int, int] = {}
+    for run_id, item_ids in by_run.items():
+        try:
+            run = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            campaign = _campaign(conn, run["campaign_id"])
+            conn.executemany(
+                "UPDATE plan_items SET status='planned', http_status=NULL, response=NULL "
+                "WHERE id=?", [(i,) for i in item_ids])
+            conn.commit()
+            out = _commit(conn, run, campaign, "resending", source="resend")
+            done[run_id] = len(item_ids)
+            log.warning("resent %s slot(s) Formi lost on run %s: posted=%s failed=%s",
+                        len(item_ids), run_id, out["counts"]["posted"], out["counts"]["failed"])
+        except Exception as exc:        # one bad run must not stop the rest
+            log.warning("resend failed for run %s: %s", run_id, exc)
+            conn.rollback()
+    return {"resent": sum(done.values()), "runs": done}
+
+
 def verify_day(day: Optional[str] = None) -> dict[str, Any]:
     """Settle every open row scheduled on `day`. Safe to call on any schedule.
 
@@ -231,11 +299,14 @@ def verify_day(day: Optional[str] = None) -> dict[str, Any]:
                     "call_stage=?, call_disposition=?, duration_sec=? WHERE id=?", updates)
             _prune(conn)
             conn.commit()
+            # Only now, with `missing` written down, is there anything to repair.
+            repair = _resend_missing(conn, day)
             settled = conn.execute(
                 "SELECT verified, COUNT(*) c FROM dial_log WHERE dry_run=0 "
                 "AND substr(scheduled_time, 1, 10)=? GROUP BY verified", (day,)).fetchall()
         return {"date": day, "checked": len(updates), "campaigns": len(by_campaign),
-                "failed_campaigns": failures,
+                "failed_campaigns": failures, "resent": repair["resent"],
+                "resent_by_run": repair["runs"],
                 "by_state": {r["verified"]: r["c"] for r in settled}}
     finally:
         _verifying.release()

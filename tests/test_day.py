@@ -1624,3 +1624,86 @@ def test_verification_follows_the_data_not_the_env_var(client):
     with session() as conn:
         expected = leads_source_effective(conn)
     assert client.get("/api/health").json()["leads_source"] == expected
+
+
+def test_a_call_formi_accepted_and_then_lost_is_sent_again(client):
+    """A 2xx is not proof that a call exists, so verification repairs what it finds.
+
+    On 14 Sep 2026 Formi answered `{"success": true, ..., "task_id": ...}` to all
+    1,364 calls of one run, by customer name, and then created no interaction for
+    206 of them. The console reported 1,364 posted / 0 failed and was right about
+    every word of it. Nothing sent those calls again.
+
+    Two rules, both asserted here: a lost slot still in the future goes back out,
+    and a slot Formi has already lost `RESEND_LIMIT` times is left alone -- a
+    console that keeps asking every ten minutes until the window shuts is a loop,
+    not a repair.
+    """
+    from api.dial_log import RESEND_LIMIT, _resend_missing
+    from api.db import now_ist, session
+
+    day = now_ist().date().isoformat()
+    slot = (now_ist() + timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:00")
+    campaign_id = _arm_two_agents()[0][1]
+    run_id = _seed_run(campaign_id, day, "auto", "committed", 2)
+
+    with session() as conn:
+        items = [int(r["id"]) for r in conn.execute(
+            "SELECT id FROM plan_items WHERE run_id=? ORDER BY id", (run_id,))]
+        # Both went out and Formi lost both. The second has used up its resends.
+        conn.executemany(
+            "UPDATE plan_items SET status='posted', scheduled_time=? WHERE id=?",
+            [(slot, i) for i in items])
+        conn.executemany(
+            "INSERT INTO dial_log (created_at, campaign_id, run_id, item_id, source, "
+            "scheduled_time, dry_run, url, request_body, outcome, verified) "
+            "VALUES (?,?,?,?,'test',?,0,'','{}','placed','missing')",
+            [(f"{day}T10:00:00", campaign_id, run_id, items[0], slot)]
+            + [(f"{day}T10:00:00", campaign_id, run_id, items[1], slot)] * (RESEND_LIMIT + 1))
+        conn.commit()
+
+        out = _resend_missing(conn, day)
+        assert out["resent"] == 1, out
+        status = dict(conn.execute(
+            "SELECT id, status FROM plan_items WHERE run_id=?", (run_id,)).fetchall())
+        # DRY_RUN is on for the whole suite, so a re-posted slot reads `simulated`.
+        assert status[items[0]] == "simulated", "a lost slot must go back out"
+        assert status[items[1]] == "posted", "a slot lost RESEND_LIMIT times is left alone"
+
+        conn.execute("DELETE FROM dial_log WHERE run_id=?", (run_id,))
+        conn.commit()
+
+
+def test_a_lost_slot_whose_time_has_gone_is_not_sent_again(client):
+    """`posted` + `missing` is the true record of a call the day has moved past.
+
+    Re-posting it would ask Formi for a call at a time that has gone, and
+    rewriting it `expired` would erase the fact that we did send it. Neither is
+    an improvement on saying what happened. The lead returns in the next plan.
+    """
+    from api.dial_log import _resend_missing
+    from api.db import now_ist, session
+
+    day = now_ist().date().isoformat()
+    gone = (now_ist() - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:00")
+    campaign_id = _arm_two_agents()[0][1]
+    run_id = _seed_run(campaign_id, day, "auto", "committed", 1)
+
+    with session() as conn:
+        item = int(conn.execute("SELECT id FROM plan_items WHERE run_id=?",
+                                (run_id,)).fetchone()["id"])
+        conn.execute("UPDATE plan_items SET status='posted', scheduled_time=? WHERE id=?",
+                     (gone, item))
+        conn.execute(
+            "INSERT INTO dial_log (created_at, campaign_id, run_id, item_id, source, "
+            "scheduled_time, dry_run, url, request_body, outcome, verified) "
+            "VALUES (?,?,?,?,'test',?,0,'','{}','placed','missing')",
+            (f"{day}T10:00:00", campaign_id, run_id, item, gone))
+        conn.commit()
+
+        assert _resend_missing(conn, day)["resent"] == 0
+        assert conn.execute("SELECT status FROM plan_items WHERE id=?",
+                            (item,)).fetchone()["status"] == "posted"
+
+        conn.execute("DELETE FROM dial_log WHERE run_id=?", (run_id,))
+        conn.commit()
