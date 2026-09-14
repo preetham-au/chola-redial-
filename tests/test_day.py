@@ -1707,3 +1707,109 @@ def test_a_lost_slot_whose_time_has_gone_is_not_sent_again(client):
 
         conn.execute("DELETE FROM dial_log WHERE run_id=?", (run_id,))
         conn.commit()
+
+
+def _arm_many(count: int) -> list[int]:
+    """Arm `count` campaigns, agent be damned -- what the dial walk is about.
+
+    `_arm` gives one campaign per AGENT, and the seed DB has two, so `_arm(4)`
+    skips. The bug these tests cover is a day of twenty-two campaigns on ONE
+    agent that dialled one of them; the walk must be exercised over more
+    campaigns than there are agents.
+    """
+    with session() as conn:
+        ids = [r["id"] for r in conn.execute(
+            "SELECT id FROM campaigns ORDER BY id LIMIT ?", (count,))]
+        assert len(ids) == count, "fixture DB is smaller than this test needs"
+        conn.executemany("UPDATE campaigns SET autopilot=1, enabled=1, paused=0, "
+                         "hidden=0 WHERE id=?", [(i,) for i in ids])
+        conn.commit()
+    return ids
+
+
+def _await_dial(client, tries: int = 200) -> dict:
+    """Poll the walk until it stops. It runs on a thread; the test must not race it."""
+    import time
+    for _ in range(tries):
+        state = client.get("/api/day/dial").json()
+        if not state["running"]:
+            return state
+        time.sleep(0.05)
+    raise AssertionError(f"dial walk never finished: {state}")
+
+
+def test_the_dial_walks_every_campaign_without_the_browser(client):
+    """The day stopped after one campaign because the queue lived in the page.
+
+    On 14 Sep 2026 the operator pressed Dial on 22 campaigns. Campaign 1744's
+    approve was a single ten-minute request -- 11:09:09 to 11:19:05, 1,364 calls
+    -- and uvicorn logged no access line for it: nobody was on the other end of
+    the socket when it answered. The queue died with that request and the other
+    21 campaigns were never asked for. One campaign dialled.
+
+    So the walk is server-side and nothing about it depends on the browser
+    staying on the page.
+    """
+    ids = _arm_many(4)
+    day = now_ist().date().isoformat()
+    for campaign_id in ids:
+        _seed_run(campaign_id, day, "auto", "planned", 2)
+
+    started = client.post("/api/day/dial",
+                          json={"date": day, "kind": "auto", "campaign_ids": ids}).json()
+    assert started["running"] is True, "the dial must start and return, not block"
+    assert started["total"] == len(ids), "every named campaign belongs to the walk"
+
+    done = _await_dial(client)
+    assert done["done"] == len(ids), f"the walk stopped early: {done}"
+    walked = {r["campaign_id"] for r in done["results"]}
+    assert walked == set(ids), f"campaigns never reached: {set(ids) - walked}"
+
+
+def test_pressing_dial_twice_does_not_dial_twice(client):
+    """A button pressed again because nothing visibly happened must not re-dial."""
+    ids = _arm_many(2)
+    day = now_ist().date().isoformat()
+    for campaign_id in ids:
+        _seed_run(campaign_id, day, "auto", "planned", 2)
+
+    first = client.post("/api/day/dial",
+                        json={"date": day, "kind": "auto", "campaign_ids": ids}).json()
+    again = client.post("/api/day/dial",
+                        json={"date": day, "kind": "auto", "campaign_ids": ids}).json()
+    # Either it is still running -- in which case the second call returns that
+    # same walk -- or it finished between the two, which is not a second dial.
+    assert again["started_at"] == first["started_at"], "a second press started a second walk"
+    _await_dial(client)
+
+
+def test_a_stopped_dial_leaves_the_rest_planned_and_approvable(client):
+    """Stop breaks between campaigns; what it never reached was never posted.
+
+    Asserted as the invariant rather than as a stopwatch: a walk over simulated
+    campaigns can finish before a stop posted from the same thread is ever read,
+    so "it stopped at campaign 2" is not a fact any test can hold. What must be
+    true at every interleave is that each campaign is EITHER in the results OR
+    still `planned` -- never dialled-but-unreported, and never dropped from the
+    day with its plan spent.
+    """
+    ids = _arm_many(4)
+    day = now_ist().date().isoformat()
+    for campaign_id in ids:
+        _seed_run(campaign_id, day, "auto", "planned", 2)
+
+    client.post("/api/day/dial", json={"date": day, "kind": "auto", "campaign_ids": ids})
+    assert client.post("/api/day/dial/stop").json()["stopped"] is True
+
+    done = _await_dial(client)
+    reached = {r["campaign_id"] for r in done["results"]}
+    assert done["done"] == len(done["results"]), "a campaign was walked and not reported"
+    with session() as conn:
+        for campaign_id in set(ids) - reached:
+            # The run this test seeded, not an older one for the same day left by
+            # a test that ran earlier in this shared DB.
+            run = conn.execute(
+                "SELECT status FROM runs WHERE campaign_id=? AND run_date=? AND kind='auto' "
+                "ORDER BY id DESC", (campaign_id, day)).fetchone()
+            assert run["status"] == "planned", \
+                "a campaign the walk never reached must still be approvable"

@@ -11,7 +11,7 @@
  *  hours left, so it is the first thing on the page — above the buckets, which
  *  follow it.
  */
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   AlertTriangle,
   CircleSlash,
@@ -32,7 +32,8 @@ import { navigate, useAsync, useStore, type Toast } from '../lib/store';
 import { Card, Empty, Fact, Modal, TypeToConfirm } from '../components/ui';
 import { DayProgress, type ProgressRow } from '../components/DayProgress';
 import type {
-  Agent, ApproveResult, Campaign, DayBucket, DayCampaign, DaySpread, DayView, PrepareResult,
+  Agent, ApproveResult, Campaign, DayBucket, DayCampaign, DaySpread, DayView, DialState,
+  PrepareResult,
 } from '../lib/types';
 
 /** The two passes a day is made of. NOT two halves of the clock: both dial the
@@ -223,9 +224,15 @@ export const retryArgs = (args: ApproveArgs, campaign_ids: number[]): ApproveArg
  *
  *  One approve used to post every campaign in a single blocking request: on
  *  12 Sep 2026 the recall pass sent 2,967 calls that way, one timeout from
- *  losing the day, with nothing on screen but a spinner. Twelve requests of
- *  ~250 is the same work, queued, and it is what makes a progress bar possible
- *  at all.
+ *  losing the day, with nothing on screen but a spinner. Splitting it per
+ *  campaign is what makes a progress bar possible at all.
+ *
+ *  The WALK itself is no longer here — it is the server's, behind
+ *  `/api/day/dial`, because a single campaign is still a ten-minute request and
+ *  on 14 Sep 2026 one of those answered to a socket nobody was on any more,
+ *  taking the other twenty-one campaigns of the queue down with it. What this
+ *  still produces is the campaign LIST that goes out with the start, and the
+ *  denominator the progress bar counts against.
  *
  *  Only `campaign_ids` varies down the queue: every entry carries the SAME
  *  `args` the whole-day approve would have sent, so the scope is the panel's
@@ -1538,124 +1545,84 @@ function Stopped({ day }: { day: DayView }) {
   );
 }
 
-/** One campaign's share of the day: everything the merge below actually adds up.
+/** Give up on the STATUS endpoint after this many polls in a row fail.
  *
- *  Narrower than `ApproveResult` because a campaign whose request threw has no
- *  date, pass or dry-run flag of its own — and never needed one, since all four
- *  are read off the day rather than off a part. */
-export type ResultPart =
-  Pick<ApproveResult, 'buckets' | 'approved' | 'posted' | 'failed' | 'not_dialled' | 'campaigns'>;
+ *  Not a limit on the dial. The walk runs in the API process; nothing the
+ *  browser does reaches it, so a blip on the way to a status read is a blind
+ *  console, never a dead day. Reporting one as the other is how an operator
+ *  comes to dial a day twice. */
+const POLL_GIVE_UP = 5;
 
-/** Fold the per-campaign approves back into the one result the bar expects.
+/** Follow the server's walk to its end, reporting every answer on the way.
  *
- *  Every request covered a different campaign, so the totals are pure addition
- *  and no campaign can appear twice. An empty list — every campaign stopped
- *  before it started — still has to produce a valid result, or the modal has
- *  nothing to show. */
-export function mergeResults(parts: ResultPart[], day: DayView): ApproveResult {
-  const base: ApproveResult = {
-    date: day.date,
-    kind: day.kind,
-    pass_label: day.pass_label,
-    dry_run: day.dry_run,
-    buckets: 'all',
-    approved: 0,
-    posted: 0,
-    failed: 0,
-    not_dialled: 0,
-    campaigns: [],
-  };
-  return parts.reduce<ApproveResult>(
-    (acc, p) => ({
-      ...acc,
-      buckets: p.buckets,
-      approved: acc.approved + p.approved,
-      posted: acc.posted + p.posted,
-      failed: acc.failed + p.failed,
-      not_dialled: acc.not_dialled + p.not_dialled,
-      campaigns: [...acc.campaigns, ...p.campaigns],
-    }),
-    base,
-  );
+ *  What is left of `runQueue` once the queue moved server-side: the loop that
+ *  used to place the calls now only watches them being placed. Still a function
+ *  rather than a click handler's body, for the same reason as before — a click
+ *  is unreachable from the static check and an `await` is not, so this is the
+ *  part the check drives against a stubbed `fetch` and reads what really went on
+ *  the wire.
+ *
+ *  React stays on the other side of `on`, so this runs outside a DOM. */
+export async function pollDial(
+  on: (state: DialState) => void,
+  wait: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+  every = 1000,
+): Promise<DialState> {
+  let misses = 0;
+  for (;;) {
+    try {
+      const state = await api.dialStatus();
+      misses = 0;
+      on(state);
+      if (!state.running) return state;
+    } catch (e) {
+      // One failed read is a blip; POLL_GIVE_UP of them in a row is a console
+      // that has lost the server, and saying so beats a bar frozen for ever.
+      if (++misses >= POLL_GIVE_UP) throw e;
+    }
+    await wait(every);
+  }
 }
 
-/** The row a campaign gets when the approve answered with none of its own.
+/** The progress list, rebuilt from the server's answer rather than accumulated.
  *
- *  `approve_day` loops the campaigns that are armed RIGHT NOW and `continue`s
- *  past any requested id that is no longer one — disarmed by the 15:00
- *  unattended pass, by a picker hide, or by a Formi pause picked up in
- *  `_resync_status` between the queue being built and this entry being reached.
- *  It answers 200 with `campaigns: []`, and `[].every(...)` is `true`: the
- *  progress row went green, `mergeResults` added nothing, and the result read
- *  "Every selected lead is on the clock" over ~250 leads nobody dialled.
+ *  Derived, not remembered: the walk's own `results` and `current` are the whole
+ *  truth about where it has got to, so a modal reopened half way through renders
+ *  the same list as one that was never closed — which is the point of the walk
+ *  living on the server at all.
  *
- *  A campaign that came back with no result did not succeed, so it gets a row
- *  of its own, under its own name, in the one place the operator reads. */
-const noResult = (c: ReturnType<typeof dialQueue>[number]): ApproveResult['campaigns'][number] =>
-  ({ campaign_id: c.campaign_id, name: c.name, status: 'no_result' });
-
-/** The part a campaign contributes when its request never came back at all.
- *
- *  A 502 from the proxy, a timeout, a `conn.commit()` that lost a SQLite lock.
- *  The campaign WAS started, so it has a progress row and `stoppedShort` counts
- *  it as reached — without a part of its own it is absent from the result, from
- *  `problems` and from the Retry, and the modal reads "11 approved" over a
- *  twelfth campaign nothing anywhere names. The counts stay zero because a
- *  request that threw never said what it did; retrying is safe either way, as a
- *  campaign that did commit answers the retry `already_committed` rather than
- *  dialling twice. */
-const threw = (c: ReturnType<typeof dialQueue>[number], err: string): ResultPart => ({
-  buckets: c.args[2],
-  approved: 0,
-  posted: 0,
-  failed: 0,
-  not_dialled: 0,
-  campaigns: [
-    { campaign_id: c.campaign_id, name: c.name, status: 'request_failed', detail: err },
-  ],
-});
-
-/** Walk the queue, one request at a time, reporting each campaign as it goes.
- *
- *  The loop itself, lifted out of the click handler that used to hold it. A
- *  click is unreachable from the static check, but an `await` is not: as a
- *  function the check drives it with a stubbed `fetch` and reads what actually
- *  went on the wire — which is the deliverable. Written inline, collapsing the
- *  queue back into one whole-day `api.approveDay(...args)` — the 2,967-calls-in-
- *  one-request bug — passed the whole gate green, and so did deleting the
- *  `stopped()` break that makes the Stop button do anything.
- *
- *  React stays on the other side of `on`: this function knows nothing about
- *  `setState` or toasts, which is what lets it run outside a DOM. */
-export async function runQueue(
-  queue: ReturnType<typeof dialQueue>,
-  on: (c: ReturnType<typeof dialQueue>[number], state: ProgressRow['state'], err?: string) => void,
-  stopped: () => boolean,
-): Promise<ResultPart[]> {
-  const merged: ResultPart[] = [];
-  for (const c of queue) {
-    if (stopped()) break;
-    on(c, 'running');
-    try {
-      const out = await api.approveDay(...c.args);
-      // Never `out.campaigns` raw: an empty list is a campaign that was skipped,
-      // not a campaign that succeeded, and `every` on it says the opposite.
-      const rows = out.campaigns.length > 0 ? out.campaigns : [noResult(c)];
-      merged.push({ ...out, campaigns: rows });
-      on(c, rows.every((r) => r.status === 'approved' && !r.failed) ? 'done' : 'failed');
-    } catch (e) {
-      // One campaign failing must not end the day for the rest — and must not
-      // vanish from it either: the progress list dies with the modal.
-      merged.push(threw(c, (e as Error).message));
-      on(c, 'failed', (e as Error).message);
-    }
+ *  Names come from the queue because the walk has none for the campaigns it
+ *  could not load: a campaign disarmed mid-walk answers `no_result` with an
+ *  empty name, and a row reading "campaign 1744" in the one list the operator
+ *  watches is the same defect as no row at all. */
+export function dialRows(
+  state: DialState,
+  /** Anything that knows the campaigns' names — `dialQueue`'s output in the
+   *  screen, a literal in the check. It is read for names and nothing else. */
+  queue: { campaign_id: number; name: string }[],
+): ProgressRow[] {
+  const named = new Map(queue.map((c) => [c.campaign_id, c.name]));
+  const rows: ProgressRow[] = state.results.map((r) => ({
+    campaign_id: r.campaign_id,
+    name: r.name || named.get(r.campaign_id) || `campaign ${r.campaign_id}`,
+    // `approved` with refused calls in it is not a clean campaign — the same
+    // test the per-campaign walk used to make before it drew the row green.
+    state: r.status === 'approved' && !r.failed ? 'done' : 'failed',
+  }));
+  if (state.current) {
+    rows.push({
+      campaign_id: state.current.campaign_id,
+      name: state.current.name || named.get(state.current.campaign_id) || '',
+      state: 'running',
+    });
   }
-  return merged;
+  return rows;
 }
 
 /** What a Stop left behind, in the one place the operator reads afterwards.
  *
- *  Stopping breaks `runQueue` mid-walk, and the result modal then REPLACES the
+ *  Stopping breaks the walk between campaigns, and the result modal then
+ *  REPLACES the
  *  one holding the progress list — so the campaigns the queue never reached
  *  vanished with it and the operator was left reading a result for five
  *  campaigns having ticked twelve, with nothing saying the other seven had not
@@ -1663,9 +1630,9 @@ export async function runQueue(
  *  so its plan items are still `planned` and approving the day again sends
  *  exactly those. That is the sentence.
  *
- *  `reached` is how many campaigns the queue actually started — one progress row
- *  each — so this needs no flag from the Stop button: a run that ended on its
- *  own reached all of them and says nothing. */
+ *  `reached` is the walk's own `done` — campaigns it started and reported — so
+ *  this needs no flag from the Stop button: a run that ended on its own reached
+ *  all of them and says nothing. */
 export function stoppedShort(queued: number, reached: number): string | null {
   const left = queued - reached;
   if (left < 1) return null;
@@ -1705,7 +1672,10 @@ export function ApproveDay({
   const [res, setRes] = useState<ApproveResult>();
   const [progress, setProgress] = useState<ProgressRow[]>([]);
   const [current, setCurrent] = useState<string | null>(null);
-  const stop = useRef(false);
+  // How far the walk got, for the Stop sentence. From the server, not from the
+  // length of `progress`: a modal opened over a walk already running has no row
+  // for the campaigns it missed, and counting rows would call them unreached.
+  const [walked, setWalked] = useState({ total: 0, done: 0 });
 
   const ready = day.buckets
     .filter((b) => shown.includes(b.bucket))
@@ -1718,8 +1688,8 @@ export function ApproveDay({
   // The panel's two witnesses of its own scope, compared. Non-null means they
   // disagree, and nothing is offered until they stop.
   const mismatch = scopeMismatch(args, day);
-  // One request per campaign, all sharing `args`. Read twice — to dial, and for
-  // the progress bar's denominator — so both count the same campaigns.
+  // The campaigns that go out with the start, and the progress bar's
+  // denominator. Read once, used for both, so they cannot count differently.
   const queue = dialQueue(args, day);
 
   // Has a call already been placed for these leads? The engine answered that at
@@ -1749,35 +1719,59 @@ export function ApproveDay({
     }
   };
 
-  /** Everything the queue reports, turned back into screen. The only part of the
-   *  dial that needs React, and so the only part the static check cannot run. */
-  const onCampaign = (
-    c: (typeof queue)[number],
-    state: ProgressRow['state'],
-    err?: string,
-  ) => {
-    if (state === 'running') {
-      setCurrent(c.name);
-      setProgress((p) => [...p, { campaign_id: c.campaign_id, name: c.name, state }]);
-      return;
-    }
-    if (err !== undefined) toast('bad', `${c.name}: ${err}`);
-    setProgress((p) => p.map((r) => (r.campaign_id === c.campaign_id ? { ...r, state } : r)));
-  };
-
-  /** One campaign per request, in order, waiting for each. */
-  const submit = async () => {
-    if (mismatch) return; // a panel that disagrees with itself dials nothing
+  /** Watch the walk to its end and put its result on screen.
+   *
+   *  Used by the button AND by a modal reopened over a walk already in flight,
+   *  which is what moving the dial to the server bought: closing this, reloading
+   *  the tab or shutting the laptop does not stop the day, and coming back
+   *  rejoins it mid-walk rather than starting a second one. */
+  const watch = async () => {
     setBusy(true);
-    stop.current = false;
     try {
-      const merged = await runQueue(queue, onCampaign, () => stop.current);
-      setRes(mergeResults(merged, day));
+      const final = await pollDial((state) => {
+        setProgress(dialRows(state, queue));
+        setCurrent(state.current?.name ?? null);
+        setWalked({ total: state.total, done: state.done });
+      });
+      setRes(final.result);
+    } catch (e) {
+      // The walk is the server's and is still going. Say the console lost sight
+      // of it — never that the day failed, which is what makes an operator dial
+      // it a second time. The progress list stays up; Dial rejoins the walk.
+      toast('bad', `${(e as Error).message} The dial is still running on the server.`);
     } finally {
       setCurrent(null);
       setBusy(false);
     }
   };
+
+  /** Hand the day to the server and watch. Returns as soon as it has started. */
+  const submit = async () => {
+    if (mismatch) return; // a panel that disagrees with itself dials nothing
+    // An empty `campaign_ids` means EVERY armed campaign to the backend, so a
+    // day with nothing planned left must not be sent as one — that is the whole
+    // roster, dialled from a button that offered none of it.
+    if (queue.length === 0) return;
+    try {
+      await api.startDial(...retryArgs(args, queue.map((c) => c.campaign_id)));
+    } catch (e) {
+      toast('bad', (e as Error).message);
+      return;
+    }
+    await watch();
+  };
+
+  // A walk for THIS day already running when the modal opens is rejoined, not
+  // restarted. Another day's walk is left alone: its progress belongs to a
+  // screen this is not.
+  useEffect(() => {
+    api.dialStatus()
+      .then((state) => { if (state.running && state.date === day.date) void watch(); })
+      // No walk to rejoin is the ordinary case, and an unreachable server is
+      // already said loudly enough by everything else on this screen.
+      .catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const done = () => {
     onDone();
@@ -1785,9 +1779,9 @@ export function ApproveDay({
   };
 
   if (res) {
-    // One progress row per campaign the queue started, so this is the count the
-    // Stop cut off — carried into the modal that replaces the progress list.
-    const short = stoppedShort(queue.length, progress.length);
+    // The walk's own numbers, carried into the modal that replaces the progress
+    // list — the campaigns it never reached are accounted for here or nowhere.
+    const short = stoppedShort(walked.total, walked.done);
     return (
       <Modal
         title={short ? 'Stopped part-way' : res.dry_run ? 'Simulated the day' : 'What went out'}
@@ -1807,12 +1801,15 @@ export function ApproveDay({
         <>
           {/* Stopping leaves the campaigns it never reached `planned` — they stay
               on the screen and stay approvable. Closing the tab does the same. */}
-          <button className="btn btn-ghost" onClick={() => (busy ? (stop.current = true) : onClose())}>
+          <button
+            className="btn btn-ghost"
+            onClick={() => (busy ? void api.stopDial().catch(() => {}) : onClose())}
+          >
             {busy ? 'Stop after this campaign' : 'Cancel'}
           </button>
           <button
             className={live ? 'btn btn-live' : 'btn btn-primary'}
-            disabled={!ok || busy || shown.length === 0 || mismatch !== null}
+            disabled={!ok || busy || shown.length === 0 || queue.length === 0 || mismatch !== null}
             onClick={submit}
           >
             {busy ? <Loader2 className="spin" /> : live ? <Radio /> : <FlaskConical />}

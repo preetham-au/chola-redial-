@@ -350,6 +350,36 @@ export interface PrepareResult {
   stopped_in_formi?: number[];
 }
 
+/** Where the server-side dial walk has got to.
+ *
+ *  The walk used to live in the browser, one `approveDay` request per campaign.
+ *  A single campaign's approve is a ten-minute request (1,364 calls at 10/sec),
+ *  and on 14 Sep 2026 one of them answered to a socket nobody was on any more --
+ *  taking the other twenty-one campaigns of the queue with it. The queue is now
+ *  the server's; this is what polling it says. */
+export interface DialState {
+  running: boolean;
+  date: string;
+  kind: string;
+  buckets: string[];
+  agent_id: number | null;
+  /** Campaigns in the walk. The denominator of the progress bar. */
+  total: number;
+  /** Campaigns walked — reported, whether they dialled or not. */
+  done: number;
+  /** The one being dialled right now, or null between campaigns. */
+  current: { campaign_id: number; name: string } | null;
+  stopped: boolean;
+  results: ApproveResult['campaigns'];
+  started_at: string;
+  finished_at: string;
+  dry_run: boolean;
+  /** The walk so far, added up server-side into the shape `/api/day/approve`
+   *  answers — so a finished walk renders through the result modal the console
+   *  already has, and nothing here adds a second set of totals. */
+  result: ApproveResult;
+}
+
 export interface ApproveResult {
   date: string;
   kind: string;

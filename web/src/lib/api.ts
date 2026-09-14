@@ -13,6 +13,7 @@ import type {
   DayView,
   DialLogPage,
   DialLogSummary,
+  DialState,
   Health,
   ManualPreview,
   PagedItems,
@@ -265,6 +266,36 @@ export const api = {
       // Never invent an approval. This is the one answer that would tell an
       // operator customers were called when nothing was.
       throw new ApiError('The server is unreachable — nothing was approved or dialled.', 503);
+    }),
+
+  /** Start the day's dial on the server and return at once. Poll `dialStatus`.
+   *
+   *  Same body as `approveDay` and the same work, minus the wait — which is the
+   *  whole point: nothing about the day now depends on this tab staying open. */
+  startDial: (
+    date: string,
+    kind = 'auto',
+    buckets: string[] = [],
+    campaign_ids: number[] = [],
+    agent_id?: number,
+  ) =>
+    req<DialState>('/api/day/dial',
+      json({ date, kind, buckets, campaign_ids, agent_id }), () => {
+      // Never invent a dial. This is the one answer that would tell an operator
+      // customers were called when nothing was.
+      throw new ApiError('The server is unreachable — nothing was approved or dialled.', 503);
+    }),
+
+  /** Where the walk has got to. Cheap; safe to poll every second. */
+  dialStatus: () =>
+    req<DialState>('/api/day/dial', undefined, () => {
+      throw new ApiError('The server is unreachable — the dial cannot be followed.', 503);
+    }),
+
+  /** Stop between campaigns. The campaign in flight finishes and its calls go. */
+  stopDial: () =>
+    req<DialState>('/api/day/dial/stop', json({}), () => {
+      throw new ApiError('The server is unreachable — the dial was not stopped.', 503);
     }),
 
   /* --- Dial log ----------------------------------------------------------- */

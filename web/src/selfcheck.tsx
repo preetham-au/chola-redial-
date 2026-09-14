@@ -25,7 +25,7 @@ import {
   autopilotDiff,
   closesAt,
   dialQueue,
-  mergeResults,
+  dialRows,
   outsideBand,
   panelDay,
   panelPrepare,
@@ -35,8 +35,8 @@ import {
   planAge,
   prepareMessage,
   recheckMessage,
+  pollDial,
   retryArgs,
-  runQueue,
   scopeMismatch,
   stoppedShort,
   unbuilt,
@@ -69,7 +69,8 @@ import {
   shortCallHint,
 } from './lib/domain';
 import type {
-  Agent, ApproveResult, Campaign, Config, DayCampaign, DaySpread, DialWindow, PrepareResult,
+  Agent, ApproveResult, Campaign, Config, DayCampaign, DaySpread, DialState, DialWindow,
+  PrepareResult,
   TestCallResult,
 } from './lib/types';
 
@@ -88,6 +89,19 @@ const click = (a: BdAction) => {
 };
 
 const has = (html: string, s: string) => html.includes(s);
+/** A walk's state, for the checks. Every field the screen reads, defaulted to
+ *  the idle answer the server gives before anything has been dialled. */
+const dialing = (over: Partial<DialState> = {}): DialState => ({
+  running: false, date: '2026-09-13', kind: 'auto', buckets: [], agent_id: null,
+  total: 0, done: 0, current: null, stopped: false, results: [],
+  started_at: '', finished_at: '', dry_run: false,
+  result: {
+    date: '2026-09-13', kind: 'auto', pass_label: 'first pass', dry_run: false,
+    buckets: 'all', approved: 0, posted: 0, failed: 0, not_dialled: 0, campaigns: [],
+  },
+  ...over,
+});
+
 function ok(label: string, cond: boolean) {
   if (!cond) throw new Error(`FAIL: ${label}`);
   console.log(`  ok  ${label}`);
@@ -853,27 +867,33 @@ ok(
   ok('with nothing to dial the bar is empty rather than dividing by zero',
      has(renderToStaticMarkup(<DayProgress done={0} total={0} current={null} rows={[]} />), 'width:0%'));
 
-  // --- folding the per-campaign answers back into one result ------------------
-  const part = (over: Partial<ApproveResult>): ApproveResult => ({
-    date: DATE, kind: 'auto', pass_label: 'first pass', dry_run: true, buckets: ['M0'],
-    approved: 1, posted: 100, failed: 0, not_dialled: 0, campaigns: [], ...over,
-  });
-  const stopped = mergeResults([], mockDay(DATE, 'auto'));
-  ok('stopping before the first campaign still leaves a result on screen, not a crash',
-     stopped.approved === 0 && stopped.posted === 0 && stopped.failed === 0 &&
-     stopped.not_dialled === 0 && stopped.campaigns.length === 0);
-  ok('and it is still this day’s result, not a blank one',
-     stopped.date === DATE && stopped.kind === 'auto');
-  const whole = mergeResults(
-    [part({ campaigns: [{ campaign_id: 1, name: 'A', status: 'approved', posted: 100 }] }),
-     part({ posted: 40, failed: 3, not_dialled: 7,
-            campaigns: [{ campaign_id: 2, name: 'B', status: 'approved', posted: 40, failed: 3 }] })],
-    mockDay(DATE, 'auto'),
-  );
-  ok('every campaign’s numbers are added, never overwritten by the last one home',
-     whole.approved === 2 && whole.posted === 140 && whole.failed === 3 && whole.not_dialled === 7);
-  ok('and every campaign keeps its own row in the result',
-     whole.campaigns.length === 2 && whole.campaigns.map((c) => c.name).join() === 'A,B');
+  // --- the progress list, rebuilt from the walk's own answer ------------------
+  //
+  // The rows used to be accumulated in the page, one `setProgress` per campaign
+  // as its request came home. They are derived now, because the walk is the
+  // server's: a modal reopened half way through has no history to accumulate
+  // from and must still draw the list that a modal left open would show.
+  const named = [{ campaign_id: 1, name: 'Hindi 1' }, { campaign_id: 2, name: 'Hindi 2' }];
+  const rebuilt = dialRows(dialing({
+    done: 2,
+    results: [{ campaign_id: 1, name: 'Hindi 1', status: 'approved', posted: 100 },
+              { campaign_id: 2, name: '', status: 'no_result' }],
+    current: { campaign_id: 3, name: 'Hindi 3' },
+  }), named);
+  ok('every campaign the walk has reported has a row, and the one in flight has one too',
+     rebuilt.length === 3 && rebuilt.map((r) => r.state).join() === 'done,failed,running');
+  // `no_result` is a campaign that was not in the plan when the walk got to it,
+  // and the walk has no name for a campaign it could not load. A row reading
+  // "campaign 2" in the one list the operator watches is the same defect as no
+  // row at all.
+  ok('and a campaign the walk could not name is still named, from the queue',
+     rebuilt[1].name === 'Hindi 2');
+  const refused = dialRows(dialing({
+    done: 1,
+    results: [{ campaign_id: 1, name: 'Hindi 1', status: 'approved', posted: 90, failed: 10 }],
+  }), named);
+  ok('and an approved campaign that Formi refused calls for is not drawn as clean',
+     refused.length === 1 && refused[0].state === 'failed');
 }
 
 // --- the dial result: what went out, and what did not -----------------------
@@ -1284,10 +1304,11 @@ ok(
   // the client actually SENDS. An unscoped day must send no `agent_id` at all:
   // `agent_id=undefined` is a string the server reads as a campaign nobody owns.
   const sent: string[] = [];
-  (globalThis as { fetch?: unknown }).fetch = async (url: unknown, init?: RequestInit) => {
+  const record = async (url: unknown, init?: RequestInit) => {
     sent.push(`${String(url)} ${String(init?.body ?? '')}`);
     return { ok: true, status: 200, json: async () => ({ campaigns: [] }) };
   };
+  (globalThis as { fetch?: unknown }).fetch = record;
   retryLive();
 
   await api.day('2026-09-13', 'auto');
@@ -1488,101 +1509,137 @@ ok(
      && afterPrepare.every((s) => /toast\(\.\.\.(prepare|recheck)Message\(/.test(s)));
   retryLive();
 
-  // --- and the day actually goes out one campaign at a time -------------------
+  // --- and the day goes out as ONE request the server walks -------------------
   //
-  // `dialQueue` proves the QUEUE is one request per campaign; nothing above
-  // proves the dial walks it. That loop used to live in a click handler, where
-  // collapsing it back into a single whole-day `api.approveDay(...args)` — the
-  // 2,967-calls-in-one-request bug of 12 Sep 2026 — passed the whole gate green.
-  // The click is still out of reach, but the `await` is not: `runQueue` is the
-  // loop with React on the far side of a callback, driven here on the same
-  // stubbed fetch and read back off the wire.
+  // `dialQueue` proves the panel knows which campaigns are still planned;
+  // nothing above proves the dial reaches them. The walk used to live in this
+  // click handler, one `approveDay` per campaign — and on 14 Sep 2026 campaign
+  // 1744's request ran 11:09:09 to 11:19:05 placing 1,364 calls and answered to
+  // a socket nobody was on any more. uvicorn logged no access line for it at
+  // all. The queue died with that request and the other twenty-one campaigns
+  // were never asked for: the operator pressed Dial on twenty-two campaigns and
+  // one of them dialled.
+  //
+  // So the queue is the server's. The click is still out of reach of a static
+  // check, but `pollDial` is not — it is the watcher with React on the far side
+  // of a callback, driven here on the same stubbed fetch.
   const tamil = mockDay('2026-09-13', 'auto', 127);
-  const queue = dialQueue(approveArgs(A127, tamil, []), tamil);
+  const targs = approveArgs(A127, tamil, []);
+  const queue = dialQueue(targs, tamil);
   const bodies = () =>
-    sent.map((s) => JSON.parse(s.slice(s.indexOf(' ') + 1)) as
-      { campaign_ids: number[]; agent_id?: number });
+    sent.map((s) => JSON.parse(s.slice(s.indexOf(' ') + 1) || '{}') as
+      { campaign_ids?: number[]; agent_id?: number });
 
   sent.length = 0;
-  await runQueue(queue, () => {}, () => false);
-  ok('the dial puts each campaign on the wire in its own request, exactly once',
-     queue.length > 1 && bodies().length === queue.length &&
-     bodies().every((b, i) =>
-       b.campaign_ids.length === 1 && b.campaign_ids[0] === queue[i].campaign_id));
-  // Twelve requests where there was one is twelve chances to lose the scope.
-  // A dropped agent dials every armed campaign on every agent — the whole
-  // roster, from a panel headed "Tamil".
-  ok('and every one of them still carries the panel’s agent, unchanged down the queue',
-     bodies().every((b) => b.agent_id === 127));
-
-  // Stopping has to stop the DIALLING, not just the spinner: the campaigns it
-  // never reached stay `planned` and stay approvable, which is only true if the
-  // requests were never sent.
-  sent.length = 0;
-  await runQueue(queue, () => {}, () => sent.length > 0);
-  ok('stopping the queue stops the phones — no request goes out after the stop',
-     queue.length > 1 && sent.length === 1);
+  await api.startDial(...retryArgs(targs, queue.map((c) => c.campaign_id)));
+  ok('starting the dial hands the server every planned campaign, in one request',
+     queue.length > 1 && sent.length === 1
+     && bodies()[0].campaign_ids?.join() === queue.map((c) => c.campaign_id).join());
+  // An empty `campaign_ids` means EVERY armed campaign to the backend and a
+  // missing agent means every agent — between them, the whole roster dialled
+  // from a panel headed "Tamil".
+  ok('and it carries the panel\u2019s agent, and never an empty campaign list',
+     bodies()[0].agent_id === 127 && (bodies()[0].campaign_ids ?? []).length > 0);
+  // The two lines above pass the list themselves, so they cannot see a CALL SITE
+  // that stopped passing one — and the click that holds it is out of reach. An
+  // empty `campaign_ids` is every armed campaign to the backend: the whole
+  // roster, dialled from a panel that offered none of it.
+  ok('and the day screen never starts a dial without naming the campaigns',
+     src.split('api.startDial(').length === 2
+     && /api\.startDial\(\.\.\.retryArgs\(args, queue\.map\(/.test(src));
   retryLive();
 
-  // --- a campaign the approve answered nothing for did not dial ---------------
-  //
-  // `approve_day` loops the campaigns that are armed RIGHT NOW and `continue`s
-  // past any requested id that no longer is — so it answers 200 with
-  // `campaigns: []`, every count zero. `[].every(...)` is `true`: the progress
-  // row went green, the merge added nothing, and the result read "Every
-  // selected lead is on the clock" over ~250 leads nobody dialled. The stub
-  // below is that answer exactly, zeroes and all, so the only thing that can
-  // redden these three lines is the screen telling the truth about it.
+  // Followed to the END. Reading the status once and calling it a day is the
+  // 14 Sep defect wearing a poll: the walk reports campaign one and the screen
+  // stops looking.
+  const walk = [
+    dialing({ running: true, total: 3, done: 0,
+              current: { campaign_id: queue[0].campaign_id, name: queue[0].name } }),
+    dialing({ running: true, total: 3, done: 1 }),
+    dialing({ running: false, total: 3, done: 3 }),
+  ];
+  let poll = 0;
   (globalThis as { fetch?: unknown }).fetch = async () => ({
-    ok: true, status: 200,
-    json: async () => ({
-      date: '2026-09-13', kind: 'auto', pass_label: 'first pass', dry_run: false,
-      buckets: 'all', approved: 0, posted: 0, failed: 0, not_dialled: 0, campaigns: [],
-    }),
+    ok: true, status: 200, json: async () => walk[Math.min(poll++, walk.length - 1)],
   });
   retryLive();
-  const states: ProgressRow['state'][] = [];
-  const none = await runQueue(queue, (_c, s) => states.push(s), () => false);
-  ok('a campaign the approve answered nothing for is never reported as done',
-     states.length === queue.length * 2 && !states.includes('done'));
-  const merged = mergeResults(none, tamil);
-  ok('and it keeps a row of its own, under its own name, in the result the operator reads',
-     merged.campaigns.length === queue.length
-     && merged.campaigns.every((c) => c.status === 'no_result')
-     && merged.campaigns.map((c) => c.name).join() === queue.map((c) => c.name).join());
+  const seen: number[] = [];
+  const final = await pollDial((st) => seen.push(st.done), async () => {});
+  ok('the walk is followed to its end, not read once and abandoned',
+     final.running === false && final.done === 3 && seen.join() === '0,1,3');
+
+  // A status read that fails is a blind console, never a dead day: the walk is
+  // in the API process and nothing the browser does reaches it. Reporting one as
+  // the other is how an operator comes to dial a day twice.
+  //
+  // A 500, not a dead socket: a socket that dies is the proxy speaking for a
+  // backend that is gone, and the client goes offline on it by design — there is
+  // no walk left to watch. A 500 is the one request failing while the server,
+  // and the dial in it, carry on.
+  let reads = 0;
+  (globalThis as { fetch?: unknown }).fetch = async () => {
+    reads += 1;
+    return reads < 3
+      ? { ok: false, status: 500, statusText: 'error', json: async () => ({ error: 'busy' }) }
+      : { ok: true, status: 200, json: async () => dialing({ running: false, done: 3 }) };
+  };
+  retryLive();
+  const survived = await pollDial(() => {}, async () => {});
+  ok('a blip on the way to the status endpoint does not end the watch',
+     reads === 3 && survived.done === 3);
+  retryLive();
+
+  // Stopping has to stop the DIALLING, not just the spinner — and it is the
+  // server that is dialling, so it has to be a request. A flag in the page stops
+  // nothing now.
+  sent.length = 0;
+  (globalThis as { fetch?: unknown }).fetch = record;
+  retryLive();
+  await api.stopDial();
+  ok('stopping the dial asks the server to stop, rather than only the screen',
+     sent.length === 1 && sent[0].startsWith('/api/day/dial/stop'));
+  retryLive();
+
+  // --- a campaign the walk answered nothing for did not dial ------------------
+  //
+  // `approve_day` loops the campaigns that are armed RIGHT NOW and skips any
+  // requested id that no longer is — disarmed by the 15:00 unattended pass, by a
+  // picker hide, or by a Formi pause picked up between the start and the walk
+  // reaching it. It contributes no result of its own. `[].every(...)` is `true`:
+  // the row went green and the modal read "Every selected lead is on the clock"
+  // over ~250 leads nobody dialled. The walk reports such a campaign as
+  // `no_result`, and this is the screen reading that.
+  const missed: ApproveResult = {
+    date: '2026-09-13', kind: 'auto', pass_label: 'first pass', dry_run: false,
+    buckets: 'all', approved: 0, posted: 0, failed: 0, not_dialled: 0,
+    campaigns: queue.map((c) => ({ campaign_id: c.campaign_id, name: c.name,
+                                   status: 'no_result' })),
+  };
   const nothing = renderToStaticMarkup(
-    <DialResult res={merged} args={approveArgs(A127, tamil, [])} onChange={() => {}} />,
+    <DialResult res={missed} args={targs} onChange={() => {}} />,
   );
-  ok('and a day where nothing went out never reads as one where everything did',
+  ok('a day where nothing went out never reads as one where everything did',
      !has(nothing, 'Every selected lead is on the clock')
      && has(nothing, queue[0].name) && has(nothing, 'no longer in the daily plan'));
-  retryLive();
 
-  // --- and a campaign whose request never came back is on that list too -------
+  // --- and a campaign whose approve blew up is on that list too ---------------
   //
-  // A 502 from the proxy, a timeout, a commit that lost a SQLite lock: the POST
-  // throws before there is any body to read. The campaign was started, so it has
-  // a progress row — and the progress list is REPLACED by the result modal, so
-  // without a part of its own it is named nowhere afterwards: absent from the
-  // totals, from the problem rows and from the Retry, under a bar reading
-  // "11 approved". The stub below throws for every campaign in the queue.
-  (globalThis as { fetch?: unknown }).fetch = async () => ({
-    ok: false, status: 500, statusText: 'error',
-    json: async () => ({ error: 'gateway blew up' }),
-  });
-  retryLive();
-  const blew = mergeResults(await runQueue(queue, () => {}, () => false), tamil);
-  ok('a campaign whose approve threw still contributes a row to the result',
-     blew.campaigns.length === queue.length
-     && blew.campaigns.every((c) => c.status === 'request_failed')
-     && blew.campaigns.map((c) => c.name).join() === queue.map((c) => c.name).join());
+  // A commit that lost a SQLite lock, a Formi client that raised. One campaign
+  // must not end the day for the rest — and must not vanish from it either: the
+  // progress list is REPLACED by this modal, so a campaign named nowhere here is
+  // named nowhere at all, under a bar reading "21 approved".
+  const blew: ApproveResult = {
+    ...missed,
+    campaigns: queue.map((c) => ({ campaign_id: c.campaign_id, name: c.name,
+                                   status: 'error', detail: 'OperationalError: locked' })),
+  };
   const thrown = renderToStaticMarkup(
-    <DialResult res={blew} args={approveArgs(A127, tamil, [])} onChange={() => {}} />,
+    <DialResult res={blew} args={targs} onChange={() => {}} />,
   );
   // Named, with what went wrong, and offered again — the operator's standing
   // rule is that a failure is logged where it can be triggered a second time.
   ok('and is named, with what went wrong, where it can be sent again',
-     has(thrown, queue[0].name) && has(thrown, 'gateway blew up')
+     has(thrown, queue[0].name) && has(thrown, 'OperationalError: locked')
      && has(thrown, 'Retry') && !has(thrown, 'Every selected lead is on the clock'));
   retryLive();
 

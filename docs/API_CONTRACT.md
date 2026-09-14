@@ -227,6 +227,36 @@ One page for the whole day across every campaign in the plan, and one approval.
 | `GET` | `/api/day?date=&kind=&agent_id=` | the whole day. Cheap by construction — two `GROUP BY`s over rows the console already wrote, so a screen may poll it all day without costing a warehouse query. Never re-runs the engine. |
 | `POST` | `/api/day/prepare` | `{date?, kind?, resync?, agent_id?}` → builds `planned` runs for every campaign in the plan. **Dials nothing.** `resync: true` (what a pass sets) re-reads campaign status and re-pulls leads first — for the scoped agent only, so a Hindi prepare cannot stop a Tamil campaign and report it in `stopped_in_formi`. |
 | `POST` | `/api/day/approve` | `{date?, kind?, buckets?[], campaign_ids?[], agent_id?}` → **dials.** Empty `buckets` means every bucket; empty `campaign_ids` means every campaign with a plan waiting. |
+| `POST` | `/api/day/dial` | same body → **dials, one campaign at a time, in a background thread.** Returns the status below immediately. Asking twice while one is running returns the one in flight rather than starting a second. |
+| `GET` | `/api/day/dial` | where that walk has got to. Safe to poll from a screen left open all day. |
+| `POST` | `/api/day/dial/stop` | asks the walk to stop after the campaign it is on. The rest stay `planned` and can be approved later. |
+
+`/api/day/dial` is `/api/day/approve` with the queue moved off the browser. A
+single campaign's approve is a ten-minute request — 1,364 calls at ten a second
+— and on 14 Sep 2026 one of them answered to a socket nobody was on any more,
+taking the other twenty-one campaigns of that day's queue with it: they were the
+*next* requests the page would have made, and the page was gone. One campaign
+dialled, twenty-one silently did not. A walk that lives in the API process does
+not care whether anyone is watching it.
+
+```jsonc
+// GET /api/day/dial
+{ "running": true, "date": "2026-09-14", "kind": "auto", "buckets": [],
+  "agent_id": 125, "total": 22, "done": 3,
+  "current": { "campaign_id": 1745, "name": "05 sep redial" },   // null between campaigns
+  "stopped": false, "started_at": "2026-09-14 11:09:09", "finished_at": "",
+  "dry_run": false,
+  "results": [ /* `campaigns` rows, exactly as POST /api/day/approve returns them */ ],
+  // The same rows added up into the shape POST /api/day/approve answers, so a
+  // finished walk renders through the result the console already knows how to
+  // draw and nothing client-side keeps a second set of totals.
+  "result": { "date": "2026-09-14", "approved": 3, "posted": 1832, "failed": 0,
+              "not_dialled": 41, "campaigns": [ /* … */ ] } }
+```
+
+All three answer that identical shape, so starting, polling and stopping are one
+thing to render. `total` is the campaigns in the walk and `done` the ones it has
+reported on, dialled or not — a walk that ends with `done < total` was stopped.
 
 `status` is one of `no_campaigns` · `not_prepared` · `awaiting_approval` ·
 `nothing_to_dial` · `part_prepared` · `approved`, so the screen has one thing to
@@ -390,7 +420,9 @@ that is no longer `planned` answers `already_committed`.
 
 A per-campaign `status` is one of `approved` · `not_prepared` ·
 `already_committed` · `already_paused` · `nothing_to_dial` · `window_closed` ·
-`not_dialled` · `error`.
+`not_dialled` · `no_result` · `error`. `no_result` is only reachable from the
+walk: a campaign that was disarmed after the walk started and so was never
+offered to `_approve_one` at all.
 
 **Every outcome that is not a clean dial is also written to that campaign's
 `autopilot_note`** (`"2026-09-13 auto: NOT dialled — window_closed: …"`), and a

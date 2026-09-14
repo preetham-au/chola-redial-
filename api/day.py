@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import threading
 from datetime import date, timedelta
 from typing import Any, Optional
 
@@ -35,7 +36,7 @@ from engine.dispatcher import (
     DEFAULT_RED_PRIORITY, WINDOW_CEIL, WINDOW_FLOOR, hhmm, parse_hhmm, red_rank,
 )
 
-from .db import dry_run, now_ist, session
+from .db import dry_run, now_ist, now_iso, session
 from .routes_core import (
     _campaign_json, _commit, _earliest_dialable, _evaluate, _floor_min, _parse_day,
     _run_json, _write_run,
@@ -772,6 +773,170 @@ def post_prepare(body: PrepareBody = Body(default_factory=PrepareBody)) -> dict[
 # Approving
 # ---------------------------------------------------------------------------
 
+def _day_result(results: list[dict[str, Any]], day: str, kind: str,
+                buckets: list[str]) -> dict[str, Any]:
+    """A day's dial, added up from its per-campaign rows. The only shape.
+
+    `/api/day/approve` and the background walk both finish holding a list of
+    `_approve_one` rows, and the console renders whichever it gets through the
+    same component. Two places summing the same rows is two places to sum them
+    differently, so they sum them here.
+    """
+    return {"date": day, "kind": kind, "pass_label": PASS_LABEL.get(kind, ""),
+            "dry_run": dry_run(), "buckets": buckets or "all",
+            "approved": sum(1 for r in results if r["status"] == "approved"),
+            "posted": sum(r.get("posted", 0) for r in results),
+            "failed": sum(r.get("failed", 0) for r in results),
+            # `dropped` is on every row now, not just the approved ones: a
+            # campaign that never reached `_commit` still held leads, and scoring
+            # it zero is what made a pass of 12 closed windows read "0 scheduled ·
+            # 0 not scheduled" over 2,000 leads. See `_unspent`.
+            #
+            # `dropped` is already the whole of it. `_commit` adds the slots it
+            # retired for being in the past to the count `_write_run` left behind
+            # for the leads `max_per_run` shed, so the run row carries one number
+            # meaning "did not dial". `expired` is that number's BREAKDOWN, not
+            # extra to it: adding `expired` back on top charged every retired
+            # slot twice, and a pass with 340 stale slots told the operator 680
+            # leads were not scheduled -- inflated by exactly the commonest
+            # reason a slot does not go out.
+            "not_dialled": sum(r.get("dropped", 0) for r in results),
+            "campaigns": results}
+
+
+# ---------------------------------------------------------------------------
+# Dialling the day in the background
+# ---------------------------------------------------------------------------
+
+# One campaign's approve is one long request: campaign 1744 took 11:09:09 to
+# 11:19:05 on 14 Sep 2026 to place 1,364 calls, and uvicorn logged no access
+# line for it at all -- nobody was still on the other end of the socket when it
+# answered. The browser had split the day into one request per campaign already,
+# which is what stopped a whole day riding on one connection; it does not help
+# when a SINGLE campaign is a ten-minute request. The queue lived in the page,
+# so when that request died the remaining twenty-one campaigns were never asked
+# for. The operator pressed Dial on twenty-two campaigns and one dialled.
+#
+# So the walk moves server-side, exactly as `/api/sync` already does it: plain
+# module state and a daemon thread. POST starts it and returns at once, GET
+# polls it. Nothing now depends on the browser staying on the page -- closing
+# the modal, a reload, a laptop lid, none of them can stop the day mid-way.
+#
+# Module state rather than a table for the same reason `/api/sync` uses it: one
+# process owns this console, the answer is only interesting while the walk runs,
+# and a restart losing it is correct -- a restart also kills the thread.
+_dial_lock = threading.Lock()
+
+
+def _idle_dial() -> dict[str, Any]:
+    return {"running": False, "date": "", "kind": "", "buckets": [], "agent_id": None,
+            "total": 0, "done": 0, "current": None, "stopped": False,
+            "results": [], "started_at": "", "finished_at": ""}
+
+
+_dial_state: dict[str, Any] = _idle_dial()
+
+
+def _dial_walk(day: date, kind: str, buckets: list[str], campaign_ids: list[int]) -> None:
+    """Approve each campaign in turn. Runs on the thread, never in a request."""
+    try:
+        for campaign_id in campaign_ids:
+            if _dial_state["stopped"]:
+                break
+            try:
+                # A connection per campaign, not one held for the whole walk: an
+                # approve can run ten minutes, and a writer holding SQLite open
+                # that long is every other request in the console waiting on it.
+                with session() as conn:
+                    where, params = _armed(_dial_state["agent_id"])
+                    campaign = conn.execute(
+                        f"SELECT * FROM campaigns WHERE id=? AND {where}",
+                        (campaign_id, *params)).fetchone()
+                    if campaign is None:
+                        # Disarmed since the walk began -- a 15:00 unattended
+                        # pass, a hide, a Formi pause picked up by a resync.
+                        # `approve_day` skips such a campaign in silence, and a
+                        # campaign that vanishes from its own result is the one
+                        # thing this screen must never do.
+                        _dial_state["results"].append(
+                            {"campaign_id": campaign_id, "name": "",
+                             "status": "no_result"})
+                        continue
+                    _dial_state["current"] = {"campaign_id": campaign_id,
+                                              "name": campaign["name"]}
+                    result = _approve_one(conn, campaign, day, kind, buckets)
+                _dial_state["results"].append(result)
+            except Exception as exc:             # noqa: BLE001 — one campaign, not the day
+                log.exception("dial walk failed on campaign %s", campaign_id)
+                _dial_state["results"].append(
+                    {"campaign_id": campaign_id, "name": "", "status": "error",
+                     "detail": f"{type(exc).__name__}: {exc}"[:200]})
+            finally:
+                _dial_state["done"] += 1
+                _dial_state["current"] = None
+    finally:
+        _dial_state["running"] = False
+        _dial_state["finished_at"] = now_iso()
+
+
+@router.post("/api/day/dial")
+def start_dial(body: ApproveBody = Body(default_factory=ApproveBody)) -> dict[str, Any]:
+    """Dial the day in the background. Returns at once; poll GET /api/day/dial.
+
+    Same body as `/api/day/approve` and the same work, minus the wait. Pressing
+    it twice is not an error and does not dial twice: the walk already in flight
+    is returned unchanged, which is what a button pressed again because nothing
+    visibly happened should do.
+    """
+    if body.kind not in KINDS:
+        raise HTTPException(422, f"kind must be one of {list(KINDS)}, got {body.kind!r}")
+    day = _parse_day(body.date)
+    wanted = set(body.campaign_ids)
+    buckets = list(body.buckets)
+
+    with _dial_lock:
+        if _dial_state["running"]:
+            return dial_status()
+        with session() as conn:
+            where, params = _armed(body.agent_id)
+            campaign_ids = [r["id"] for r in conn.execute(
+                f"SELECT id FROM campaigns WHERE {where} ORDER BY id", params)
+                if not wanted or r["id"] in wanted]
+        _dial_state.update(_idle_dial())
+        _dial_state.update(running=True, date=day.isoformat(), kind=body.kind,
+                           buckets=buckets, agent_id=body.agent_id,
+                           total=len(campaign_ids), started_at=now_iso())
+    threading.Thread(target=_dial_walk, args=(day, body.kind, buckets, campaign_ids),
+                     daemon=True).start()
+    return dial_status()
+
+
+@router.get("/api/day/dial")
+def dial_status() -> dict[str, Any]:
+    """Where the walk has got to. Safe to poll from a screen that is open all day.
+
+    `result` is the walk so far in the same shape `/api/day/approve` answers, so
+    the console renders a finished walk through the component it already has and
+    adds nothing up itself.
+    """
+    state = dict(_dial_state)
+    state["dry_run"] = dry_run()
+    state["result"] = _day_result(list(state["results"]), state["date"],
+                                  state["kind"], list(state["buckets"]))
+    return state
+
+
+@router.post("/api/day/dial/stop")
+def stop_dial() -> dict[str, Any]:
+    """Stop between campaigns. The one in flight finishes -- its calls are posted.
+
+    A campaign the walk never reached was never posted, so its plan items are
+    still `planned` and dialling the day again sends exactly those.
+    """
+    _dial_state["stopped"] = True
+    return dial_status()
+
+
 @router.post("/api/day/approve")
 def approve_day(body: ApproveBody = Body(default_factory=ApproveBody)) -> dict[str, Any]:
     """Dial the day. The only path in this module that reaches Formi.
@@ -800,26 +965,7 @@ def approve_day(body: ApproveBody = Body(default_factory=ApproveBody)) -> dict[s
                 continue
             results.append(_approve_one(conn, campaign, day, body.kind, buckets))
 
-    posted = sum(r.get("posted", 0) for r in results)
-    return {"date": day.isoformat(), "kind": body.kind, "pass_label": PASS_LABEL[body.kind],
-            "dry_run": dry_run(), "buckets": buckets or "all",
-            "approved": sum(1 for r in results if r["status"] == "approved"),
-            "posted": posted, "failed": sum(r.get("failed", 0) for r in results),
-            # `dropped` is on every row now, not just the approved ones: a
-            # campaign that never reached `_commit` still held leads, and scoring
-            # it zero is what made a pass of 12 closed windows read "0 scheduled ·
-            # 0 not scheduled" over 2,000 leads. See `_unspent`.
-            #
-            # `dropped` is already the whole of it. `_commit` adds the slots it
-            # retired for being in the past to the count `_write_run` left behind
-            # for the leads `max_per_run` shed, so the run row carries one number
-            # meaning "did not dial". `expired` is that number's BREAKDOWN, not
-            # extra to it: adding `expired` back on top charged every retired
-            # slot twice, and a pass with 340 stale slots told the operator 680
-            # leads were not scheduled -- inflated by exactly the commonest
-            # reason a slot does not go out.
-            "not_dialled": sum(r.get("dropped", 0) for r in results),
-            "campaigns": results}
+    return _day_result(results, day.isoformat(), body.kind, buckets)
 
 
 def _unspent(run: Optional[sqlite3.Row]) -> int:
