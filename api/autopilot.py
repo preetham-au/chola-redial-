@@ -43,6 +43,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, Body, HTTPException
 from pydantic import BaseModel
 
+from engine.dispatcher import dispatch_config_from_body, twice_deadline
 from engine.red_engine import EXCLUDED, config_from_settings
 
 from .db import current_config, now_ist, session
@@ -215,12 +216,21 @@ def _recall_due(conn: sqlite3.Connection, campaign_id: int, day: date,
                 now: datetime) -> bool:
     """Has this campaign earned its second call of the day yet?
 
-    `same_day_gap_hours` after its FIRST PASS went out — read per campaign, so it
-    is the operator's own knob answering the operator's own example: "if you call
-    them at 11:30 and they do not pick, call them after 3 hrs". Per campaign
-    rather than at one clock time on purpose: twenty-two campaigns chased at
-    twenty-two different minutes is twenty-two small posts to Formi instead of
-    one thundering herd, which is the whole of "do not overload the system".
+    Once the LAST of its two-call leads is `same_day_gap_hours` old — which is
+    `dispatcher.twice_deadline` plus the gap, read per campaign from that
+    campaign's own window and its own first pass. Not a time of day: twenty-two
+    campaigns chased at twenty-two different minutes is twenty-two small posts to
+    Formi instead of one thundering herd, which is the whole of "do not overload
+    the system".
+
+    Timed off the deadline rather than off the first pass's own clock because the
+    chase gets ONE run per campaign per day and the first pass's calls are spread
+    over hours. Firing at `first pass + 3h` chased only the leads dialled in the
+    first pass's opening minutes; everyone called later was still inside their own
+    three hours, answered SKIP_CADENCE, and was never looked at again — the pass
+    reported a clean run having chased almost nobody. `twice_deadline` is the
+    other half of the same fix: it is what makes "the last two-call lead" a
+    knowable minute instead of whenever the spread happened to end.
 
     This is only the COARSE gate — it decides when to look, never who to call.
     Whether any individual lead has earned a second call stays the engine's
@@ -247,12 +257,18 @@ def _recall_due(conn: sqlite3.Connection, campaign_id: int, day: date,
                     "AND status<>'planned' LIMIT 1",
                     (campaign_id, day.isoformat(), PM)).fetchone():
         return False
-    gap = config_from_settings(current_config(conn, campaign_id)).same_day_gap_hours
     try:
+        dcfg = dispatch_config_from_body(current_config(conn, campaign_id))
         dialled = datetime.fromisoformat(first["created_at"])
     except (TypeError, ValueError):          # a hand-edited row; never chase on a guess
         return False
-    return now >= dialled + timedelta(hours=float(gap))
+    # The same `start` the first pass's plan was built from: `_approve_one` passes
+    # its floor and `_write_run` stamps `created_at` in the same breath, so the
+    # run's own row is where that minute is recorded.
+    deadline = twice_deadline(dcfg, max(dcfg.start_min, dialled.hour * 60 + dialled.minute))
+    if deadline is None:
+        return False                         # no room for a second call at all
+    return now.hour * 60 + now.minute >= deadline + int(round(dcfg.same_day_gap_hours * 60))
 
 
 def run_recall(day: Optional[date] = None) -> dict[str, Any]:

@@ -87,6 +87,13 @@ enforced server-side.
                  "wrong_number","number_not_working","invalid_number",
                  "policy_expired","not_interested","firm_decision_to_discontinue"],
   "calls_per_day_cap": 2,
+  // The gap between a lead's two calls of the day. It also SHORTENS the window a
+  // two-call lead may be placed in: `dispatcher.twice_deadline` splits whatever
+  // is left of the day in half around this gap, and every lead the engine could
+  // ring twice — the mandatory days and the intensive bands F5/E0/F6 — takes its
+  // first call in the early half. A first call at 19:00 against a 19:00 close is
+  // not a first call, it is the only one that lead will get. Everybody else
+  // still uses the whole window; the ceiling is per lead, not a shorter day.
   "same_day_gap_hours": 3.0,
   "shift_from_last_hours": 2.0,   // time rotation: yesterday 09:00 -> today 11:00
   "max_per_minute": 12,           // load stagger ceiling
@@ -199,11 +206,21 @@ whose last call still says nobody picked up (no pick, hung up, under
 The recall pass no longer waits for an approval. On the same tick,
 `api/autopilot.py`'s `run_recall` prepares AND dials it, one campaign at a time:
 
-* **When.** A campaign comes due `same_day_gap_hours` (default 3) after **its
-  own** first pass was dialled — "you called them at 11:30, call them again after
-  3 hrs". Not a time of day, so campaigns that dialled at different times chase
-  at different minutes rather than arriving at Formi together. The server looks
-  for a due campaign every `RECALL_EVERY_MIN` (10) minutes.
+* **When.** A campaign comes due `same_day_gap_hours` (default 3) after the LAST
+  two-call lead of **its own** first pass — "you called them at 11:30, call them
+  again after 3 hrs". Not a time of day, so campaigns that dialled at different
+  times chase at different minutes rather than arriving at Formi together. The
+  server looks for a due campaign every `RECALL_EVERY_MIN` (10) minutes.
+
+  After the pass's LAST such lead, not after the pass began, because the chase
+  gets one run per campaign per day while the pass's own calls are spread over
+  hours. Timed at `first pass + 3h` it caught only the leads dialled in the
+  pass's opening minutes: everyone rung later was still inside their own three
+  hours, answered `SKIP_CADENCE`, and was never looked at again — the pass
+  reported a clean run having chased almost nobody. The minute comes from
+  `dispatcher.twice_deadline` read against that campaign's own window and the
+  minute its pass went out; a pass with no room for a second call (18:00 against
+  a 20:00 close) is never chased at all.
 * **Who.** Only leads the engine gives a second slot: the two-calls-a-day buckets
   F5 / E0 / F6 — RED 0..7 days before expiry and 1..3 days after — whose earlier
   call today says nobody was reached, and whose own `same_day_gap_hours` have

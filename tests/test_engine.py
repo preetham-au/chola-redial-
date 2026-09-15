@@ -7,7 +7,8 @@ from datetime import date, datetime, timedelta
 import pytest
 
 from engine.dispatcher import (
-    DispatchConfig, dispatch, manual_pairs, red_config_from_body, validate_dial_window,
+    DispatchConfig, dispatch, manual_pairs, red_config_from_body, twice_deadline,
+    twice_today, validate_dial_window,
 )
 from engine.red_engine import (
     DEFAULT_CONFIG, SCHEDULE, SKIP_CADENCE, SKIP_DAILY_CAP, SKIP_MANUAL_ONLY,
@@ -202,10 +203,17 @@ def test_the_red_bands_are_the_two_intensive_rows_of_that_table():
 # Dispatcher
 # ---------------------------------------------------------------------------
 
-def _pair(bucket, uuid, **over):
+def _pair(bucket, uuid, dte=0, **over):
+    """`dte` defaults to 0 -- a RED day, so a TWO-call lead.
+
+    It is not cosmetic. `dispatch` reads it twice: `red_rank` orders on it, and
+    `twice_today` asks it whether this lead must be placed early enough for a
+    second call to follow (see `twice_deadline`). Pass a far-out `dte` to build a
+    lead that gets one call and may therefore use the whole window.
+    """
     return (lead(lead_uuid=uuid, **over),
             Decision(action=SCHEDULE, reason="", schedule=True, bucket=bucket,
-                     bucket_label=bucket, dte=0, disposition_class="dnp"))
+                     bucket_label=bucket, dte=dte, disposition_class="dnp"))
 
 
 WIDE = DispatchConfig(start_min=9 * 60, end_min=19 * 60, shift_from_last_hours=2.0,
@@ -257,7 +265,7 @@ def test_time_rotation_shifts_the_hour():
 
 
 def test_rotation_wraps_back_into_the_window():
-    late = _pair("F1", "wrap", last_interaction_time="2026-08-27 18:30:00")
+    late = _pair("F1", "wrap", dte=20, last_interaction_time="2026-08-27 18:30:00")
     result = dispatch([late], TODAY, DEFAULT_CONFIG, WIDE)
     minute = result.slots[0].minute
     assert WIDE.start_min <= minute <= WIDE.end_min
@@ -265,7 +273,7 @@ def test_rotation_wraps_back_into_the_window():
 
 
 def test_leads_with_no_history_are_spread_across_the_window():
-    pairs = [_pair("F1", f"n{i}") for i in range(11)]
+    pairs = [_pair("F1", f"n{i}", dte=20) for i in range(11)]
     result = dispatch(pairs, TODAY, DEFAULT_CONFIG, WIDE)
     minutes = sorted(s.minute for s in result.slots)
     # `end_min - 1`: the dial window is half-open, so `end_min` is the minute it
@@ -273,6 +281,95 @@ def test_leads_with_no_history_are_spread_across_the_window():
     # morning and afternoon bands meet belonged to both waves at once.
     assert minutes[0] == WIDE.start_min and minutes[-1] == WIDE.end_min - 1
     assert len(set(minutes)) == 11
+
+
+# ---------------------------------------------------------------------------
+# "make sure the 2wice a day calls should be placed earlier"
+# ---------------------------------------------------------------------------
+
+# WIDE is 09:00-19:00 with a 3h gap, so `twice_deadline` splits the 7h that are
+# left in half: a two-call lead may take its first call up to 12:30, and the
+# chase then has 15:30-19:00 to place the second one.
+DEADLINE = 12 * 60 + 30
+
+
+def test_twice_deadline_leaves_equal_room_for_both_calls():
+    assert twice_deadline(WIDE, WIDE.start_min) == DEADLINE
+    first_half = DEADLINE - WIDE.start_min
+    second_half = WIDE.end_min - (DEADLINE + int(WIDE.same_day_gap_hours * 60))
+    assert first_half == second_half, "one of the two calls was given less room than the other"
+
+
+def test_twice_deadline_is_none_when_the_day_is_too_short():
+    """Approved at 17:00 against a 19:00 close: there is room for one call, not two.
+
+    Saying so is the point. Crushing every two-call lead onto one early minute to
+    honour a second call the window cannot hold would cost them their first call
+    as well, and `_recall_due` reads the same None and never comes due.
+    """
+    assert twice_deadline(WIDE, 17 * 60) is None
+    assert twice_deadline(WIDE, WIDE.end_min - int(WIDE.same_day_gap_hours * 60)) is None
+
+
+@pytest.mark.parametrize("dte, why", [
+    (0, "RED day: mandatory, and E0"),
+    (-1, "the day after expiry"),
+    (-3, "F6, the last of the two-call bands"),
+    (2, "F5, the week before expiry"),
+])
+def test_a_two_call_lead_is_never_placed_past_the_deadline(dte, why):
+    """The reported bug: "if you schedule those people at 8 how can we dial them".
+
+    Every one of these leads has a call history late in the evening, which is what
+    the rotation rule turns into an evening slot. Rotation now works inside the
+    lead's own half of the window, so it cannot undo this.
+    """
+    pairs = [_pair("F5", f"t{i}", dte=dte, last_interaction_time="2026-08-27 17:30:00")
+             for i in range(20)]
+    result = dispatch(pairs, TODAY, DEFAULT_CONFIG, WIDE)
+    assert len(result.slots) == 20
+    latest = max(s.minute for s in result.slots)
+    assert latest < DEADLINE, (
+        f"{why}: placed at {latest // 60:02d}:{latest % 60:02d}, too late for a second call")
+
+
+def test_a_one_call_lead_still_gets_the_whole_window():
+    """The ceiling is per lead, not a shortened day for everybody.
+
+    Halving the window for leads who were only ever getting one call would halve
+    the console's capacity to buy nothing.
+    """
+    pairs = [_pair("F1", f"o{i}", dte=20) for i in range(40)]
+    result = dispatch(pairs, TODAY, DEFAULT_CONFIG, WIDE)
+    assert max(s.minute for s in result.slots) > DEADLINE
+
+
+def test_the_two_groups_are_spread_over_their_own_halves():
+    """Mixed plan: each group fills its own half rather than sharing one spread."""
+    pairs = ([_pair("E0", f"x{i}", dte=0) for i in range(10)]
+             + [_pair("F1", f"y{i}", dte=20) for i in range(10)])
+    result = dispatch(pairs, TODAY, DEFAULT_CONFIG, WIDE)
+    by_uuid = {s.lead["lead_uuid"]: s.minute for s in result.slots}
+    twice = [m for u, m in by_uuid.items() if u.startswith("x")]
+    once = [m for u, m in by_uuid.items() if u.startswith("y")]
+    assert max(twice) < DEADLINE
+    # Each half is filled end to end -- not bunched onto one minute, which is what
+    # a single ceiling applied only at placement time would have produced.
+    assert min(twice) == WIDE.start_min and max(twice) == DEADLINE - 1
+    assert min(once) == WIDE.start_min and max(once) == WIDE.end_min - 1
+
+
+def test_a_full_early_half_costs_the_second_call_not_the_day():
+    """More two-call leads than the early half can hold. They still get dialled.
+
+    One call today beats none: the overflow takes a late minute and loses its
+    second call. The alternative is a lead the plan counted and nobody rang.
+    """
+    dcfg = DispatchConfig(**{**WIDE.__dict__, "max_per_minute": 1})
+    pairs = [_pair("E0", f"f{i}", dte=0) for i in range(DEADLINE - WIDE.start_min + 30)]
+    result = dispatch(pairs, TODAY, DEFAULT_CONFIG, dcfg)
+    assert result.unplaceable == 0 and len(result.slots) == len(pairs)
+    assert max(s.minute for s in result.slots) >= DEADLINE
 
 
 def test_stagger_never_exceeds_max_per_minute():

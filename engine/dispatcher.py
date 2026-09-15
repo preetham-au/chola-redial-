@@ -11,15 +11,20 @@ Four rules, in the order they are applied:
                   are placed first. When `max_per_run` bites it is the
                   far-from-expiry leads that get shed, never the ones about to
                   lapse. The shed count is returned, not swallowed.
-  2. ONE SLOT   — one call per lead per pass. F5/E0/F6 allow two a day, but the
-                  second is the recall pass's, not this one's: see the note
-                  where it used to be booked, below.
-  3. ROTATION   — a lead dialled yesterday at 09:00 is not dialled at 09:00
+  2. ONE SLOT   — one call per lead per pass. F5/E0/F6 and the mandatory days
+                  allow two a day, but the second is the recall pass's, not this
+                  one's: see the note where it used to be booked, below.
+  3. EARLY      — a lead who gets TWO calls today takes its first one in the
+                  first half of the window (`twice_deadline`), so the second one
+                  still has hours to land in. Placed late, it is one call and not
+                  two, whatever the plan believed it was giving them.
+  4. ROTATION   — a lead dialled yesterday at 09:00 is not dialled at 09:00
                   today. Ported from schedule_redials.py: today's minute-of-day
                   is (last call's minute + shift_from_last_hours) wrapped into
-                  the window. Leads with no history are spread uniformly.
-  4. STAGGER    — at most `max_per_minute` calls share a minute; overflow moves
-                  to the next free minute, still inside the window.
+                  the lead's own half of the window. Leads with no history are
+                  spread uniformly across it.
+  5. STAGGER    — at most `max_per_minute` calls share a minute; overflow moves
+                  to the next free minute, still inside the lead's half.
 """
 from __future__ import annotations
 
@@ -37,6 +42,7 @@ __all__ = [
     "DispatchConfig", "Slot", "DispatchResult", "WINDOW_FLOOR", "WINDOW_CEIL",
     "DEFAULT_RED_PRIORITY", "parse_hhmm", "validate_dial_window", "red_rank",
     "dispatch_config_from_body", "red_config_from_body", "dispatch", "manual_pairs",
+    "twice_today", "twice_deadline",
 ]
 
 # Regulatory / operational clamp. Nothing may be dialled outside these hours,
@@ -225,6 +231,56 @@ def red_config_from_body(body: dict[str, Any]) -> RedConfig:
 # Dispatch
 # ---------------------------------------------------------------------------
 
+def twice_today(dte: Any, config: RedConfig) -> bool:
+    """Could the engine give this lead a SECOND call today?
+
+    Asked of the same config `evaluate` will be asked rather than hardcoded, so
+    narrowing a window narrows this with it. The two branches of `evaluate` that
+    let `calls_today` reach two: a mandatory day (RED-1, RED) and an intensive
+    window — F5/E0/F6, dte 7..1, 0..-1, -2..-3, which is the operator's
+    "red 0-7 and -1 to -3".
+    """
+    if dte is None:
+        return False
+    try:
+        dte = int(dte)
+    except (TypeError, ValueError):
+        return False
+    if dte in config.mandatory_days:
+        return True
+    window = config.window_for(dte)
+    return bool(window and window.intensive)
+
+
+def twice_deadline(dcfg: DispatchConfig, start_min: int) -> Optional[int]:
+    """Latest minute a two-call lead may take its FIRST call. None = no room.
+
+    Reported on 15 Sep 2026: "you schedule the calls over the day to people who
+    can be dialled twice — if you schedule those at 8 how can we dial them".
+    Exactly right. The second call is legal only `same_day_gap_hours` after the
+    first and only inside the window, so a first call at 19:00 in a window that
+    shuts at 19:00 is not a first call at all: it is the only call that lead will
+    ever get, placed by a scheduler that believed it was giving them two.
+
+    So the hours that are left are split in half around the gap:
+
+        [start .......... deadline]   gap   [deadline+gap .......... end)
+             first calls                          the chase's calls
+
+    Equal halves on purpose. Any other split starves one of them, and they hold
+    the same leads — a first-call half wide enough for everybody is no use if the
+    chase behind it has ten minutes to place the same number again.
+
+    None when what is left of the window cannot hold both. A campaign approved at
+    16:00 against a 19:00 close and a 3h gap has room for one call each, and
+    saying so is better than crushing every two-call lead onto one minute to
+    honour a second call that cannot happen. `_recall_due` reads the same None
+    and never comes due.
+    """
+    room = dcfg.end_min - start_min - int(round(dcfg.same_day_gap_hours * 60))
+    return start_min + room // 2 if room >= 2 else None
+
+
 def _lead_key(lead: dict[str, Any]) -> str:
     """Stable tiebreak so two runs over the same data produce the same plan."""
     for name in ("lead_uuid", "id", "warehouse_lead_id", "policy_no", "contact_id"):
@@ -258,36 +314,60 @@ def dispatch(
         ordered = ordered[:dcfg.max_per_run]
 
     start = dcfg.start_min if floor_min is None else max(dcfg.start_min, int(floor_min))
-    # Span drives the rotation modulo below; it has to shrink with the floor or a
-    # rotated slot can be pushed back past the end of the remaining window.
-    span = max(1, dcfg.end_min - start)
     shift_min = int(round(dcfg.shift_from_last_hours * 60))
 
-    # --- rule 3: rotation ---------------------------------------------------
+    # --- rule 3: the two-call leads go early --------------------------------
+    # Per lead, the last minute it may be placed on: `end_min` for almost
+    # everybody, and for a lead the engine could call TWICE today the point past
+    # which a second call could not follow it. Every step below works in the
+    # lead's own ceiling rather than one shared span, because a ceiling applied
+    # at placement alone is a ceiling rotation and the uniform spread have
+    # already driven straight through.
+    deadline = twice_deadline(dcfg, start)
+    ceiling = [deadline if deadline and twice_today(dec.dte, config) else dcfg.end_min
+               for _lead, dec in ordered]
+
+    # --- rule 4: rotation ---------------------------------------------------
     desired: list[Optional[int]] = [None] * len(ordered)
     for index, (lead, _dec) in enumerate(ordered):
         last = parse_timestamp(lead.get("last_interaction_time") or lead.get("last_called_at"))
         if last is not None and shift_min > 0:
             base = last.hour * 60 + last.minute + shift_min
-            desired[index] = start + (base - start) % span
+            # The modulo works in the lead's OWN reach: it has to shrink with the
+            # floor or a rotated slot lands past the end of what is left, and it
+            # has to shrink with the deadline or a two-call lead with any call
+            # history at all wraps straight back into the evening.
+            desired[index] = start + (base - start) % max(1, ceiling[index] - start)
 
-    blank = [i for i, m in enumerate(desired) if m is None]
-    # Across `span - 1`, not `span`: the window is half-open (see `_free_minute`),
-    # so the last minute anybody may be placed on is `end_min - 1`. Spreading onto
-    # `end_min` handed the last lead a minute the window had already shut on, and
-    # `_free_minute` answered None -- one lead silently unplaceable per plan, the
-    # one the spread had picked to go last. The rotation above already works in
-    # `span` modulo, so it never produced `end_min` in the first place.
-    for k, index in enumerate(blank):
-        desired[index] = start if len(blank) < 2 else \
-            start + int(round(k * (span - 1) / (len(blank) - 1)))
+    # One spread per ceiling, so each group fills its own half evenly. A single
+    # spread across the whole window would deal two-call leads into the evening
+    # before `_free_minute` ever saw them.
+    #
+    # Across `reach - 1`, not `reach`: the window is half-open (see
+    # `_free_minute`), so the last minute anybody may be placed on is the one
+    # before it shuts. Spreading onto the boundary handed the last lead a minute
+    # the window had already closed on and `_free_minute` answered None -- one
+    # lead silently unplaceable per plan, the one the spread picked to go last.
+    for limit in sorted(set(ceiling)):
+        blank = [i for i, m in enumerate(desired) if m is None and ceiling[i] == limit]
+        reach = max(1, limit - start)
+        for k, index in enumerate(blank):
+            desired[index] = start if len(blank) < 2 else \
+                start + int(round(k * (reach - 1) / (len(blank) - 1)))
 
-    # --- rules 1 + 4: place the pass's call in priority order, staggered -----
+    # --- rules 1 + 5: place the pass's call in priority order, staggered -----
     load: dict[int, int] = {}
     result = DispatchResult(slots=[])
     for index, (lead, dec) in enumerate(ordered):
         want = desired[index]
-        minute = _free_minute(start if want is None else want, load, dcfg, start)
+        limit = ceiling[index]
+        minute = _free_minute(start if want is None else want, load, dcfg, start, limit)
+        if minute is None and limit < dcfg.end_min:
+            # The early half filled up. One call today beats none, so this lead
+            # takes a late minute and loses its second call rather than its day.
+            # That is the right way round to fail: the alternative is a lead the
+            # plan counted and nobody rang.
+            minute = _free_minute(limit, load, dcfg, start)
         if minute is None:
             result.unplaceable += 1
             continue
@@ -322,8 +402,12 @@ def dispatch(
 
 
 def _free_minute(wanted: int, load: dict[int, int], dcfg: DispatchConfig,
-                 floor_min: Optional[int] = None) -> Optional[int]:
-    """First minute >= `wanted` under the per-minute ceiling, or None.
+                 floor_min: Optional[int] = None,
+                 ceil_min: Optional[int] = None) -> Optional[int]:
+    """First free minute in [max(wanted, floor), min(end, ceil)), or None.
+
+    `ceil_min` is the two-call deadline (see `twice_deadline`); without one the
+    window's own end applies.
 
     The window is half-open: `end_min` is when it SHUTS, so no call is placed on
     it. That makes the capacity arithmetic true -- `end - start` minutes are
@@ -333,9 +417,10 @@ def _free_minute(wanted: int, load: dict[int, int], dcfg: DispatchConfig,
     neither run over its own ceiling.
     """
     minute = max(wanted, dcfg.start_min if floor_min is None else floor_min)
+    end = dcfg.end_min if ceil_min is None else min(dcfg.end_min, ceil_min)
     if not dcfg.max_per_minute:
-        return minute if minute < dcfg.end_min else None
-    while minute < dcfg.end_min:
+        return minute if minute < end else None
+    while minute < end:
         if load.get(minute, 0) < dcfg.max_per_minute:
             return minute
         minute += 1

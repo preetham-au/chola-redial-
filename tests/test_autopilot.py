@@ -951,45 +951,62 @@ def _armed_campaign(conn):
     return campaign["id"]
 
 
-def _first_pass(conn, campaign_id, hours_ago, posted=40):
-    """A first pass that went out `hours_ago` hours ago and reached `posted` people."""
+def _first_pass(conn, campaign_id, at="11:00", posted=40):
+    """A first pass dialled at `at` today that reached `posted` people.
+
+    The minute matters now, not just the elapsed hours: the chase is due once the
+    LAST two-call lead of that pass has aged `same_day_gap_hours`, and where that
+    falls is read from the pass's own start (see `dispatcher.twice_deadline`).
+    """
+    hour, minute = (int(p) for p in at.split(":"))
     conn.execute(
         "INSERT INTO runs (campaign_id, run_date, kind, status, config_version, created_at, "
         "dry_run, evaluated, planned, slots, posted, failed, dropped, note) "
         "VALUES (?,?,'auto','committed',1,?,1,?,?,?,?,0,0,'seeded')",
         (campaign_id, TODAY.isoformat(),
-         (now_ist() - datetime.timedelta(hours=hours_ago)).isoformat(timespec="seconds"),
+         datetime.datetime.combine(TODAY, datetime.time(hour, minute)).isoformat(timespec="seconds"),
          posted, posted, posted, posted))
     conn.commit()
 
 
-def test_a_campaign_is_chased_three_hours_after_its_own_first_pass(client):
+def _at(hhmm):
+    hour, minute = (int(p) for p in hhmm.split(":"))
+    return datetime.datetime.combine(TODAY, datetime.time(hour, minute))
+
+
+def test_a_campaign_is_chased_once_its_last_two_call_lead_is_three_hours_old(client):
     """"if you call them at 11 30 if they do not pick call them after 3 hrs only".
 
-    Three hours after ITS OWN first pass, not at a time of day. Twenty-two
-    campaigns that dialled at twenty-two different times come due at twenty-two
-    different minutes, which is both what was asked for and what keeps the chase
-    off Formi in one burst.
+    Three hours against ITS OWN pass, not a time of day. Twenty-two campaigns that
+    dialled at twenty-two different times come due at twenty-two different
+    minutes, which is both what was asked for and what keeps the chase off Formi
+    in one burst.
 
-    The gap is `same_day_gap_hours` — the operator's own knob, the same number the
-    engine then applies again to each individual lead's own last call.
+    Three hours after the LAST of that pass's two-call leads, though, not after
+    the pass began. The chase gets one run per campaign per day and the pass's own
+    calls are spread over hours; firing at `first pass + 3h` caught only the leads
+    dialled in its opening minutes, and everyone rung later was still inside their
+    own three hours, answered SKIP_CADENCE, and was never looked at again.
+
+    The default window is 09:00-20:00 with a 3h gap. A pass that starts at 11:00
+    may place a two-call lead up to 14:00 (`twice_deadline`), so the chase is due
+    at 17:00 — not at 14:00, which is what the old rule would have said.
     """
     from api.autopilot import _recall_due
 
     conn = _db()
     campaign_id = _armed_campaign(conn)
     try:
-        assert not _recall_due(conn, campaign_id, TODAY, now_ist()), (
+        assert not _recall_due(conn, campaign_id, TODAY, _at("17:00")), (
             "a campaign that has not called anybody today has nothing to chase")
 
-        _first_pass(conn, campaign_id, hours_ago=1)
-        assert not _recall_due(conn, campaign_id, TODAY, now_ist()), (
-            "one hour after the first pass is not three; nobody is due a second call yet")
-
-        conn.execute("DELETE FROM runs WHERE run_date=?", (TODAY.isoformat(),))
-        _first_pass(conn, campaign_id, hours_ago=4)
-        assert _recall_due(conn, campaign_id, TODAY, now_ist()), (
-            "four hours after the first pass, the chase is due")
+        _first_pass(conn, campaign_id, at="11:00")
+        assert not _recall_due(conn, campaign_id, TODAY, _at("14:00")), (
+            "three hours after the pass STARTED, its later leads have not aged three "
+            "hours of their own; chasing here is the bug this rule exists to stop")
+        assert not _recall_due(conn, campaign_id, TODAY, _at("16:59"))
+        assert _recall_due(conn, campaign_id, TODAY, _at("17:00")), (
+            "the last lead the pass could place at 14:00 is now three hours old")
 
         # The day's one chase, already out. Asking here is what stops a settled
         # campaign being re-synced against the warehouse every ten minutes for a
@@ -1000,8 +1017,29 @@ def test_a_campaign_is_chased_three_hours_after_its_own_first_pass(client):
             "VALUES (?,?,'auto_pm','committed',1,?,1,5,5,5,5,0,0,'seeded')",
             (campaign_id, TODAY.isoformat(), now_ist().isoformat(timespec="seconds")))
         conn.commit()
-        assert not _recall_due(conn, campaign_id, TODAY, now_ist()), (
+        assert not _recall_due(conn, campaign_id, TODAY, _at("18:00")), (
             "the recall has already gone out today; a campaign is chased once")
+    finally:
+        conn.execute("DELETE FROM runs WHERE note='seeded' AND run_date=?", (TODAY.isoformat(),))
+        conn.commit()
+        conn.close()
+
+
+def test_a_late_first_pass_is_never_chased(client):
+    """A pass that starts at 18:00 against a 20:00 close has room for one call.
+
+    `twice_deadline` answers None and the chase never comes due — rather than
+    coming due at 21:00 for `_approve_one` to refuse with `window_closed`, which
+    would re-sync every armed campaign against the warehouse to place nothing.
+    """
+    from api.autopilot import _recall_due
+
+    conn = _db()
+    campaign_id = _armed_campaign(conn)
+    try:
+        _first_pass(conn, campaign_id, at="18:00")
+        assert not _recall_due(conn, campaign_id, TODAY, _at("19:59"))
+        assert not _recall_due(conn, campaign_id, TODAY, _at("23:30"))
     finally:
         conn.execute("DELETE FROM runs WHERE note='seeded' AND run_date=?", (TODAY.isoformat(),))
         conn.commit()
@@ -1041,18 +1079,22 @@ def test_the_recall_dials_without_an_approval_and_never_beside_a_dial_walk(clien
     # The status re-read is a warehouse call. Its own failure is already logged
     # and survived; stubbing it keeps this test off the network either way.
     monkeypatch.setattr(autopilot, "_resync_status", lambda *_a, **_k: [])
+    # `run_recall` reads the clock itself, and dueness is now a minute of the day
+    # rather than an elapsed count. Pinning it is what keeps this test from
+    # passing or failing on the hour it happens to be run at.
+    clock = {"now": _at("12:00")}
+    monkeypatch.setattr(autopilot, "now_ist", lambda: clock["now"])
 
     conn = _db()
     campaign_id = _armed_campaign(conn)
     try:
-        # Not due yet: one hour since the first pass.
-        _first_pass(conn, campaign_id, hours_ago=1)
+        # Not due yet: the pass's later leads have not aged their own three hours.
+        _first_pass(conn, campaign_id, at="11:00")
         out = autopilot.run_recall(TODAY)
         assert out["skipped"] == "no campaign is due"
         assert approved == [], "a campaign one hour past its first pass was chased early"
 
-        conn.execute("DELETE FROM runs WHERE run_date=?", (TODAY.isoformat(),))
-        _first_pass(conn, campaign_id, hours_ago=4)
+        clock["now"] = _at("17:00")
 
         # Due, but the operator is already dialling. Nothing may go out.
         day._dial_state["running"] = True
