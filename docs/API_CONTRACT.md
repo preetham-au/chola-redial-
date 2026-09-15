@@ -177,10 +177,12 @@ out"`, so a live campaign is never entirely off-screen.
 
 ### The daily plan (autopilot)
 
-`campaigns.autopilot` means **"include this campaign in the daily plan"**. It is
-not a dialler. Twice a day a pass re-reads campaign status, re-syncs those
-campaigns' leads and PREPARES a plan for each — and stops there, leaving the run
-`planned`. There is no path from a pass to Formi.
+`campaigns.autopilot` means **"include this campaign in the daily plan"**. Twice
+a day a pass re-reads campaign status, re-syncs those campaigns' leads and
+PREPARES a plan for each, leaving the run `planned`.
+
+The FIRST pass stops there: there is no path from it to Formi, and it waits for
+an approval on the day screen.
 
 Pass times come from `AUTOPILOT_AM` (default `10:00`) and `AUTOPILOT_PM`
 (default `15:00`), IST. These are when a plan is BUILT, not a band it may dial
@@ -190,8 +192,33 @@ Two passes because the client's rule is "second call only if the first is not
 answered": the second plan is built *after* a re-sync, so it only reaches leads
 whose last call still says nobody picked up (no pick, hung up, under
 `short_call_seconds`, or a `second_call_dispositions` slug) and whose
-`same_day_gap_hours` since that call have passed. Each pass needs its own
-approval.
+`same_day_gap_hours` since that call have passed.
+
+#### The automatic recall — the one unattended path to Formi
+
+The recall pass no longer waits for an approval. On the same tick,
+`api/autopilot.py`'s `run_recall` prepares AND dials it, one campaign at a time:
+
+* **When.** A campaign comes due `same_day_gap_hours` (default 3) after **its
+  own** first pass was dialled — "you called them at 11:30, call them again after
+  3 hrs". Not a time of day, so campaigns that dialled at different times chase
+  at different minutes rather than arriving at Formi together. The server looks
+  for a due campaign every `RECALL_EVERY_MIN` (10) minutes.
+* **Who.** Only leads the engine gives a second slot: the two-calls-a-day buckets
+  F5 / E0 / F6 — RED 0..7 days before expiry and 1..3 days after — whose earlier
+  call today says nobody was reached, and whose own `same_day_gap_hours` have
+  passed. A due campaign routinely dials nobody.
+* **Once.** `_write_run`'s (campaign, date, kind) guard doubles as the "already
+  chased today" guard, so a campaign is chased at most once a day. A recall that
+  finds nobody eligible leaves its run `planned` and is retried on a later tick.
+* **What still holds it back.** It goes out through `day._approve_one`, the same
+  function the operator's Approve calls, so the dial window (a recall due at
+  21:00 answers `window_closed`), `max_per_minute`, `DRY_RUN`, pause and hide all
+  apply unchanged. It re-reads Formi campaign status first, and it never runs
+  while an operator's own dial walk is in flight.
+* **The kill switch.** `AUTO_RECALL=0` stops it, including the manual endpoint —
+  a kill switch with a bypass beside it is not a kill switch. The day screen's
+  Dial button remains the way to chase by hand.
 
 The same tick settles the dial log every 10 minutes between 09:00 and 21:00 (see
 Call log). Verification is read-only and cannot place a call.
@@ -204,9 +231,10 @@ than planning against stale leads.
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET` | `/api/autopilot` | `{passes, dials: false, now, fired_today, campaigns[]}`. `dials` is always `false` and is said out loud so a screen can repeat it. `now` is the server's IST clock as `HH:MM` — pass times are IST and the browser is not, so "has 10:00 gone by?" is only answerable here. A pass whose `at` is `<= now` and is absent from `fired_today` was missed; it fires once a day and is never retried. |
-| `POST` | `/api/campaigns/{id}/autopilot` | `{ "on": true \| false }` → the campaign; **409** if disabled. Switching it on never places a call. |
+| `GET` | `/api/autopilot` | `{passes, dials, recall: {on, every_min, last_run}, now, fired_today, campaigns[]}`. `dials` is `AUTO_RECALL` — the first pass still never dials, the recall does. `now` is the server's IST clock as `HH:MM` — pass times are IST and the browser is not, so "has 10:00 gone by?" is only answerable here. A pass whose `at` is `<= now` and is absent from `fired_today` was missed; it fires once a day and is never retried. |
+| `POST` | `/api/campaigns/{id}/autopilot` | `{ "on": true \| false }` → the campaign; **409** if disabled. Switching it on places no call itself; it does put the campaign in the automatic recall. |
 | `POST` | `/api/autopilot/run` | `{ "kind": "auto" \| "auto_pm", "date"? }` — prepare a pass now; safe to repeat, an already-approved pass answers `already_ran` |
+| `POST` | `/api/autopilot/recall` | `{ "date"? }` — **dials.** Runs the automatic recall now instead of waiting for the tick. Answers a `/api/day/approve` body plus `due` (campaigns chased) and `skipped` (`""`, `"AUTO_RECALL is off"`, `"a dial is already running"`, `"no campaign is due"`). |
 
 Run kinds: `auto` (first pass), `auto_pm` (recall pass), `manual`.
 

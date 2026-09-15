@@ -147,10 +147,12 @@ export function Dashboard() {
 
 /** The one switch: put this campaign in the daily plan, or take it out.
  *
- *  It never dials. On, the server re-syncs the leads and PREPARES a plan twice a
- *  day; the plan waits on the day screen until an operator approves it. The
- *  campaign leaves the plan on its own when every policy is past the grace
- *  window, and the moment it is paused or removed in Formi. */
+ *  On, the server re-syncs the leads and PREPARES a plan twice a day. The FIRST
+ *  pass waits on the day screen until an operator approves it. The RECALL pass
+ *  does not wait: a few hours after that first pass went out it chases whoever
+ *  did not answer, by itself. The campaign leaves the plan on its own when every
+ *  policy is past the grace window, and the moment it is paused or removed in
+ *  Formi. */
 function Autopilot() {
   const campaign = useCampaign();
   const { campaigns, setCampaigns, toast } = useStore();
@@ -167,7 +169,7 @@ function Autopilot() {
         on ? 'info' : 'ok',
         on
           ? `${next.name} is out of the daily plan. Nothing is planned for it.`
-          : `${next.name} is in the daily plan. Its plan is ready each day and waits for you to approve the day.`,
+          : `${next.name} is in the daily plan. Its first pass is ready each day and waits for you to approve it; the recall chases whoever did not answer on its own.`,
       );
     } catch (e) {
       toast('bad', (e as Error).message);
@@ -179,13 +181,13 @@ function Autopilot() {
   return (
     <Card
       title="In the daily plan"
-      eyebrow={on ? 'planned every day · never dialled without your approval' : 'not planned'}
+      eyebrow={on ? 'planned every day · you approve the first pass' : 'not planned'}
     >
       <div className="row" style={{ gap: 14, alignItems: 'flex-start' }}>
         <p className="hero-sub" style={{ margin: 0, flex: 1 }}>
           {on
-            ? 'Twice a day — a first pass, then a recall for the leads it did not reach — this campaign re-syncs and its plan is built for you. It goes out only when you approve the day. It leaves the plan when every policy is past the grace window, or when it is paused here or in Formi.'
-            : 'Put this campaign in the daily plan and its calls are worked out for you each day. Switching it on never places a call — you approve the day.'}
+            ? 'Twice a day this campaign re-syncs and its plan is built for you. The first pass goes out only when you approve the day. The recall does not wait: a few hours after that first pass it chases the leads it did not reach — only those in the last week before RED and the three days after, and only where the earlier call says nobody was reached. It leaves the plan when every policy is past the grace window, or when it is paused here or in Formi.'
+            : 'Put this campaign in the daily plan and its calls are worked out for you each day. Switching it on places no call by itself — you approve the first pass. The recall of that pass is then automatic.'}
           {campaign.autopilot_note ? (
             <>
               {' '}

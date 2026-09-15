@@ -1,9 +1,13 @@
 /** The day. One screen, one decision.
  *
- *  Nothing in this console dials on its own. A pass prepares a plan — the day's
- *  first, then the recall after it — and leaves it waiting; this screen is where
- *  an operator reads
- *  what is ready and approves it. If nobody approves, no call goes out.
+ *  The day's FIRST pass dials nothing on its own: it prepares a plan and leaves
+ *  it waiting, and this screen is where an operator reads what is ready and
+ *  approves it. If nobody approves, no first call goes out.
+ *
+ *  The RECALL pass is not like that any more. It chases the calls the approved
+ *  first pass did not reach, a few hours later, and it dials without being asked
+ *  again — see api/autopilot.py's `run_recall`. So this screen shows a recall
+ *  that may already have gone out by itself.
  *
  *  The order is the client's, not the bucket order: the three days just PAST
  *  expiry first (their "1 to 3"), then the week running up to it (their "-7 to

@@ -1,18 +1,26 @@
 """The clock: switch a campaign on once and its plans are ready every day.
 
 `campaigns.autopilot` means "include this campaign in the daily plan". Twice a
-day this module re-syncs those campaigns' leads and PREPARES a plan for each —
-and stops there. **Nothing here dials.** The plan waits for an operator to
-approve it on the day screen (api/day.py); if nobody does, no call goes out.
+day this module re-syncs those campaigns' leads and PREPARES a plan for each.
+The FIRST pass stops there: it waits for an operator to approve it on the day
+screen (api/day.py), and if nobody does, no call goes out.
+
+The RECALL pass does not wait. Asked for on 15 Sep 2026 — "Recall pass i wont
+approve send it should automatically schedule the call based on the previous
+today's call only for the required one" — so `run_recall` both prepares and
+dials it, one campaign at a time, each once its own first pass is
+`same_day_gap_hours` old. That is the only thing in this module that reaches
+Formi; `run_recall` lists what still holds it back.
 
 Two passes, two run kinds, because `_write_run` refuses to replace a run for the
 same (campaign, date, kind) once it has been acted on — which is exactly the
-"already prepared today" guard, so no extra bookkeeping column is needed:
+"already prepared today" guard, and for the recall it doubles as the "already
+chased today" guard, so no extra bookkeeping column is needed:
 
     auto      first pass   the day's plan, every schedulable bucket
     auto_pm   recall pass  a second plan, built AFTER a re-sync so it only
                            reaches leads whose last call still says nobody was
-                           reached
+                           reached — and dialled with no approval in front of it
 
 The two preparation times below are when each plan is BUILT, not hours either
 pass may dial in. Both dial anywhere in the campaign's own window; what makes
@@ -177,6 +185,168 @@ def run_pass(kind: str, day: Optional[date] = None) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# The automatic recall
+# ---------------------------------------------------------------------------
+
+_OFF = {"0", "false", "no", "off"}
+
+# How often a due campaign is looked at again. NOT a time of day: a campaign is
+# due `same_day_gap_hours` after its own first pass, which is a different minute
+# for each of them. This is only the floor on how often we go back and check, so
+# a campaign that was due but had nobody eligible yet is not re-synced against
+# the warehouse every single minute until somebody is.
+RECALL_EVERY_MIN = 10
+_recalled_at: Optional[datetime] = None
+
+
+def auto_recall_on() -> bool:
+    """Whether the recall pass dials itself. On unless switched off.
+
+    The one kill switch, and the only thing here that is not already a knob
+    somewhere else: everything the recall obeys — the campaign's dial window,
+    DRY_RUN, pause, `max_per_minute`, the per-lead RED gate — it obeys because it
+    goes out through `day._approve_one`, the same function the operator's own
+    Approve calls.
+    """
+    return (os.environ.get("AUTO_RECALL") or "1").strip().lower() not in _OFF
+
+
+def _recall_due(conn: sqlite3.Connection, campaign_id: int, day: date,
+                now: datetime) -> bool:
+    """Has this campaign earned its second call of the day yet?
+
+    `same_day_gap_hours` after its FIRST PASS went out — read per campaign, so it
+    is the operator's own knob answering the operator's own example: "if you call
+    them at 11:30 and they do not pick, call them after 3 hrs". Per campaign
+    rather than at one clock time on purpose: twenty-two campaigns chased at
+    twenty-two different minutes is twenty-two small posts to Formi instead of
+    one thundering herd, which is the whole of "do not overload the system".
+
+    This is only the COARSE gate — it decides when to look, never who to call.
+    Whether any individual lead has earned a second call stays the engine's
+    question: `wants_second_call` reads the disposition that lead's first call
+    recorded, `same_day_gap_hours` is applied again to that lead's own last call,
+    and only the two-calls-a-day buckets F5/E0/F6 — the operator's "red 0-7 and
+    -1 to -3" — can hold a second slot at all. A campaign that is due can very
+    reasonably dial nobody.
+    """
+    first = conn.execute(
+        "SELECT created_at FROM runs WHERE campaign_id=? AND run_date=? AND kind=? "
+        "AND posted>0 ORDER BY id DESC LIMIT 1",
+        (campaign_id, day.isoformat(), AM)).fetchone()
+    # No first pass, no recall. A campaign that has not called anybody today has
+    # nothing to chase, whatever the hour — the recall is defined against the
+    # previous call, not against the clock.
+    if first is None:
+        return False
+    # The day's one chase, already out. `_write_run`'s (campaign, date, kind)
+    # guard would refuse a second one anyway; asking here is what keeps a settled
+    # campaign from being re-synced against the warehouse every ten minutes for a
+    # plan that cannot be written.
+    if conn.execute("SELECT 1 FROM runs WHERE campaign_id=? AND run_date=? AND kind=? "
+                    "AND status<>'planned' LIMIT 1",
+                    (campaign_id, day.isoformat(), PM)).fetchone():
+        return False
+    gap = config_from_settings(current_config(conn, campaign_id)).same_day_gap_hours
+    try:
+        dialled = datetime.fromisoformat(first["created_at"])
+    except (TypeError, ValueError):          # a hand-edited row; never chase on a guess
+        return False
+    return now >= dialled + timedelta(hours=float(gap))
+
+
+def run_recall(day: Optional[date] = None) -> dict[str, Any]:
+    """Chase today's unanswered calls. THIS DIALS — there is no approval in front.
+
+    Asked for in as many words: "Recall pass i wont approve send it should
+    automatically schedule the call based on the previous today's call only for
+    the required one." So the recall pass stopped waiting for a person.
+
+    It is still exactly the two steps an operator performs by hand, in the same
+    order and through the same two functions:
+
+        `_prepare_one(resync=True)`  re-pulls the campaign's leads, so the plan is
+                                     built against how the day's earlier calls
+                                     actually went and not yesterday's guess at it
+        `_approve_one`               re-plans from this minute and commits
+
+    Which is the point: nothing about a dial is re-implemented here, so nothing
+    about a dial can drift. A recall that comes due at 21:00 answers
+    `window_closed` and dials nobody, because `_approve_one` checks the window. A
+    paused campaign never reaches it, because `_armed` and `_prepare_one` both
+    ask. DRY_RUN is honoured because `_commit` honours it. `max_per_minute` and
+    the RED bands hold because `_write_run` and the engine hold them.
+
+    Two things are this function's own:
+
+      * it never runs beside the operator's own dial walk — two writers posting
+        to Formi at once is a customer called twice in a minute;
+      * it re-reads Formi's campaign status first, for the same reason
+        `prepare_day` does. A campaign the client paused at 11:00 must drop out
+        of the chase, and a pass that dials with nobody watching needs that check
+        more than one that waits for a button, not less.
+    """
+    from .day import _approve_one, _armed, _day_result, _dial_state, _prepare_one  # noqa: PLC0415
+
+    day = day or now_ist().date()
+    now = now_ist()
+
+    def nothing(why: str, due: int = 0) -> dict[str, Any]:
+        return {**_day_result([], day.isoformat(), PM, []), "skipped": why, "due": due}
+
+    if not auto_recall_on():
+        return nothing("AUTO_RECALL is off")
+    if _dial_state["running"]:
+        return nothing("a dial is already running")
+
+    with session() as conn:
+        where, params = _armed()
+        due = [r["id"] for r in conn.execute(
+            f"SELECT id FROM campaigns WHERE {where} ORDER BY id", params)
+            if _recall_due(conn, r["id"], day, now)]
+    if not due:
+        return nothing("no campaign is due")
+
+    try:
+        _resync_status(day)
+    except Exception as exc:                 # noqa: BLE001 — reported, never fatal
+        log.warning("could not re-read campaign status before the recall: %s", exc)
+
+    results: list[dict[str, Any]] = []
+    for campaign_id in due:
+        # One campaign at a time, each opening its own connection for as long as
+        # it needs it. The queue IS the overload protection: twenty-two campaigns
+        # preparing and posting at once is what this shape exists to prevent.
+        prepared = _prepare_one(campaign_id, day, PM, resync=True)
+        if prepared["status"] != "prepared" or not prepared.get("ready"):
+            # resync_failed, not_in_daily_plan, finished, window_closed,
+            # already_ran, or simply nobody eligible. Carried through rather than
+            # dropped: a campaign missing from its own result is the one thing
+            # this must never do.
+            results.append(prepared)
+            continue
+        try:
+            with session() as conn:
+                where, params = _armed()
+                campaign = conn.execute(
+                    f"SELECT * FROM campaigns WHERE id=? AND {where}",
+                    (campaign_id, *params)).fetchone()
+                if campaign is None:         # disarmed while we were preparing
+                    results.append({**prepared, "status": "not_in_daily_plan"})
+                    continue
+                results.append(_approve_one(conn, campaign, day, PM, []))
+        except Exception as exc:             # noqa: BLE001 — one campaign, not the pass
+            log.exception("automatic recall failed on campaign %s", campaign_id)
+            results.append({"campaign_id": campaign_id, "status": "error",
+                            "detail": f"{type(exc).__name__}: {exc}"[:200]})
+
+    out = {**_day_result(results, day.isoformat(), PM, []), "skipped": "", "due": len(due)}
+    log.info("automatic recall %s: %s due, %s posted, %s refused",
+             day, len(due), out["posted"], out["failed"])
+    return out
+
+
+# ---------------------------------------------------------------------------
 # The loop
 # ---------------------------------------------------------------------------
 
@@ -198,9 +368,10 @@ async def loop() -> None:
     warehouse was down at 10:00, re-fire it by hand with POST /api/autopilot/run
     rather than have the box retry silently every minute.
 
-    The same tick settles the dial log. Verification is read-only — SELECTs
-    against the warehouse, writes only to the local log — so it is unaffected by
-    DRY_RUN and can never place a call.
+    The same tick chases the day's unanswered calls and settles the dial log.
+    The chase is the one thing on this tick that dials; see `run_recall`.
+    Verification is read-only — SELECTs against the warehouse, writes only to the
+    local log — so it is unaffected by DRY_RUN and can never place a call.
     """
     while True:
         now = now_ist()
@@ -210,6 +381,17 @@ async def loop() -> None:
                 continue
             _fired.add(key)
             await asyncio.to_thread(run_pass, kind, now.date())
+        # The recall chases today's unanswered calls, and unlike the passes above
+        # it DIALS. It gets no pass time of its own because it does not want one:
+        # each campaign comes due `same_day_gap_hours` after its OWN first pass,
+        # so the tick's job is only to come back and look often enough.
+        global _recalled_at
+        if auto_recall_on() and (_recalled_at is None or
+                                 (now - _recalled_at) >= timedelta(minutes=RECALL_EVERY_MIN)):
+            # Stamped before the await, not after: a recall that takes twenty
+            # minutes to place its calls must not be re-entered at minute ten.
+            _recalled_at = now
+            await asyncio.to_thread(run_recall, now.date())
         global _verified_at
         due = _verified_at is None or (now - _verified_at) >= timedelta(minutes=VERIFY_EVERY_MIN)
         # Elapsed time, not "minute % 10": a tick that drifts past the tenth
@@ -237,8 +419,12 @@ def autopilot_status() -> dict[str, Any]:
     with session() as conn:
         rows = conn.execute("SELECT * FROM campaigns ORDER BY id").fetchall()
     return {"passes": [{"kind": k, "at": at} for k, at in pass_times()],
-            # Said out loud so a screen can say it: a pass prepares, it never dials.
-            "dials": False,
+            # No longer always false. The first pass still only prepares and still
+            # waits for the day screen; the recall pass dials itself.
+            "dials": auto_recall_on(),
+            "recall": {"on": auto_recall_on(), "every_min": RECALL_EVERY_MIN,
+                       "last_run": _recalled_at.isoformat(timespec="seconds")
+                                   if _recalled_at else ""},
             # Pass times are IST and the browser is on whatever the operator's
             # laptop says, so "has 10:00 gone by?" is only answerable here.
             "now": now_ist().strftime("%H:%M"),
@@ -280,6 +466,19 @@ def trigger(kind: str = Body(AM, embed=True),
         raise HTTPException(422, f"kind must be {AM!r} or {PM!r}, got {kind!r}")
     day = date.fromisoformat(date_) if date_ else None
     return run_pass(kind, day)
+
+
+@router.post("/api/autopilot/recall")
+def trigger_recall(date_: Optional[str] = Body(None, embed=True, alias="date")) -> dict[str, Any]:
+    """Chase today's unanswered calls now. THIS DIALS — nothing follows it.
+
+    The same work the tick does, on demand: for running the chase early, and for
+    seeing what it would do without waiting ten minutes to find out. It answers
+    `skipped` rather than dialling when AUTO_RECALL is off, deliberately — a kill
+    switch with a manual bypass beside it is not a kill switch. The day screen's
+    own Dial button is still there for a chase somebody wants to make by hand.
+    """
+    return run_recall(date.fromisoformat(date_) if date_ else None)
 
 
 @router.delete("/api/campaigns/{campaign_id}")

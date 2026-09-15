@@ -485,8 +485,11 @@ def test_autopilot_switch_endpoints(client, armed):
     assert client.post("/api/campaigns/999/autopilot", json={"on": True}).status_code == 404
     body = client.get("/api/autopilot").json()
     assert [c["id"] for c in body["campaigns"]] == [16]
-    # The switch decides who is IN the plan; it can never place a call.
-    assert body["dials"] is False
+    # The switch decides who is IN the plan. Switching it on places no call of its
+    # own — but it does put the campaign in the automatic recall, and `dials` says
+    # so out loud rather than leaving a screen to guess.
+    assert body["dials"] is True
+    assert body["recall"]["on"] is True and body["recall"]["every_min"] > 0
 
 
 # ---------------------------------------------------------------------------
@@ -932,3 +935,163 @@ def test_the_afternoon_wave_reconsiders_this_mornings_outcome(
 
     planned = _planned_pm(armed)
     assert (uuid in planned) is again, f"{why} (planned={planned})"
+
+
+# ---------------------------------------------------------------------------
+# "Recall pass i wont approve send" — the chase that dials itself
+# ---------------------------------------------------------------------------
+
+def _armed_campaign(conn):
+    """One campaign in the daily plan, with today's runs cleared out from under it."""
+    campaign = conn.execute("SELECT * FROM campaigns LIMIT 1").fetchone()
+    conn.execute("UPDATE campaigns SET autopilot=1, enabled=1, paused=0, hidden=0 WHERE id=?",
+                 (campaign["id"],))
+    conn.execute("DELETE FROM runs WHERE run_date=?", (TODAY.isoformat(),))
+    conn.commit()
+    return campaign["id"]
+
+
+def _first_pass(conn, campaign_id, hours_ago, posted=40):
+    """A first pass that went out `hours_ago` hours ago and reached `posted` people."""
+    conn.execute(
+        "INSERT INTO runs (campaign_id, run_date, kind, status, config_version, created_at, "
+        "dry_run, evaluated, planned, slots, posted, failed, dropped, note) "
+        "VALUES (?,?,'auto','committed',1,?,1,?,?,?,?,0,0,'seeded')",
+        (campaign_id, TODAY.isoformat(),
+         (now_ist() - datetime.timedelta(hours=hours_ago)).isoformat(timespec="seconds"),
+         posted, posted, posted, posted))
+    conn.commit()
+
+
+def test_a_campaign_is_chased_three_hours_after_its_own_first_pass(client):
+    """"if you call them at 11 30 if they do not pick call them after 3 hrs only".
+
+    Three hours after ITS OWN first pass, not at a time of day. Twenty-two
+    campaigns that dialled at twenty-two different times come due at twenty-two
+    different minutes, which is both what was asked for and what keeps the chase
+    off Formi in one burst.
+
+    The gap is `same_day_gap_hours` — the operator's own knob, the same number the
+    engine then applies again to each individual lead's own last call.
+    """
+    from api.autopilot import _recall_due
+
+    conn = _db()
+    campaign_id = _armed_campaign(conn)
+    try:
+        assert not _recall_due(conn, campaign_id, TODAY, now_ist()), (
+            "a campaign that has not called anybody today has nothing to chase")
+
+        _first_pass(conn, campaign_id, hours_ago=1)
+        assert not _recall_due(conn, campaign_id, TODAY, now_ist()), (
+            "one hour after the first pass is not three; nobody is due a second call yet")
+
+        conn.execute("DELETE FROM runs WHERE run_date=?", (TODAY.isoformat(),))
+        _first_pass(conn, campaign_id, hours_ago=4)
+        assert _recall_due(conn, campaign_id, TODAY, now_ist()), (
+            "four hours after the first pass, the chase is due")
+
+        # The day's one chase, already out. Asking here is what stops a settled
+        # campaign being re-synced against the warehouse every ten minutes for a
+        # plan `_write_run` would refuse to write anyway.
+        conn.execute(
+            "INSERT INTO runs (campaign_id, run_date, kind, status, config_version, "
+            "created_at, dry_run, evaluated, planned, slots, posted, failed, dropped, note) "
+            "VALUES (?,?,'auto_pm','committed',1,?,1,5,5,5,5,0,0,'seeded')",
+            (campaign_id, TODAY.isoformat(), now_ist().isoformat(timespec="seconds")))
+        conn.commit()
+        assert not _recall_due(conn, campaign_id, TODAY, now_ist()), (
+            "the recall has already gone out today; a campaign is chased once")
+    finally:
+        conn.execute("DELETE FROM runs WHERE note='seeded' AND run_date=?", (TODAY.isoformat(),))
+        conn.commit()
+        conn.close()
+
+
+def test_the_recall_dials_without_an_approval_and_never_beside_a_dial_walk(client, monkeypatch):
+    """The chase reaches `_approve_one` on its own. That function IS the dial.
+
+    "Recall pass i wont approve send it should automatically schedule the call" —
+    so this is the assertion that the module docstring's old promise, **Nothing
+    here dials**, is deliberately no longer true. `day._approve_one` is the only
+    function in that module that reaches Formi; a recall that calls it has placed
+    calls with nobody in the loop.
+
+    The second half is the guard that has to hold for that to be safe: the
+    operator's own dial walk and the unattended chase must never post at the same
+    moment, or a customer is called twice inside a minute by two different
+    writers who cannot see each other.
+    """
+    from api import autopilot, day
+
+    approved: list[tuple[int, str]] = []
+    prepared: list[tuple[int, str, bool]] = []
+
+    def fake_prepare(campaign_id, when, kind, resync):
+        prepared.append((campaign_id, kind, resync))
+        return {"campaign_id": campaign_id, "status": "prepared", "run_id": 1, "ready": 7}
+
+    def fake_approve(conn, campaign, when, kind, buckets):
+        approved.append((campaign["id"], kind))
+        return {"campaign_id": campaign["id"], "name": campaign["name"],
+                "status": "approved", "posted": 7, "failed": 0, "dropped": 0}
+
+    monkeypatch.setattr(day, "_prepare_one", fake_prepare)
+    monkeypatch.setattr(day, "_approve_one", fake_approve)
+    # The status re-read is a warehouse call. Its own failure is already logged
+    # and survived; stubbing it keeps this test off the network either way.
+    monkeypatch.setattr(autopilot, "_resync_status", lambda *_a, **_k: [])
+
+    conn = _db()
+    campaign_id = _armed_campaign(conn)
+    try:
+        # Not due yet: one hour since the first pass.
+        _first_pass(conn, campaign_id, hours_ago=1)
+        out = autopilot.run_recall(TODAY)
+        assert out["skipped"] == "no campaign is due"
+        assert approved == [], "a campaign one hour past its first pass was chased early"
+
+        conn.execute("DELETE FROM runs WHERE run_date=?", (TODAY.isoformat(),))
+        _first_pass(conn, campaign_id, hours_ago=4)
+
+        # Due, but the operator is already dialling. Nothing may go out.
+        day._dial_state["running"] = True
+        try:
+            out = autopilot.run_recall(TODAY)
+        finally:
+            day._dial_state["running"] = False
+        assert out["skipped"] == "a dial is already running"
+        assert approved == [], "the chase posted to Formi while a dial walk was running"
+
+        # Due, and the console is idle. It dials, with no approval in front of it.
+        out = autopilot.run_recall(TODAY)
+        assert (campaign_id, "auto_pm", True) in prepared, (
+            "the chase must re-sync before it plans, or it chases people who already answered")
+        assert (campaign_id, "auto_pm") in approved, (
+            "a due campaign was prepared and then left waiting for an approval that "
+            "the operator said they would not give")
+        assert out["posted"] >= 7 and out["skipped"] == ""
+    finally:
+        conn.execute("DELETE FROM runs WHERE note='seeded' AND run_date=?", (TODAY.isoformat(),))
+        conn.commit()
+        conn.close()
+
+
+def test_the_kill_switch_stops_the_chase_dialling(client, monkeypatch):
+    """AUTO_RECALL=0 and nothing is chased — including by hand.
+
+    A kill switch with a manual bypass beside it is not a kill switch, so
+    `POST /api/autopilot/recall` answers `skipped` too. The day screen's own Dial
+    button is the way to chase deliberately.
+    """
+    from api import autopilot, day
+
+    monkeypatch.setenv("AUTO_RECALL", "0")
+    monkeypatch.setattr(day, "_approve_one",
+                        lambda *_a, **_k: pytest.fail("the chase dialled with AUTO_RECALL off"))
+    assert autopilot.auto_recall_on() is False
+    assert autopilot.run_recall(TODAY)["skipped"] == "AUTO_RECALL is off"
+
+    body = client.post("/api/autopilot/recall", json={}).json()
+    assert body["skipped"] == "AUTO_RECALL is off"
+    assert body["posted"] == 0

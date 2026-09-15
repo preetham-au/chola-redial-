@@ -172,8 +172,14 @@ export interface BucketsResponse {
  *  `fired_today` was missed (the warehouse was down) and can be re-fired. */
 export interface AutopilotStatus {
   passes: { kind: string; at: string }[];
-  /** Always false. A pass PREPARES a plan; the day screen dials it. */
+  /** True when the RECALL pass dials itself — see `recall`. The first pass still
+   *  only prepares a plan, and still waits for the day screen. */
   dials: boolean;
+  /** The chase. `on` = the recall pass no longer waits for an approval: each
+   *  campaign is chased `same_day_gap_hours` after its own first pass, which is
+   *  why there is no time of day here. `every_min` is only how often the server
+   *  goes back to look for one that has come due. */
+  recall: { on: boolean; every_min: number; last_run: string };
   /** Server clock, IST HH:MM. The pass times are IST too; the browser is not. */
   now: string;
   fired_today: string[];

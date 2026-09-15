@@ -316,8 +316,10 @@ export const api = {
         throw new ApiError('The server is unreachable — nothing was verified.', 503);
       }),
 
-  /** The one switch. On = this campaign is in the daily plan. It never dials:
-   *  the plan waits for the day to be approved. */
+  /** The one switch. On = this campaign is in the daily plan. Switching it on
+   *  places no call itself: the first pass waits for the day to be approved. It
+   *  does put the campaign in the automatic recall, which chases that approved
+   *  pass's unanswered calls a few hours later without asking again. */
   setAutopilot: (id: number, on: boolean) =>
     req<Campaign>(`/api/campaigns/${id}/autopilot`, json({ on }), () => {
       const c = mockCampaigns.find((x) => x.id === id) ?? mockCampaigns[0];

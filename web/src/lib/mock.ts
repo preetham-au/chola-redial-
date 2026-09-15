@@ -80,7 +80,8 @@ export const mockTestNumbers: TestNumber[] = [
 
 export const mockAutopilot: AutopilotStatus = {
   passes: [{ kind: 'auto', at: '10:00' }, { kind: 'auto_pm', at: '15:00' }],
-  dials: false,
+  dials: true,
+  recall: { on: true, every_min: 10, last_run: '' },
   now: '09:00',
   fired_today: [],
 };
