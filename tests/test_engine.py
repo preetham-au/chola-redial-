@@ -320,11 +320,16 @@ def test_twice_deadline_is_none_when_the_day_is_too_short():
 def test_a_two_call_lead_is_never_placed_past_the_deadline(dte, why):
     """The reported bug: "if you schedule those people at 8 how can we dial them".
 
-    Every one of these leads has a call history late in the evening, which is what
-    the rotation rule turns into an evening slot. Rotation now works inside the
-    lead's own half of the window, so it cannot undo this.
+    Called at 14:00 yesterday, so the rotation rule wants 16:00 today -- an
+    evening slot, three and a half hours past the deadline, and only an hour
+    before a window that shuts at 19:00. Rotation now works inside the lead's own
+    half of the window, so it cannot undo the line above.
+
+    The time is chosen so that rotation genuinely lands late without the ceiling.
+    An earlier draft used 17:30, which the modulo wrapped back to 09:30: the test
+    passed by accident and stayed green when the ceiling was deleted.
     """
-    pairs = [_pair("F5", f"t{i}", dte=dte, last_interaction_time="2026-08-27 17:30:00")
+    pairs = [_pair("F5", f"t{i}", dte=dte, last_interaction_time="2026-08-27 14:00:00")
              for i in range(20)]
     result = dispatch(pairs, TODAY, DEFAULT_CONFIG, WIDE)
     assert len(result.slots) == 20
