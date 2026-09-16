@@ -1056,6 +1056,66 @@ def test_a_late_first_pass_is_never_chased(client):
         conn.close()
 
 
+def test_a_chase_due_in_the_last_minutes_is_taken_by_the_tick_that_can_still_dial(client):
+    """The 15 Sep miss: due at 19:50, ticks at 19:49 and 19:59, never chased.
+
+    1786 and 1798 were approved at 16:34. A 16:40 pass against a 20:00 close may
+    place a two-call lead up to 16:50 (`twice_deadline`), so the chase came due
+    at 19:50 — inside a window that stops accepting schedules at 19:54, because
+    Formi refuses anything less than five minutes out. The tick looks every ten
+    minutes, so it asked at 19:49 (not yet) and at 19:59 (too late), and the
+    day's second call never went out for either campaign.
+
+    The coarse gate now yields to the window it is a gate for. Going early
+    costs the leads rung in the pass's final minutes their second call, since
+    they answer SKIP_CADENCE and the chase runs once; not going costs every
+    lead in the campaign theirs.
+    """
+    from api.autopilot import _recall_due
+
+    conn = _db()
+    campaign_id = _armed_campaign(conn)
+    try:
+        _first_pass(conn, campaign_id, at="16:40")
+        assert not _recall_due(conn, campaign_id, TODAY, _at("19:40")), (
+            "a campaign with a whole tick of dialable day left is not hurried")
+        assert _recall_due(conn, campaign_id, TODAY, _at("19:49")), (
+            "19:59 is past the last minute Formi will accept, so 19:49 is the "
+            "last tick that can dial at all — this is the 15 Sep miss")
+        assert _recall_due(conn, campaign_id, TODAY, _at("19:50")), (
+            "and the minute it is genuinely due still comes due")
+    finally:
+        conn.execute("DELETE FROM runs WHERE note='seeded' AND run_date=?", (TODAY.isoformat(),))
+        conn.commit()
+        conn.close()
+
+
+def test_a_campaign_is_not_chased_once_nothing_can_be_scheduled_today(client):
+    """Past the window, never due — not due-and-refused every ten minutes.
+
+    A 16:52 pass comes due at 19:56, which no schedule can reach: 19:54 is the
+    last minute Formi will accept a call for before the 20:00 close. Left as
+    "due", every tick from 19:56 to midnight would re-sync that campaign
+    against the warehouse to build a plan `_approve_one` can only refuse.
+    """
+    from api.autopilot import _recall_due
+
+    conn = _db()
+    campaign_id = _armed_campaign(conn)
+    try:
+        _first_pass(conn, campaign_id, at="16:52")
+        assert _recall_due(conn, campaign_id, TODAY, _at("19:49")), (
+            "the last tick that can dial still takes it")
+        assert not _recall_due(conn, campaign_id, TODAY, _at("19:55"))
+        assert not _recall_due(conn, campaign_id, TODAY, _at("19:56")), (
+            "the minute it comes due is already past the last schedulable one")
+        assert not _recall_due(conn, campaign_id, TODAY, _at("23:30"))
+    finally:
+        conn.execute("DELETE FROM runs WHERE note='seeded' AND run_date=?", (TODAY.isoformat(),))
+        conn.commit()
+        conn.close()
+
+
 def test_the_recall_dials_without_an_approval_and_never_beside_a_dial_walk(client, monkeypatch):
     """The chase reaches `_approve_one` on its own. That function IS the dial.
 

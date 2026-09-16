@@ -51,7 +51,7 @@ from .db import current_config, now_ist, session
 # level and reaches back into this module only from inside functions, so this
 # direction can be a plain import.
 from .day import _scope
-from .routes_core import _campaign, _campaign_json
+from .routes_core import FORMI_LEAD_MINUTES, _campaign, _campaign_json
 
 log = logging.getLogger("redial.autopilot")
 
@@ -239,6 +239,10 @@ def _recall_due(conn: sqlite3.Connection, campaign_id: int, day: date,
     and only the two-calls-a-day buckets F5/E0/F6 — the operator's "red 0-7 and
     -1 to -3" — can hold a second slot at all. A campaign that is due can very
     reasonably dial nobody.
+
+    The one exception to that minute is the window beating the gap: a campaign
+    that comes due with less than one tick of dialable day left is taken on the
+    last tick that can still place a call. See the clause at the end.
     """
     first = conn.execute(
         "SELECT created_at FROM runs WHERE campaign_id=? AND run_date=? AND kind=? "
@@ -268,7 +272,30 @@ def _recall_due(conn: sqlite3.Connection, campaign_id: int, day: date,
     deadline = twice_deadline(dcfg, max(dcfg.start_min, dialled.hour * 60 + dialled.minute))
     if deadline is None:
         return False                         # no room for a second call at all
-    return now.hour * 60 + now.minute >= deadline + int(round(dcfg.same_day_gap_hours * 60))
+    now_min = now.hour * 60 + now.minute
+    # The last minute of the day a plan built now could still place a call in:
+    # `_approve_one` floors every slot at `_earliest_dialable`, so a chase
+    # started after this can only answer `window_closed`.
+    last = dcfg.end_min - FORMI_LEAD_MINUTES - 1
+    if now_min > last:
+        # Never "due" again today. There is nothing left to place, and saying so
+        # here is what stops a campaign being re-synced against the warehouse
+        # every ten minutes until midnight to write a plan that cannot dial.
+        return False
+    if now_min >= deadline + int(round(dcfg.same_day_gap_hours * 60)):
+        return True
+    # Due later today -- but the tick only comes back every RECALL_EVERY_MIN
+    # minutes, and "later today" can be past `last`. On 15 Sep 1786 and 1798
+    # were approved at 16:34, came due at 19:50 and 19:53 against a window
+    # shutting at 20:00, and the tick looked at 19:49 (not yet) and again at
+    # 19:59 (too late). Neither was ever chased.
+    #
+    # So the last tick that can still dial takes the campaign rather than
+    # leaving it to a tick that cannot. Early is not free: a lead whose OWN gap
+    # has not elapsed answers SKIP_CADENCE and, since the chase gets one run per
+    # campaign per day, is not looked at again. But that costs SOME of these
+    # leads their second call where waiting costs ALL of them theirs.
+    return now_min > last - RECALL_EVERY_MIN
 
 
 def run_recall(day: Optional[date] = None) -> dict[str, Any]:

@@ -221,6 +221,20 @@ The recall pass no longer waits for an approval. On the same tick,
   `dispatcher.twice_deadline` read against that campaign's own window and the
   minute its pass went out; a pass with no room for a second call (18:00 against
   a 20:00 close) is never chased at all.
+
+  **The window outranks that minute at both ends.** Nothing can be scheduled
+  inside Formi's five-minute lead, so against a 20:00 close the last minute a
+  chase can be *started* is 19:54. Past it a campaign is never due — there is
+  nothing left to place, and saying so is what stops a campaign being re-synced
+  against the warehouse every ten minutes until midnight for a plan
+  `_approve_one` can only refuse. Before it, a campaign that comes due with less
+  than one tick of dialable day left is taken by the last tick that can still
+  dial, rather than by the next one, which cannot. On 15 Sep 2026 campaigns 1786
+  and 1798 were approved at 16:34, came due at 19:50 and 19:53, and the tick
+  asked at 19:49 (not yet) and 19:59 (too late): neither was ever chased. Going
+  early costs the leads rung in the pass's final minutes their second call —
+  they answer `SKIP_CADENCE` and the chase runs once — where not going costs
+  every lead in the campaign theirs.
 * **Who.** Only leads the engine gives a second slot: the two-calls-a-day buckets
   F5 / E0 / F6 — RED 0..7 days before expiry and 1..3 days after — whose earlier
   call today says nobody was reached, and whose own `same_day_gap_hours` have
