@@ -1183,8 +1183,8 @@ def test_both_passes_are_judged_against_the_same_band(client):
 # ---------------------------------------------------------------------------
 # Which pass a per-campaign build files itself under
 #
-# `_write_run` replaces any `planned` run for (campaign, date, KIND), so the kind
-# a writer picks decides which pass's plan it destroys. The per-campaign
+# `_write_run` replaces every `planned` run for (campaign, date), so the kind a
+# writer picks decides which pass the SURVIVING plan is filed as. The per-campaign
 # `POST /api/campaigns/{id}/plan` used to hardcode `kind="auto"`: opening Plan
 # Review and pressing Build deleted the day screen's run whichever pass it was,
 # and filed the replacement as the first pass even on a campaign that had
@@ -1264,6 +1264,68 @@ def test_a_per_campaign_plan_after_a_first_pass_is_the_recall_pass(client):
     finally:
         _drop_run(built["id"])
         _drop_run(first)
+
+
+def test_rebuilding_a_plan_clears_the_other_passs_stale_plan(client):
+    """One plan per campaign per day. A rebuild is "this is the plan now".
+
+    Scoped to the same kind, the delete leaves the other pass's unapproved plan
+    sitting beside the new one. On 15 Sep that was ~4,000 slots under "recall
+    pass, awaiting approval" -- written at 15:00 for campaigns whose first call
+    had not gone out -- still on the day screen at 20:19 next to the first pass
+    that HAD gone out. Two plans on screen, one of them dead, no way to tell
+    which from the row.
+    """
+    campaign_id = _arm()[0]
+    day = _tomorrow()
+    stale = _seed_run(campaign_id, day, "auto_pm", "planned", 3)
+
+    built = client.post(f"/api/campaigns/{campaign_id}/plan", json={"date": day})
+    assert built.status_code == 200, built.text
+    built = built.json()
+    try:
+        assert built["kind"] == "auto", \
+            "nothing has been dialled tomorrow, so tomorrow's plan is a first pass"
+        assert client.get(f"/api/runs/{stale}").status_code == 404, \
+            "a recall plan nobody approved survived a rebuild of the same day"
+    finally:
+        _drop_run(built["id"])
+
+
+def test_a_recall_is_not_prepared_for_a_campaign_that_has_not_dialled(untouched, monkeypatch):
+    """The 15:00 pass must not write a recall for a campaign with no calls yet.
+
+    A recall is defined against today's earlier calls, so without one there is
+    nothing to recall -- and now that a rebuild clears the day's other stale plan
+    (above), writing one would DELETE the morning's real plan and leave Approve
+    with nothing to dial. The two changes only work together.
+    """
+    from api import autopilot                      # noqa: PLC0415 — patched per test
+    monkeypatch.setattr(autopilot, "remaining_leads",
+                        lambda conn, campaign_id, day=None: 42)
+    campaign_id = untouched()[0]
+    today = now_ist().date()
+    with session() as conn:
+        conn.execute("UPDATE campaigns SET autopilot=1, enabled=1, paused=0, hidden=0 "
+                     "WHERE id=?", (campaign_id,))
+        conn.commit()
+
+    out = day_module._prepare_one(campaign_id, today, day_module.RECALL_PASS, resync=False)
+    assert out["status"] == "no_first_pass_yet", out
+    with session() as conn:
+        assert conn.execute("SELECT COUNT(*) AS n FROM runs WHERE campaign_id=?",
+                            (campaign_id,)).fetchone()["n"] == 0, \
+            "the refused recall wrote a plan anyway"
+
+    # Scoped to the recall. The first pass is exactly what this campaign is owed,
+    # and refusing that too would leave it with no plan at all.
+    first = day_module._prepare_one(campaign_id, today, day_module.FIRST_PASS, resync=False)
+    assert first["status"] != "no_first_pass_yet", first
+
+    # And it lifts the moment a call has actually gone out.
+    _posted_run(campaign_id, today.isoformat(), day_module.FIRST_PASS, "committed", 7)
+    again = day_module._prepare_one(campaign_id, today, day_module.RECALL_PASS, resync=False)
+    assert again["status"] != "no_first_pass_yet", again
 
 
 # ---------------------------------------------------------------------------

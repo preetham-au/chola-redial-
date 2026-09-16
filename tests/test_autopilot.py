@@ -887,6 +887,16 @@ def _dialled_this_morning(campaign_id: int, stage: str, duration) -> str:
     # afternoon plan is about this one lead and nothing else can explain it.
     conn.execute("UPDATE leads SET red=NULL WHERE campaign_id=? AND id<>?",
                  (campaign_id, lead["id"]))
+    # The morning wave leaves a COMMITTED run behind as well as the lead state,
+    # and that run is the day's only record that a call went out -- it is what
+    # `kind_for_campaign` reads. Without it this campaign is still on its first
+    # pass whatever the hour, and the afternoon pass is rightly refused, so the
+    # seam below would never be reached.
+    conn.execute(
+        "INSERT INTO runs (campaign_id, run_date, kind, status, config_version, created_at, "
+        "dry_run, evaluated, planned, slots, posted, failed, dropped, note) "
+        "VALUES (?,?,'auto','committed',1,?,1,1,1,1,1,0,0,'seeded')",
+        (campaign_id, TODAY.isoformat(), f"{TODAY.isoformat()}T10:00:00"))
     conn.commit()
     conn.close()
     return lead["lead_uuid"]

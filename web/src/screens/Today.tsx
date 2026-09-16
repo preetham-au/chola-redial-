@@ -114,9 +114,9 @@ export const pickerPrepare = (agentId: number | null, date: string, kind: string
  *  `resync_failed` is the warehouse read failing, so it was left out rather than
  *  planned off a stale copy. `error` is `_write_run` raising — nothing was
  *  written, and the campaign is in no plan either. They arrive by different
- *  doors and land in the same place, so both have to be said. The other five
- *  (`prepared`, `not_in_daily_plan`, `finished`, `window_closed`, `already_ran`)
- *  are ordinary answers, not failures. */
+ *  doors and land in the same place, so both have to be said. The other six
+ *  (`prepared`, `not_in_daily_plan`, `finished`, `window_closed`, `already_ran`,
+ *  `no_first_pass_yet`) are ordinary answers, not failures. */
 const NO_PLAN = ['resync_failed', 'error'];
 
 /** What a prepare pass has to say for itself, whatever button started it.

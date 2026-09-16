@@ -335,9 +335,13 @@ export interface PrepareResult {
      *  resync block — so a `resync_failed` row has never carried one. Name a
      *  campaign through the day view's own `campaigns`, not through this. */
     name?: string;
-    /** Every value `api/day.py`'s `_prepare_one` can return, all seven of them:
+    /** Every value `api/day.py`'s `_prepare_one` can return, all eight of them:
      *  `prepared` | `not_in_daily_plan` | `finished` | `window_closed` |
-     *  `already_ran` | `resync_failed` | `error`.
+     *  `already_ran` | `no_first_pass_yet` | `resync_failed` | `error`.
+     *
+     *  `no_first_pass_yet` is a recall asked for on a campaign that has posted
+     *  no calls today — an ordinary answer, not a failure: there is nothing to
+     *  recall yet, and the campaign is still owed its first pass.
      *
      *  TWO of them are failures, not one. `resync_failed` is the warehouse read
      *  failing before planning; `error` is `_write_run` raising during it. Either

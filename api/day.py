@@ -736,6 +736,16 @@ def _prepare_one(campaign_id: int, day: date, kind: str, resync: bool) -> dict[s
                   f"non-terminal stage")
             return {**out, "status": "finished"}
 
+        # A recall is defined against today's earlier calls, so a campaign that
+        # has placed none is still on its FIRST pass whatever the hour. The 15:00
+        # pass ignored that on 15 Sep and wrote 20 recall plans for campaigns
+        # whose first call had not gone out yet. Now that a rebuild clears the
+        # day's other stale plan, writing one would DELETE the morning's real
+        # plan and leave the Approve button with nothing to dial.
+        if kind == RECALL_PASS and kind_for_campaign(conn, campaign_id, day) == FIRST_PASS:
+            return {**out, "status": "no_first_pass_yet",
+                    "detail": "no call has gone out today, so there is nothing to recall"}
+
         try:
             cfg, red, dcfg, _now, leads, pairs = _evaluate(conn, campaign, day)
             # Both passes get the campaign's whole window. The pass is decided by

@@ -554,16 +554,27 @@ def _write_run(conn: sqlite3.Connection, campaign: sqlite3.Row, day: date, kind:
                config_version: int, pairs, red: RedConfig, dcfg: DispatchConfig,
                evaluated: int, note: str = "", floor_min: Optional[int] = None,
                buckets: Optional[Sequence[str]] = None) -> int:
-    """Replace any `planned` run for (campaign, date, kind) and store the plan."""
+    """Replace every `planned` run this campaign has for `day` and store the plan."""
     existing = conn.execute(
-        "SELECT id, status FROM runs WHERE campaign_id=? AND run_date=? AND kind=?",
-        (campaign["id"], day.isoformat(), kind)).fetchall()
+        "SELECT id, status, kind FROM runs WHERE campaign_id=? AND run_date=?",
+        (campaign["id"], day.isoformat())).fetchall()
     for row in existing:
-        if row["status"] != "planned":
+        if row["kind"] == kind and row["status"] != "planned":
             raise HTTPException(
                 409, f"run {row['id']} for {day.isoformat()} is already {row['status']}; "
                      "re-planning would rewrite a run that has been acted on")
+    # EVERY `planned` run goes, not just this pass's own. A campaign is on one
+    # pass at a time (`kind_for_campaign`), so a plan left over from the other
+    # kind is stale by construction -- and stale in the most confusing way there
+    # is: on 15 Sep the 15:00 recall prepare left ~4,000 slots sitting under
+    # "recall pass, awaiting approval" all evening, beside the first pass that
+    # had already gone out. A rebuild is the operator saying "this is the plan
+    # now"; anything still merely planned is the plan it replaced.
+    # A `committed` run of the other kind is untouched -- it is history, and the
+    # recall depends on the first pass's row surviving to know it may run.
     for row in existing:
+        if row["status"] != "planned":
+            continue
         conn.execute("DELETE FROM plan_items WHERE run_id=?", (row["id"],))
         conn.execute("DELETE FROM decisions WHERE run_id=?", (row["id"],))
         conn.execute("DELETE FROM runs WHERE id=?", (row["id"],))

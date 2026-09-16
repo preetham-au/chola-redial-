@@ -522,11 +522,27 @@ moment it is sent — never from an inference afterwards. Rows are pruned after
 `POST /api/campaigns/{id}/plan` does not choose a `kind`; it asks
 `kind_for_campaign` the same question `POST /api/day/prepare` asks — has this
 campaign posted calls today? — and files the run as `auto` or `auto_pm`
-accordingly. The response's `kind` says which. It matters because `_write_run`
-replaces the `planned` run for the KIND it is given: a per-campaign plan filed
-under the wrong kind deletes the day screen's plan for that kind and puts its own
-slots there under that name. A `manual` run is filed as itself and keeps the
-window it was scheduled with.
+accordingly. The response's `kind` says which, and it is the name the surviving
+plan carries. A `manual` run is filed as itself and keeps the window it was
+scheduled with.
+
+**Rebuilding a plan clears every plan that campaign still has for that day.**
+`_write_run` deletes EVERY `planned` run for `(campaign, date)` — both kinds —
+and refuses with 409 only when a run of the kind it is writing has already been
+acted on. A campaign is on one pass at a time (`kind_for_campaign`), so a plan
+left over from the other kind is stale by construction: on 15 Sep 2026 the 15:00
+recall prepare left ~4,000 slots reading "recall pass, awaiting approval" beside
+a first pass that had already gone out, and both were on the day screen at 20:19
+with nothing in the row to say which was dead. A `committed` run of either kind
+is never touched — it is dial history, and the recall reads the first pass's row
+to know it may run at all.
+
+Paired with it, `_prepare_one` answers **`no_first_pass_yet`** and writes nothing
+when asked for a recall on a campaign that has posted no calls that day. A recall
+is defined against the day's earlier calls; without one there is nothing to
+recall, and under the delete above such a plan would take the morning's real plan
+with it. This is the same `posted > 0` question `kind_for_campaign` and
+`_recall_due` already ask, so the three cannot disagree.
 
 `dropped` in a commit response counts the slots the plan no longer holds: stale
 ones retired as `expired`. There is no `out_of_band` count — it was removed on
