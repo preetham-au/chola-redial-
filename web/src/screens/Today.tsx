@@ -2005,6 +2005,15 @@ export function DialResult({
   const total = res.posted + notScheduled;
   const pct = (x: number) => (total ? `${(x / total) * 100}%` : '0%');
 
+  // `not_dialled` holds two kinds of undialled lead and they need different
+  // things from the operator. A slot that expired against the window comes back
+  // in the next plan on its own; a `left_behind` campaign's leads do not come
+  // back at all until somebody restarts it. Printing the sum under the window
+  // sentence would tell them the second kind is already handled.
+  const shelved = res.left_behind ?? [];
+  const shelvedLeads = shelved.reduce((sum, c) => sum + c.leads, 0);
+  const expired = Math.max(res.not_dialled - shelvedLeads, 0);
+
   const problems = res.campaigns.filter(
     (c) => c.status !== 'approved' || (c.failed ?? 0) > 0);
   const clean = res.campaigns.length - problems.length;
@@ -2095,17 +2104,17 @@ export function DialResult({
         {res.failed > 0 && (
           <>
             <b style={{ color: 'var(--bad)' }}>{n(res.failed)} refused by Formi</b>
-            {res.not_dialled > 0 && ' · '}
+            {expired > 0 && ' · '}
           </>
         )}
-        {res.not_dialled > 0 && (
-          <>{n(res.not_dialled)} did not fit before the window shut — back in the next plan</>
+        {expired > 0 && (
+          <>{n(expired)} did not fit before the window shut — back in the next plan</>
         )}
         {/* Earned, not assumed. A campaign that was skipped, refused or never
             started contributes nothing to `notScheduled` — the totals of a
             campaign that produced no result are all zero — so the counts alone
             cannot tell a clean day from a day that did nothing. */}
-        {notScheduled === 0 && problems.length === 0 && !short
+        {notScheduled === 0 && problems.length === 0 && shelved.length === 0 && !short
           && 'Every selected lead is on the clock.'}
         {res.dry_run && ' Nothing reached Formi: the server is in dry run.'}
       </p>
@@ -2138,6 +2147,34 @@ export function DialResult({
               </div>
             );
           })}
+        </div>
+      )}
+
+      {/* Not a fault and not a retry — a plain statement of what the button did
+          not cover. These campaigns were stopped after their plan was built, so
+          the approve never walked them and they appear in no row above. Left
+          unnamed they were invisible: on 15 Sep three of them held 2,280 ready
+          leads that the 16:34 approve neither dialled nor mentioned. There is no
+          button here on purpose; dialling them would undo the stop somebody
+          chose, and that is the operator's call to reverse on the campaign. */}
+      {shelved.length > 0 && (
+        <div style={{ marginTop: 10 }}>
+          <p className="hero-sub" style={{ marginBottom: 4 }}>
+            <b>{n(shelvedLeads)} leads were ready but not dialled</b> — their
+            campaign was stopped after the plan was built. Restart the campaign to
+            send them.
+          </p>
+          <div className="grid" style={{ gap: 0 }}>
+            {shelved.map((c) => (
+              <div className="dialrow" key={`${c.campaign_id}-${c.run_id}`}>
+                <AlertTriangle size={14} style={{ color: 'var(--warn)', flex: '0 0 auto' }} />
+                <b className="trunc">{c.name}</b>
+                <span className="dialrow-why">
+                  {n(c.leads)} ready · {c.reason}
+                </span>
+              </div>
+            ))}
+          </div>
         </div>
       )}
 

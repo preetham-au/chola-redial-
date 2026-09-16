@@ -783,8 +783,8 @@ def post_prepare(body: PrepareBody = Body(default_factory=PrepareBody)) -> dict[
 # Approving
 # ---------------------------------------------------------------------------
 
-def _day_result(results: list[dict[str, Any]], day: str, kind: str,
-                buckets: list[str]) -> dict[str, Any]:
+def _day_result(results: list[dict[str, Any]], day: str, kind: str, buckets: list[str],
+                left_behind: Optional[list[dict[str, Any]]] = None) -> dict[str, Any]:
     """A day's dial, added up from its per-campaign rows. The only shape.
 
     `/api/day/approve` and the background walk both finish holding a list of
@@ -810,8 +810,16 @@ def _day_result(results: list[dict[str, Any]], day: str, kind: str,
             # slot twice, and a pass with 340 stale slots told the operator 680
             # leads were not scheduled -- inflated by exactly the commonest
             # reason a slot does not go out.
-            "not_dialled": sum(r.get("dropped", 0) for r in results),
-            "campaigns": results}
+            #
+            # And the leads of a campaign the approve never reached at all. They
+            # are "not dialled" in the plainest sense there is -- a plan was
+            # built for them and nobody sent it -- but they are in no `results`
+            # row to be summed, so until `left_behind` existed they were counted
+            # nowhere and named nowhere. See `_left_behind`.
+            "not_dialled": sum(r.get("dropped", 0) for r in results)
+                           + sum(r["leads"] for r in (left_behind or [])),
+            "campaigns": results,
+            "left_behind": left_behind or []}
 
 
 # ---------------------------------------------------------------------------
@@ -841,7 +849,7 @@ _dial_lock = threading.Lock()
 def _idle_dial() -> dict[str, Any]:
     return {"running": False, "date": "", "kind": "", "buckets": [], "agent_id": None,
             "total": 0, "done": 0, "current": None, "stopped": False,
-            "results": [], "started_at": "", "finished_at": ""}
+            "results": [], "left_behind": [], "started_at": "", "finished_at": ""}
 
 
 _dial_state: dict[str, Any] = _idle_dial()
@@ -917,10 +925,20 @@ def start_dial(body: ApproveBody = Body(default_factory=ApproveBody)) -> dict[st
             campaign_ids = [r["id"] for r in conn.execute(
                 f"SELECT id FROM campaigns WHERE {where} ORDER BY id", params)
                 if not wanted or r["id"] in wanted]
+            # Worked out once, here, rather than on every poll: the walk's
+            # membership is fixed the moment it starts, so a campaign outside it
+            # is left behind for the whole walk and re-deriving that per poll
+            # would be the same answer at the price of a query a second. Passing
+            # the walk itself as `covered` is also what makes the answer stable
+            # while `results` is still filling up -- a campaign the walk has not
+            # REACHED yet must not be reported as one it will never reach.
+            left_behind = _left_behind(conn, day, set(campaign_ids), wanted,
+                                       body.agent_id)
         _dial_state.update(_idle_dial())
         _dial_state.update(running=True, date=day.isoformat(), kind=body.kind,
                            buckets=buckets, agent_id=body.agent_id,
-                           total=len(campaign_ids), started_at=now_iso())
+                           total=len(campaign_ids), left_behind=left_behind,
+                           started_at=now_iso())
     threading.Thread(target=_dial_walk, args=(day, body.kind, buckets, campaign_ids),
                      daemon=True).start()
     return dial_status()
@@ -937,7 +955,8 @@ def dial_status() -> dict[str, Any]:
     state = dict(_dial_state)
     state["dry_run"] = dry_run()
     state["result"] = _day_result(list(state["results"]), state["date"],
-                                  state["kind"], list(state["buckets"]))
+                                  state["kind"], list(state["buckets"]),
+                                  list(state["left_behind"]))
     return state
 
 
@@ -979,8 +998,65 @@ def approve_day(body: ApproveBody = Body(default_factory=ApproveBody)) -> dict[s
             if wanted and campaign["id"] not in wanted:
                 continue
             results.append(_approve_one(conn, campaign, day, body.kind, buckets))
+        left = _left_behind(conn, day, {r["campaign_id"] for r in results},
+                            wanted, body.agent_id)
 
-    return _day_result(results, day.isoformat(), body.kind, buckets)
+    return _day_result(results, day.isoformat(), body.kind, buckets, left)
+
+
+def _left_behind(conn: sqlite3.Connection, day: date, covered: set[int],
+                 wanted: set[int], agent_id: Optional[int]) -> list[dict[str, Any]]:
+    """Campaigns still holding a plan for `day` that this approve never looked at.
+
+    The approve walks ARMED campaigns. A campaign stopped AFTER its plan was
+    built is no longer armed, so it was skipped with no result row at all -- not
+    a failure, not a zero, simply absent. On 15 Sep 2026 that shelved 2,280 leads
+    across three campaigns whose plans had been ready since 10:01 and whose
+    operator stopped them at 16:33, and the approve at 16:34 said nothing about
+    any of them.
+
+    Dialling them is not the answer: somebody stopped those campaigns on purpose
+    and an approve must not undo that. Naming them is. "Approve dialled
+    everything" is only true if it can say what everything did not include.
+
+    A campaign the operator deliberately unticked is not in this list -- they
+    already know, and a surprise that is not surprising is noise.
+    """
+    rows = conn.execute(
+        "SELECT r.campaign_id, r.id AS run_id, r.kind, r.slots, r.dropped, "
+        "c.name, c.agent_id, c.autopilot, c.enabled, c.paused, c.hidden "
+        "FROM runs r JOIN campaigns c ON c.id=r.campaign_id "
+        "WHERE r.run_date=? AND r.status='planned' ORDER BY r.campaign_id, r.id",
+        (day.isoformat(),)).fetchall()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if row["campaign_id"] in covered or (wanted and row["campaign_id"] not in wanted):
+            continue
+        if agent_id is not None and row["agent_id"] != agent_id:
+            continue
+        out.append({"campaign_id": row["campaign_id"], "name": row["name"],
+                    "run_id": row["run_id"], "kind": row["kind"],
+                    "leads": int(row["slots"]) + int(row["dropped"]),
+                    "reason": _why_left_behind(row)})
+    return out
+
+
+def _why_left_behind(row: sqlite3.Row) -> str:
+    """Which part of ARMED this campaign fails, in the operator's words.
+
+    Ordered the way a person would ask it: switched off beats paused beats
+    autopilot, because a disabled campaign is also technically un-armed by the
+    other three and reporting the least specific reason helps nobody.
+    """
+    if not row["enabled"]:
+        return "switched off"
+    if row["paused"]:
+        return "paused"
+    if not row["autopilot"]:
+        return "autopilot off"
+    if row["hidden"]:
+        return "hidden"
+    return "not in this approve"
 
 
 def _unspent(run: Optional[sqlite3.Row]) -> int:

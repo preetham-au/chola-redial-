@@ -479,8 +479,33 @@ caller dropped the response. `already_committed` is the exception: that campaign
 
 `failed` and `not_dialled` are not the same kind of thing. `failed` is Formi
 refusing a call — a fault, and what `POST /api/runs/{id}/retry` sends again.
-`not_dialled` is a slot that no longer fitted before the window shut; it returns
-in the next plan on its own, and retrying it would only expire it again.
+`not_dialled` is a lead nobody sent: a slot that no longer fitted before the
+window shut, which returns in the next plan on its own and would only expire
+again if retried, **plus** every lead of a `left_behind` campaign, which does
+not return until somebody restarts that campaign.
+
+**An approve names what it did not include** (`left_behind`). An approve walks
+armed campaigns, so a campaign stopped AFTER its plan was built is skipped with
+no `campaigns` row at all — not a failure, not a zero, simply absent. On 15 Sep
+2026 that shelved 2,280 leads across three campaigns whose plans had been ready
+since 10:01 and whose operator stopped them at 16:33; the approve at 16:34 said
+nothing about any of them. Every `planned` run for that date whose campaign the
+approve never looked at is now listed, and its leads counted in `not_dialled`:
+
+```jsonc
+"left_behind": [ { "campaign_id": 1744, "name": "…", "run_id": 41,
+                   "kind": "auto", "leads": 1200,
+                   // which part of armed it fails: paused · switched off ·
+                   // autopilot off · hidden
+                   "reason": "paused" } ]
+```
+
+They are named, not dialled — somebody stopped those campaigns on purpose and an
+approve must not undo that. A campaign the operator deliberately left out of
+`campaign_ids` is not listed either: they already know, and a surprise that is
+not surprising is noise. `GET /api/day/dial` carries the same list on its
+`result`, fixed when the walk starts, so a campaign the walk has not *reached*
+yet is never reported as one it will never reach.
 
 ### Call log
 

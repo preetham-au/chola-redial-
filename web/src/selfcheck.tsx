@@ -951,6 +951,36 @@ ok(
   ok('a campaign refused with no reason attached still says so in words',
      has(caught, 'Refused campaign') && has(caught, 'refused before any call went out'));
 
+  // --- and what the approve never looked at -----------------------------------
+  //
+  // A campaign stopped AFTER its plan was built is not armed, so the approve
+  // walks past it with no result row at all. On 15 Sep that shelved 2,280 ready
+  // leads across three campaigns and the approve said nothing about any of them.
+  // Its leads belong in `not_dialled` -- nobody sent them -- but NOT under the
+  // window sentence beside them, which promises the next plan picks them up.
+  // Nothing picks these up until somebody restarts the campaign.
+  const shelved = dialres({
+    approved: 0, posted: 0, not_dialled: 2280, campaigns: [],
+    left_behind: [
+      { campaign_id: 1744, name: 'Renewal Hindi', run_id: 41, kind: 'auto',
+        leads: 1200, reason: 'paused' },
+      { campaign_id: 1745, name: 'Renewal Tamil', run_id: 42, kind: 'auto',
+        leads: 1080, reason: 'switched off' },
+    ],
+  });
+  ok('leads shelved by a stopped campaign are named, counted and reasoned',
+     has(shelved, '2,280 leads were ready but not dialled')
+     && has(shelved, 'Renewal Hindi') && has(shelved, '1,200 ready · paused')
+     && has(shelved, 'Renewal Tamil') && has(shelved, 'switched off'));
+  // The whole point of splitting them out: "back in the next plan" is a promise
+  // this console cannot keep for a campaign nobody has restarted.
+  ok('and are not filed under the window sentence, which would be a false promise',
+     !has(shelved, 'did not fit before the window shut'));
+  ok('nor offered a Retry, which would undo the stop somebody chose',
+     !has(shelved, 'Retry'));
+  ok('a shelved campaign alone is never "every lead is on the clock"',
+     !has(shelved, 'on the clock'));
+
   const refused = dialres({
     failed: 12,
     campaigns: [{

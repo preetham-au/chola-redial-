@@ -1594,6 +1594,82 @@ def test_a_pass_holding_one_unbuilt_campaign_is_not_reported_as_approved(client)
 
 
 # ---------------------------------------------------------------------------
+# What the approve did NOT include
+# ---------------------------------------------------------------------------
+
+def test_approve_names_a_campaign_stopped_after_its_plan_was_built(client):
+    """The 15 Sep shape: plan built at 10:01, campaign stopped at 16:33.
+
+    The approve walks ARMED campaigns, so a stopped one is skipped with no
+    result row at all — not a failure, not a zero, simply absent. Three of them
+    took 2,280 ready leads off that evening's books and the approve a minute
+    later mentioned none of it. Approving must not dial a campaign somebody
+    stopped on purpose; it must say the campaign is there.
+    """
+    campaign_id = _arm()[0]
+    today = now_ist().date().isoformat()
+    _seed_run(campaign_id, today, "auto", "planned", 6)
+    with session() as conn:
+        conn.execute("UPDATE campaigns SET paused=1 WHERE id=?", (campaign_id,))
+        conn.commit()
+
+    body = client.post("/api/day/approve",
+                       json={"date": today, "campaign_ids": [campaign_id]}).json()
+
+    assert not any(c["campaign_id"] == campaign_id for c in body["campaigns"]), \
+        "an approve dialled a campaign the operator had stopped"
+    mine = [c for c in body["left_behind"] if c["campaign_id"] == campaign_id]
+    assert len(mine) == 1, body["left_behind"]
+    assert mine[0]["leads"] == 6, "the shelved plan's leads are the number that matters"
+    assert mine[0]["reason"] == "paused"
+    assert body["not_dialled"] >= 6, \
+        "leads nobody sent are not dialled, and have to be counted as such"
+
+
+def test_a_campaign_the_operator_unticked_is_not_reported_as_a_surprise(client):
+    """Left out on purpose is not left behind. They already know; it is noise."""
+    stopped, other = _arm(2)
+    today = now_ist().date().isoformat()
+    _seed_run(stopped, today, "auto", "planned", 4)
+    with session() as conn:
+        conn.execute("UPDATE campaigns SET paused=1 WHERE id=?", (stopped,))
+        conn.commit()
+
+    body = client.post("/api/day/approve",
+                       json={"date": today, "campaign_ids": [other]}).json()
+
+    assert not any(c["campaign_id"] == stopped for c in body["left_behind"]), \
+        "a campaign the operator did not tick was reported as a surprise"
+
+
+def test_the_dial_queue_reports_what_it_left_behind_too(client):
+    """The queue is the path the button takes, so it is the path that must say so.
+
+    `/api/day/approve` and `/api/day/dial` do the same work; only the second one
+    is what the console presses. Reporting the shelved campaigns on the first
+    alone would put the answer somewhere the operator never looks.
+    """
+    stopped, other = _arm(2)
+    day = now_ist().date().isoformat()
+    _seed_run(stopped, day, "auto", "planned", 5)
+    _seed_run(other, day, "auto", "planned", 2)
+    with session() as conn:
+        conn.execute("UPDATE campaigns SET enabled=0 WHERE id=?", (stopped,))
+        conn.commit()
+
+    client.post("/api/day/dial",
+                json={"date": day, "kind": "auto", "campaign_ids": [stopped, other]})
+    done = _await_dial(client)
+
+    mine = [c for c in done["result"]["left_behind"] if c["campaign_id"] == stopped]
+    assert len(mine) == 1, done["result"]["left_behind"]
+    assert mine[0]["leads"] == 5
+    assert mine[0]["reason"] == "switched off"
+    assert not any(c["campaign_id"] == other for c in done["result"]["left_behind"]), \
+        "a campaign the walk dialled was also reported as left behind"
+
+
+# ---------------------------------------------------------------------------
 # A rehearsal to your own handset has no hours
 # ---------------------------------------------------------------------------
 

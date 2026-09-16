@@ -400,9 +400,26 @@ export interface ApproveResult {
   approved: number;
   posted: number;
   failed: number;
-  /** Slots that no longer fit before the window shuts. Not lost — they come back
-   *  in tomorrow's plan. */
+  /** Leads nobody sent: slots that no longer fit before the window shuts, plus
+   *  every lead of a `left_behind` campaign. The first kind comes back in
+   *  tomorrow's plan by itself; the second does not until somebody restarts the
+   *  campaign, which is why the two are split on screen. */
   not_dialled: number;
+  /** Campaigns holding a plan for the day that this approve never looked at,
+   *  because they were stopped after the plan was built. Not dialled — somebody
+   *  stopped them on purpose and an approve must not undo that — but named, so
+   *  "everything was dialled" can say what everything did not include. */
+  left_behind?: Array<{
+    campaign_id: number;
+    name: string;
+    run_id: number;
+    kind: string;
+    /** The shelved plan's size: slots + dropped. */
+    leads: number;
+    /** Which part of armed it fails, in the operator's words — "paused",
+     *  "switched off", "autopilot off", "hidden". */
+    reason: string;
+  }>;
   campaigns: Array<{
     campaign_id: number;
     name: string;
