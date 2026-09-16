@@ -1571,11 +1571,12 @@ export async function pollDial(
   on: (state: DialState) => void,
   wait: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
   every = 1000,
+  agentId?: number,
 ): Promise<DialState> {
   let misses = 0;
   for (;;) {
     try {
-      const state = await api.dialStatus();
+      const state = await api.dialStatus(agentId);
       misses = 0;
       on(state);
       if (!state.running) return state;
@@ -1736,7 +1737,7 @@ export function ApproveDay({
         setProgress(dialRows(state, queue));
         setCurrent(state.current?.name ?? null);
         setWalked({ total: state.total, done: state.done });
-      });
+      }, undefined, undefined, args[4]);
       setRes(final.result);
     } catch (e) {
       // The walk is the server's and is still going. Say the console lost sight
@@ -1765,11 +1766,13 @@ export function ApproveDay({
     await watch();
   };
 
-  // A walk for THIS day already running when the modal opens is rejoined, not
-  // restarted. Another day's walk is left alone: its progress belongs to a
-  // screen this is not.
+  // A walk for THIS day AND this agent already running when the modal opens is
+  // rejoined, not restarted. Another day's walk is left alone: its progress
+  // belongs to a screen this is not — and so does the other language's, which
+  // is why the scope here is `args[4]`, the same one `submit` puts on the wire,
+  // and never a second reading of `agent`.
   useEffect(() => {
-    api.dialStatus()
+    api.dialStatus(args[4])
       .then((state) => { if (state.running && state.date === day.date) void watch(); })
       // No walk to rejoin is the ordinary case, and an unreachable server is
       // already said loudly enough by everything else on this screen.
@@ -1807,7 +1810,7 @@ export function ApproveDay({
               on the screen and stay approvable. Closing the tab does the same. */}
           <button
             className="btn btn-ghost"
-            onClick={() => (busy ? void api.stopDial().catch(() => {}) : onClose())}
+            onClick={() => (busy ? void api.stopDial(args[4]).catch(() => {}) : onClose())}
           >
             {busy ? 'Stop after this campaign' : 'Cancel'}
           </button>

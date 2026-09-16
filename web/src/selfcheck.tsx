@@ -1630,6 +1630,45 @@ ok(
      sent.length === 1 && sent[0].startsWith('/api/day/dial/stop'));
   retryLive();
 
+  // --- one walk per language, not one per console -----------------------------
+  //
+  // Reported 16 Sep 2026: "when agent 125 is scheduling i cant schedule for
+  // 127". A single shared walk meant the second panel's Dial returned the FIRST
+  // panel's progress and started nothing, so the second language went undialled
+  // while its operator watched a bar fill up for campaigns they do not own.
+  //
+  // The walk is per agent on the server now, which makes the scope on the wire
+  // load-bearing in both directions: unscoped, the poll reads the other
+  // language's progress and Stop stops the other language's dial.
+  sent.length = 0;
+  await api.dialStatus(127);
+  await api.stopDial(127);
+  ok('following and stopping a dial both name the agent they belong to',
+     sent.length === 2 && sent.every((s) => s.includes('agent_id=127')));
+  // ...and an unscoped panel must still be able to say so. `q()` drops
+  // `undefined`, so "every agent" is the bare path rather than `agent_id=`,
+  // which FastAPI would refuse as an int.
+  sent.length = 0;
+  await api.dialStatus();
+  ok('and an unscoped console asks for the whole roster, not for agent ""',
+     sent.length === 1 && !sent[0].includes('agent_id'));
+  retryLive();
+
+  // The three lines above pass the scope themselves, so they cannot see a CALL
+  // SITE that stopped passing one — and two of the three are inside a click
+  // handler and an effect, out of reach of everything else here. The scope has
+  // to be `args[4]`, the same value `submit` puts on the wire, and never a
+  // second reading of `agent`: sourced twice, the poll and the dial can drift
+  // apart and the panel watches a walk it did not start.
+  const watchCall = src.slice(src.indexOf('await pollDial('), src.indexOf('await pollDial(') + 400);
+  ok('and the day screen follows and stops its OWN agent’s dial, never an unscoped one',
+     // Two reads: `pollDial`'s own, which forwards whatever scope it was given,
+     // and the rejoin effect's. Both named, so a THIRD one — unscoped — fails.
+     src.split('api.dialStatus(').length === 3
+     && /api\.dialStatus\(agentId\)/.test(src) && /api\.dialStatus\(args\[4\]\)/.test(src)
+     && src.split('api.stopDial(').length === 2 && /api\.stopDial\(args\[4\]\)/.test(src)
+     && watchCall.includes('args[4]'));
+
   // --- a campaign the walk answered nothing for did not dial ------------------
   //
   // `approve_day` loops the campaigns that are armed RIGHT NOW and skips any

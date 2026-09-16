@@ -286,15 +286,18 @@ export const api = {
       throw new ApiError('The server is unreachable — nothing was approved or dialled.', 503);
     }),
 
-  /** Where the walk has got to. Cheap; safe to poll every second. */
-  dialStatus: () =>
-    req<DialState>('/api/day/dial', undefined, () => {
+  /** Where THIS agent's walk has got to. Cheap; safe to poll every second.
+   *
+   *  Scoped for the same reason `startDial` is: each language panel follows its
+   *  own dial, and an unscoped poll would draw the other one's progress bar. */
+  dialStatus: (agent_id?: number) =>
+    req<DialState>(`/api/day/dial${q({ agent_id })}`, undefined, () => {
       throw new ApiError('The server is unreachable — the dial cannot be followed.', 503);
     }),
 
   /** Stop between campaigns. The campaign in flight finishes and its calls go. */
-  stopDial: () =>
-    req<DialState>('/api/day/dial/stop', json({}), () => {
+  stopDial: (agent_id?: number) =>
+    req<DialState>(`/api/day/dial/stop${q({ agent_id })}`, json({}), () => {
       throw new ApiError('The server is unreachable — the dial was not stopped.', 503);
     }),
 

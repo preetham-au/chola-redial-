@@ -38,8 +38,8 @@ from engine.dispatcher import (
 
 from .db import dry_run, now_ist, now_iso, session
 from .routes_core import (
-    _campaign_json, _commit, _earliest_dialable, _evaluate, _floor_min, _parse_day,
-    _run_json, _write_run,
+    APPROVE_LEAD_MINUTES, _campaign_json, _commit, _earliest_dialable, _evaluate,
+    _floor_min, _parse_day, _run_json, _write_run,
 )
 
 router = APIRouter()
@@ -618,7 +618,10 @@ def get_day(date: Optional[str] = Query(None), kind: str = Query(FIRST_PASS),
     # number is decided then — but an operator opening this at 18:00 needs to see
     # that the day no longer fits BEFORE they approve, not in the drop count
     # afterwards.
-    first_free = _earliest_dialable(now)
+    # The same head start `_floor_min` gives a fresh plan, so the capacity on
+    # screen is the capacity Approve would really find. Measured against Formi's
+    # five instead, this read ten minutes of room the plan cannot use.
+    first_free = _earliest_dialable(now, APPROVE_LEAD_MINUTES)
     span = _day_window(configs, {c["id"]: c["ready"] for c in listed},
                        first_free.hour * 60 + first_free.minute, today)
 
@@ -852,14 +855,47 @@ def _idle_dial() -> dict[str, Any]:
             "results": [], "left_behind": [], "started_at": "", "finished_at": ""}
 
 
-_dial_state: dict[str, Any] = _idle_dial()
+# One walk per AGENT, not one per console. Each language has its own panel with
+# its own Approve, and a single shared walk meant pressing Tamil while Hindi was
+# still going returned Hindi's progress bar and started nothing at all -- the
+# operator watched a walk they had not asked for and the second language went
+# undialled in silence. Reported 16 Sep 2026: "when agent 125 is scheduling i
+# cant schedule for 127".
+#
+# Keyed by the scope the button was pressed under; `None` is the whole roster,
+# which is the single-panel deployment and the unattended recall.
+_dial_states: dict[Optional[int], dict[str, Any]] = {}
 
 
-def _dial_walk(day: date, kind: str, buckets: list[str], campaign_ids: list[int]) -> None:
+def _dial_scope(agent_id: Optional[int]) -> dict[str, Any]:
+    """This agent's walk, created idle the first time it is asked for.
+
+    The dict's identity is the whole point: the walking thread and every poll of
+    it hold the same object, so progress is visible without a lock.
+    """
+    return _dial_states.setdefault(agent_id, _idle_dial())
+
+
+def _walk_running(agent_id: Optional[int]) -> Optional[dict[str, Any]]:
+    """A running walk that would collide with one for `agent_id`, or None.
+
+    Two agents never share a campaign, so their walks touch disjoint rows and
+    disjoint Formi schedules and may run side by side -- which is the point. An
+    UNSCOPED walk is every campaign, so it collides with each of them and each of
+    them collides with it, and that pair still has to queue.
+    """
+    for scope, state in list(_dial_states.items()):
+        if state["running"] and (scope is None or agent_id is None or scope == agent_id):
+            return state
+    return None
+
+
+def _dial_walk(state: dict[str, Any], day: date, kind: str, buckets: list[str],
+               campaign_ids: list[int]) -> None:
     """Approve each campaign in turn. Runs on the thread, never in a request."""
     try:
         for campaign_id in campaign_ids:
-            if _dial_state["stopped"]:
+            if state["stopped"]:
                 break
             # Held outside the try so the error row below can still say which
             # campaign it was -- an unnamed failure in a list of twenty-two is
@@ -870,7 +906,7 @@ def _dial_walk(day: date, kind: str, buckets: list[str], campaign_ids: list[int]
                 # approve can run ten minutes, and a writer holding SQLite open
                 # that long is every other request in the console waiting on it.
                 with session() as conn:
-                    where, params = _armed(_dial_state["agent_id"])
+                    where, params = _armed(state["agent_id"])
                     campaign = conn.execute(
                         f"SELECT * FROM campaigns WHERE id=? AND {where}",
                         (campaign_id, *params)).fetchone()
@@ -880,26 +916,26 @@ def _dial_walk(day: date, kind: str, buckets: list[str], campaign_ids: list[int]
                         # `approve_day` skips such a campaign in silence, and a
                         # campaign that vanishes from its own result is the one
                         # thing this screen must never do.
-                        _dial_state["results"].append(
+                        state["results"].append(
                             {"campaign_id": campaign_id, "name": "",
                              "status": "no_result"})
                         continue
                     name = campaign["name"]
-                    _dial_state["current"] = {"campaign_id": campaign_id,
-                                              "name": name}
+                    state["current"] = {"campaign_id": campaign_id,
+                                        "name": name}
                     result = _approve_one(conn, campaign, day, kind, buckets)
-                _dial_state["results"].append(result)
+                state["results"].append(result)
             except Exception as exc:             # noqa: BLE001 — one campaign, not the day
                 log.exception("dial walk failed on campaign %s", campaign_id)
-                _dial_state["results"].append(
+                state["results"].append(
                     {"campaign_id": campaign_id, "name": name, "status": "error",
                      "detail": f"{type(exc).__name__}: {exc}"[:200]})
             finally:
-                _dial_state["done"] += 1
-                _dial_state["current"] = None
+                state["done"] += 1
+                state["current"] = None
     finally:
-        _dial_state["running"] = False
-        _dial_state["finished_at"] = now_iso()
+        state["running"] = False
+        state["finished_at"] = now_iso()
 
 
 @router.post("/api/day/dial")
@@ -910,6 +946,8 @@ def start_dial(body: ApproveBody = Body(default_factory=ApproveBody)) -> dict[st
     it twice is not an error and does not dial twice: the walk already in flight
     is returned unchanged, which is what a button pressed again because nothing
     visibly happened should do.
+
+    Scoped by `agent_id`, so one language dialling does not lock the other out.
     """
     if body.kind not in KINDS:
         raise HTTPException(422, f"kind must be one of {list(KINDS)}, got {body.kind!r}")
@@ -918,8 +956,10 @@ def start_dial(body: ApproveBody = Body(default_factory=ApproveBody)) -> dict[st
     buckets = list(body.buckets)
 
     with _dial_lock:
-        if _dial_state["running"]:
-            return dial_status()
+        busy = _walk_running(body.agent_id)
+        if busy is not None:
+            return _dial_json(busy)
+        state = _dial_scope(body.agent_id)
         with session() as conn:
             where, params = _armed(body.agent_id)
             campaign_ids = [r["id"] for r in conn.execute(
@@ -934,41 +974,52 @@ def start_dial(body: ApproveBody = Body(default_factory=ApproveBody)) -> dict[st
             # REACHED yet must not be reported as one it will never reach.
             left_behind = _left_behind(conn, day, set(campaign_ids), wanted,
                                        body.agent_id)
-        _dial_state.update(_idle_dial())
-        _dial_state.update(running=True, date=day.isoformat(), kind=body.kind,
-                           buckets=buckets, agent_id=body.agent_id,
-                           total=len(campaign_ids), left_behind=left_behind,
-                           started_at=now_iso())
-    threading.Thread(target=_dial_walk, args=(day, body.kind, buckets, campaign_ids),
+        state.update(_idle_dial())
+        state.update(running=True, date=day.isoformat(), kind=body.kind,
+                     buckets=buckets, agent_id=body.agent_id,
+                     total=len(campaign_ids), left_behind=left_behind,
+                     started_at=now_iso())
+    threading.Thread(target=_dial_walk,
+                     args=(state, day, body.kind, buckets, campaign_ids),
                      daemon=True).start()
-    return dial_status()
+    return _dial_json(state)
 
 
-@router.get("/api/day/dial")
-def dial_status() -> dict[str, Any]:
-    """Where the walk has got to. Safe to poll from a screen that is open all day.
+def _dial_json(state: dict[str, Any]) -> dict[str, Any]:
+    """One walk, in the shape the console reads.
 
     `result` is the walk so far in the same shape `/api/day/approve` answers, so
     the console renders a finished walk through the component it already has and
     adds nothing up itself.
     """
-    state = dict(_dial_state)
-    state["dry_run"] = dry_run()
-    state["result"] = _day_result(list(state["results"]), state["date"],
-                                  state["kind"], list(state["buckets"]),
-                                  list(state["left_behind"]))
-    return state
+    out = dict(state)
+    out["dry_run"] = dry_run()
+    out["result"] = _day_result(list(out["results"]), out["date"], out["kind"],
+                                list(out["buckets"]), list(out["left_behind"]))
+    return out
+
+
+@router.get("/api/day/dial")
+def dial_status(agent_id: Optional[int] = Query(None)) -> dict[str, Any]:
+    """Where this agent's walk has got to. Safe to poll from a screen open all day.
+
+    A panel asks only about its own agent: told about the other language's walk
+    it would draw a progress bar for campaigns it does not own and a Stop button
+    that stops someone else's dial.
+    """
+    return _dial_json(_dial_scope(agent_id))
 
 
 @router.post("/api/day/dial/stop")
-def stop_dial() -> dict[str, Any]:
+def stop_dial(agent_id: Optional[int] = Query(None)) -> dict[str, Any]:
     """Stop between campaigns. The one in flight finishes -- its calls are posted.
 
     A campaign the walk never reached was never posted, so its plan items are
     still `planned` and dialling the day again sends exactly those.
     """
-    _dial_state["stopped"] = True
-    return dial_status()
+    state = _dial_scope(agent_id)
+    state["stopped"] = True
+    return _dial_json(state)
 
 
 @router.post("/api/day/approve")

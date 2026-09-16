@@ -377,6 +377,39 @@ def test_a_full_early_half_costs_the_second_call_not_the_day():
     assert max(s.minute for s in result.slots) >= DEADLINE
 
 
+def test_a_lead_aimed_at_a_full_minute_rings_earlier_rather_than_not_at_all():
+    """65 leads over 14-15 Sep were counted in no column and rang on no phone.
+
+    Run 506 alone lost 42 (`approved 16:35`, `sched=1156 slots=1114`), run 642
+    lost 22. `_free_minute` searched FORWARD only, so a lead aimed into a
+    congested stretch was shed with the rest of its window standing empty in
+    front of it -- and `_write_run` has no column for `unplaceable`, so nothing
+    on any screen ever said so.
+
+    The forward search still wins where it can: only a lead with nothing left
+    ahead of it takes an earlier minute.
+    """
+    from engine.dispatcher import _free_minute
+
+    dcfg = DispatchConfig(**{**WIDE.__dict__, "max_per_minute": 1})
+    # Everything from 11:00 to the close is taken; 09:00-10:59 is empty.
+    load = {m: 1 for m in range(660, dcfg.end_min)}
+
+    assert _free_minute(660, load, dcfg) == 659, (
+        "a lead aimed at a full 11:00 was dropped with two hours standing empty")
+    # Never before the window opens, before the clock, or past a two-call
+    # deadline -- the backward search is bounded by exactly the same floor and
+    # ceiling as the forward one.
+    assert _free_minute(660, load, dcfg, floor_min=660) is None
+    assert _free_minute(660, {m: 1 for m in range(dcfg.start_min, dcfg.end_min)},
+                        dcfg) is None
+    assert _free_minute(660, load, dcfg, floor_min=600) == 659
+
+    # A free minute AHEAD is still preferred: order follows the spread.
+    ahead = {m: 1 for m in range(660, 700)}
+    assert _free_minute(660, ahead, dcfg) == 700
+
+
 def test_stagger_never_exceeds_max_per_minute():
     # 60 leads that all *want* the same minute.
     pairs = [_pair("F5", f"s{i}", last_interaction_time="2026-08-27 09:00:00")

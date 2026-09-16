@@ -1191,6 +1191,47 @@ def test_both_passes_are_judged_against_the_same_band(client):
 # already dialled one. It asks `kind_for_campaign`, same as the day screen.
 # ---------------------------------------------------------------------------
 
+def test_a_fresh_plan_stands_fifteen_minutes_off_the_clock(client, pin_clock):
+    """Asked for on 16 Sep 2026: "if i approve 11 am then call should start
+    scheduling form 11 15 am".
+
+    Before this, Approve placed its first call `FORMI_LEAD_MINUTES` out and the
+    production notes read `approved 11:09 from=11:15` — six minutes between
+    pressing the button and the phone ringing, which is all the time there was
+    to notice a wrong plan and stop it.
+
+    Only PLAN BUILDING moves. Retiring a slot that has already been planned asks
+    the narrower question "will Formi still take this?", and that answer is still
+    Formi's own five: retiring at fifteen would throw away slots Formi would
+    have accepted.
+    """
+    from api.routes_core import APPROVE_LEAD_MINUTES, _earliest_dialable, _floor_min
+
+    assert APPROVE_LEAD_MINUTES == 15, "the operator asked for fifteen minutes"
+    assert APPROVE_LEAD_MINUTES > FORMI_LEAD_MINUTES, (
+        "the head start sits ON TOP of Formi's floor; at or below it, it is not one")
+
+    now = pin_clock(11, 0)
+    dcfg = DispatchConfig(start_min=540, end_min=1200)
+    assert _floor_min(now, now.date(), dcfg) == 11 * 60 + 15, (
+        "approving at 11:00 must place the first call at 11:15, not at 11:05")
+
+    # Rounded UP, never down: Formi re-checks the floor against its own clock
+    # when the POST lands, so 11:00:40 truncated to 11:15 asks for a minute that
+    # is already 14m20s out.
+    assert _floor_min(pin_clock(11, 0).replace(second=40), now.date(), dcfg) \
+        == 11 * 60 + 16
+
+    # Early in the day the WINDOW still wins -- a head start cannot open the day
+    # before the operator's own start time.
+    assert _floor_min(pin_clock(7, 0), now.date(), dcfg) == 540
+
+    # And the sweep that retires already-planned slots keeps Formi's five.
+    assert _earliest_dialable(pin_clock(11, 0)).hour * 60 \
+        + _earliest_dialable(pin_clock(11, 0)).minute == 11 * 60 + 5, (
+        "retiring at the head start would throw away slots Formi would accept")
+
+
 def _tomorrow() -> str:
     """A date `_floor_min` returns None for, so the clock cannot decide the band.
 
@@ -1865,11 +1906,12 @@ def _arm_many(count: int) -> list[int]:
     return ids
 
 
-def _await_dial(client, tries: int = 200) -> dict:
+def _await_dial(client, tries: int = 200, agent_id: int | None = None) -> dict:
     """Poll the walk until it stops. It runs on a thread; the test must not race it."""
     import time
+    params = {} if agent_id is None else {"agent_id": agent_id}
     for _ in range(tries):
-        state = client.get("/api/day/dial").json()
+        state = client.get("/api/day/dial", params=params).json()
         if not state["running"]:
             return state
         time.sleep(0.05)
@@ -1919,6 +1961,70 @@ def test_pressing_dial_twice_does_not_dial_twice(client):
     # same walk -- or it finished between the two, which is not a second dial.
     assert again["started_at"] == first["started_at"], "a second press started a second walk"
     _await_dial(client)
+
+
+def test_a_dial_for_one_agent_does_not_lock_the_other_agent_out(client):
+    """Reported 16 Sep 2026: "when agent 125 is scheduling i cant schedule for 127".
+
+    One walk for the whole console meant the second panel's Dial returned the
+    FIRST panel's progress and started nothing: the operator watched a bar fill
+    up for campaigns they do not own while their own language went out never.
+    Two agents share no campaign, so the two walks touch disjoint rows and
+    disjoint Formi schedules, and they may run side by side.
+
+    The first walk is PINNED running rather than really dialled. A walk over
+    simulated campaigns can finish before the second request is even read, so
+    "125 was still going" is otherwise not a fact this test holds.
+    """
+    ids = _arm(2)
+    with session() as conn:
+        busy, free = [conn.execute("SELECT agent_id FROM campaigns WHERE id=?",
+                                   (i,)).fetchone()["agent_id"] for i in ids]
+    day = now_ist().date().isoformat()
+    _seed_run(ids[1], day, "auto", "planned", 2)
+
+    day_module._dial_scope(busy).update(running=True, agent_id=busy, date=day,
+                                        total=99, started_at="2026-09-16T09:00:00")
+    try:
+        started = client.post("/api/day/dial",
+                              json={"date": day, "kind": "auto", "agent_id": free,
+                                    "campaign_ids": [ids[1]]}).json()
+        assert started["agent_id"] == free, (
+            f"agent {free} pressed Dial and was handed agent {started['agent_id']}'s walk")
+        assert started["total"] == 1, (
+            f"agent {free} was handed the other panel's queue of {started['total']}")
+
+        # And each panel follows its OWN walk, or the progress bar and the Stop
+        # button under it both belong to the other language.
+        assert client.get("/api/day/dial", params={"agent_id": busy}).json()["total"] == 99
+        assert client.get("/api/day/dial",
+                          params={"agent_id": free}).json()["agent_id"] == free
+        _await_dial(client, agent_id=free)
+    finally:
+        day_module._dial_states.pop(busy, None)
+
+
+def test_the_unattended_chase_still_waits_for_any_agents_walk(client):
+    """The recall is every campaign on the box, so ANY walk collides with it.
+
+    Two writers posting to Formi at once is a customer called twice in a minute,
+    and the chase asks `_armed()` with no agent -- so a walk scoped to one agent
+    has to stop it just as the old console-wide one did.
+    """
+    ids = _arm(2)
+    with session() as conn:
+        scoped = conn.execute("SELECT agent_id FROM campaigns WHERE id=?",
+                              (ids[0],)).fetchone()["agent_id"]
+    day_module._dial_scope(scoped)["running"] = True
+    try:
+        assert day_module._walk_running(None) is not None, (
+            "the unscoped chase would have dialled beside a running per-agent walk")
+        assert day_module._walk_running(scoped) is not None, "a panel would re-dial itself"
+        other = next(a for a in (125, 127, -1) if a != scoped)
+        assert day_module._walk_running(other) is None, (
+            "one agent's walk still blocks the other -- the bug this split fixes")
+    finally:
+        day_module._dial_states.pop(scoped, None)
 
 
 def test_a_stopped_dial_leaves_the_rest_planned_and_approvable(client):

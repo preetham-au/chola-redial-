@@ -222,9 +222,9 @@ The recall pass no longer waits for an approval. On the same tick,
   minute its pass went out; a pass with no room for a second call (18:00 against
   a 20:00 close) is never chased at all.
 
-  **The window outranks that minute at both ends.** Nothing can be scheduled
-  inside Formi's five-minute lead, so against a 20:00 close the last minute a
-  chase can be *started* is 19:54. Past it a campaign is never due — there is
+  **The window outranks that minute at both ends.** A fresh plan stands
+  `APPROVE_LEAD_MINUTES` (15) off the clock, so against a 20:00 close the last
+  minute a chase can be *started* is 19:44. Past it a campaign is never due — there is
   nothing left to place, and saying so is what stops a campaign being re-synced
   against the warehouse every ten minutes until midnight for a plan
   `_approve_one` can only refuse. Before it, a campaign that comes due with less
@@ -286,9 +286,25 @@ One page for the whole day across every campaign in the plan, and one approval.
 | `GET` | `/api/day?date=&kind=&agent_id=` | the whole day. Cheap by construction — two `GROUP BY`s over rows the console already wrote, so a screen may poll it all day without costing a warehouse query. Never re-runs the engine. |
 | `POST` | `/api/day/prepare` | `{date?, kind?, resync?, agent_id?}` → builds `planned` runs for every campaign in the plan. **Dials nothing.** `resync: true` (what a pass sets) re-reads campaign status and re-pulls leads first — for the scoped agent only, so a Hindi prepare cannot stop a Tamil campaign and report it in `stopped_in_formi`. |
 | `POST` | `/api/day/approve` | `{date?, kind?, buckets?[], campaign_ids?[], agent_id?}` → **dials.** Empty `buckets` means every bucket; empty `campaign_ids` means every campaign with a plan waiting. |
-| `POST` | `/api/day/dial` | same body → **dials, one campaign at a time, in a background thread.** Returns the status below immediately. Asking twice while one is running returns the one in flight rather than starting a second. |
-| `GET` | `/api/day/dial` | where that walk has got to. Safe to poll from a screen left open all day. |
-| `POST` | `/api/day/dial/stop` | asks the walk to stop after the campaign it is on. The rest stay `planned` and can be approved later. |
+| `POST` | `/api/day/dial` | same body → **dials, one campaign at a time, in a background thread.** Returns the status below immediately. Asking twice while a *colliding* walk is running returns the one in flight rather than starting a second. |
+| `GET` | `/api/day/dial?agent_id=` | where **that agent's** walk has got to. Safe to poll from a screen left open all day. Omit `agent_id` for the whole roster's walk. |
+| `POST` | `/api/day/dial/stop?agent_id=` | asks that agent's walk to stop after the campaign it is on. The rest stay `planned` and can be approved later. |
+
+**One walk per agent, not one per box.** Reported 16 Sep 2026: *"when agent 125 is
+scheduling i cant schedule for 127"*. Each language has its own panel with its own
+Approve, and a single shared walk meant pressing Tamil while Hindi was still going
+returned Hindi's progress bar and started nothing at all — the operator watched a
+walk they had not asked for and the second language went undialled in silence.
+
+Two agents never share a campaign, so their walks touch disjoint rows and disjoint
+Formi schedules and run side by side. An **unscoped** walk (no `agent_id`) is every
+campaign, so it collides with each of them and each of them with it — that pair
+still queues. The unattended recall is unscoped, which is why any operator walk
+holds it off, whichever language pressed the button.
+
+The scope is on the wire in all three directions: polling and stopping must name
+the same `agent_id` the dial was started with, or a panel draws the other
+language's progress bar and its Stop button stops someone else's dial.
 
 `/api/day/dial` is `/api/day/approve` with the queue moved off the browser. A
 single campaign's approve is a ten-minute request — 1,364 calls at ten a second
@@ -446,16 +462,31 @@ no narrower band to compare against any more.
 
 **Both passes dial the campaign's whole window.** There is no clock boundary and
 no `WAVE_BOUNDARY` env var — it was removed on 14 Sep 2026 with the morning and
-afternoon bands. A pass runs from the campaign's own opening (or the 5-minute
-floor, today) to its own close, and what separates the two passes is the
+afternoon bands. A pass runs from the campaign's own opening (or the head start
+below, today) to its own close, and what separates the two passes is the
 previous call, not the hour.
 
 **A dial window is half-open.** `end` is the minute a window SHUTS on; no call is
 placed there. It makes the capacity arithmetic true: `end - start` minutes are
 dialable, which is what `capacity_before_close` has always counted.
 
+**Approve gives you fifteen minutes.** Asked for on 16 Sep 2026 — *"if i approve
+11 am then call should start scheduling form 11 15 am"*. `routes_core.APPROVE_LEAD_MINUTES`
+(15) is the floor a fresh plan's first slot is placed on, so approving at 11:00
+rings at 11:15, and the day screen's capacity reads against the same floor rather
+than promising ten minutes of room Approve cannot use.
+
+It is the gap between pressing the button and the phone ringing, which is the
+time there is to notice a wrong plan and stop it. **Formi's own five-minute floor
+is a different number and still five:** retiring a slot that has already been
+planned asks the narrower question "will Formi still take this?", so
+`FORMI_LEAD_MINUTES` governs that (and the test call, which has no time
+restriction at all). Retiring at fifteen would throw away slots Formi would have
+accepted. The head start is a module constant, not a config field — one value was
+asked for; ask if you want the knob.
+
 **Approving late does not dial into the night.** `approve` RE-PLANS each campaign
-from the current minute with the buckets the operator ticked, then commits it, so
+from that floor with the buckets the operator ticked, then commits it, so
 only what genuinely fits before the window shuts is scheduled — best RED band
 first. Whatever does not fit is not dialled today and returns in tomorrow's plan
 (`not_dialled` in the response). Approving a pass twice does not dial twice: a run
@@ -497,6 +528,17 @@ refusing a call — a fault, and what `POST /api/runs/{id}/retry` sends again.
 window shut, which returns in the next plan on its own and would only expire
 again if retried, **plus** every lead of a `left_behind` campaign, which does
 not return until somebody restarts that campaign.
+
+**A lead aimed at a full minute now rings earlier rather than not at all.**
+`max_per_minute` caps each minute, and `dispatcher._free_minute` used to search
+only FORWARD from the minute the spread or the rotation asked for — so a lead
+aimed into a congested stretch was shed with the rest of its window standing
+empty in front of it. 65 leads over 14–15 Sep 2026 went that way (42 of them run
+506's), counted in no column and reported on no screen: `dispatch()` returns
+`unplaceable`, and `_write_run` has no place to put it. Forward still wins where
+it can, so order follows the spread; only a lead with nothing left ahead of it
+takes an earlier minute, and the backward search is bounded by the same floor and
+the same two-call deadline as the forward one.
 
 **An approve names what it did not include** (`left_behind`). An approve walks
 armed campaigns, so a campaign stopped AFTER its plan was built is skipped with

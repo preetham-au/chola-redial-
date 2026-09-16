@@ -51,7 +51,7 @@ from .db import current_config, now_ist, session
 # level and reaches back into this module only from inside functions, so this
 # direction can be a plain import.
 from .day import _scope
-from .routes_core import FORMI_LEAD_MINUTES, _campaign, _campaign_json
+from .routes_core import APPROVE_LEAD_MINUTES, _campaign, _campaign_json
 
 log = logging.getLogger("redial.autopilot")
 
@@ -274,9 +274,13 @@ def _recall_due(conn: sqlite3.Connection, campaign_id: int, day: date,
         return False                         # no room for a second call at all
     now_min = now.hour * 60 + now.minute
     # The last minute of the day a plan built now could still place a call in:
-    # `_approve_one` floors every slot at `_earliest_dialable`, so a chase
-    # started after this can only answer `window_closed`.
-    last = dcfg.end_min - FORMI_LEAD_MINUTES - 1
+    # `_approve_one` floors every slot at `_floor_min`, which stands the plan
+    # `APPROVE_LEAD_MINUTES` off the clock, so a chase started after this can
+    # only answer `window_closed`. It tracks that constant rather than Formi's
+    # own five -- the head start is what the plan is actually built against, and
+    # reading the smaller number here would hand the last tick a window it has
+    # already lost.
+    last = dcfg.end_min - APPROVE_LEAD_MINUTES - 1
     if now_min > last:
         # Never "due" again today. There is nothing left to place, and saying so
         # here is what stops a campaign being re-synced against the warehouse
@@ -329,7 +333,7 @@ def run_recall(day: Optional[date] = None) -> dict[str, Any]:
         of the chase, and a pass that dials with nobody watching needs that check
         more than one that waits for a button, not less.
     """
-    from .day import _approve_one, _armed, _day_result, _dial_state, _prepare_one  # noqa: PLC0415
+    from .day import _approve_one, _armed, _day_result, _prepare_one, _walk_running  # noqa: PLC0415
 
     day = day or now_ist().date()
     now = now_ist()
@@ -339,7 +343,10 @@ def run_recall(day: Optional[date] = None) -> dict[str, Any]:
 
     if not auto_recall_on():
         return nothing("AUTO_RECALL is off")
-    if _dial_state["running"]:
+    # The chase is unscoped -- `_armed()` below is every campaign on the box --
+    # so ANY operator walk collides with it, whichever language pressed the
+    # button. `_walk_running(None)` is exactly that question.
+    if _walk_running(None) is not None:
         return nothing("a dial is already running")
 
     with session() as conn:

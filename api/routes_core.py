@@ -95,23 +95,35 @@ def _anchor(day: date, dcfg: DispatchConfig) -> datetime:
 # are guaranteed rejections, not calls.
 FORMI_LEAD_MINUTES = 5
 
+# How far ahead of Approve the first call of a fresh plan is placed. Formi's
+# floor above is a hard limit -- a slot inside it is a 400, not a call -- and
+# this is the operator's head start ON TOP of it, asked for on 16 Sep 2026:
+# "if i approve 11 am then call should start scheduling form 11 15 am".
+#
+# It is the gap between pressing the button and the phone ringing, which is the
+# time there is to notice a wrong plan and stop it. Only plan building uses it:
+# retiring a slot that has already been planned asks the narrower question "will
+# Formi still take this?", and that is `FORMI_LEAD_MINUTES`. Retiring at fifteen
+# would throw away slots Formi would have accepted.
+APPROVE_LEAD_MINUTES = 15
 
-def _earliest_dialable(now: datetime) -> datetime:
-    """The first whole minute Formi will accept a schedule for.
+
+def _earliest_dialable(now: datetime, minutes: int = FORMI_LEAD_MINUTES) -> datetime:
+    """The first whole minute a schedule may be asked for, `minutes` out.
 
     Rounded *up*: Formi re-checks the floor against its own clock when the POST
     lands, so truncating 16:31:40 down to 16:31 would ask for a minute that has
     already fallen inside the five.
     """
-    return (now + timedelta(minutes=FORMI_LEAD_MINUTES, seconds=59)
+    return (now + timedelta(minutes=minutes, seconds=59)
             ).replace(second=0, microsecond=0)
 
 
 def _floor_min(now: datetime, day: date, dcfg: DispatchConfig) -> Optional[int]:
-    """Earliest dialable minute-of-day, or None to mean 'the window start'."""
+    """Earliest minute-of-day a fresh plan may place on, or None for 'window start'."""
     if day != now_ist().date():
         return None
-    first = _earliest_dialable(now)
+    first = _earliest_dialable(now, APPROVE_LEAD_MINUTES)
     return max(dcfg.start_min, first.hour * 60 + first.minute)
 
 

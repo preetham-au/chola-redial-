@@ -404,7 +404,11 @@ def dispatch(
 def _free_minute(wanted: int, load: dict[int, int], dcfg: DispatchConfig,
                  floor_min: Optional[int] = None,
                  ceil_min: Optional[int] = None) -> Optional[int]:
-    """First free minute in [max(wanted, floor), min(end, ceil)), or None.
+    """A free minute in [floor, min(end, ceil)) at or nearest `wanted`, or None.
+
+    Searched forward from `wanted` first -- a lead placed later than the spread
+    asked still keeps its order relative to the leads after it -- and only then
+    backward, when the whole rest of the window is full.
 
     `ceil_min` is the two-call deadline (see `twice_deadline`); without one the
     window's own end applies.
@@ -416,7 +420,8 @@ def _free_minute(wanted: int, load: dict[int, int], dcfg: DispatchConfig,
     is how a campaign capped at ten calls a minute once put twenty on 13:30 with
     neither run over its own ceiling.
     """
-    minute = max(wanted, dcfg.start_min if floor_min is None else floor_min)
+    floor = dcfg.start_min if floor_min is None else floor_min
+    minute = max(wanted, floor)
     end = dcfg.end_min if ceil_min is None else min(dcfg.end_min, ceil_min)
     if not dcfg.max_per_minute:
         return minute if minute < end else None
@@ -424,6 +429,17 @@ def _free_minute(wanted: int, load: dict[int, int], dcfg: DispatchConfig,
         if load.get(minute, 0) < dcfg.max_per_minute:
             return minute
         minute += 1
+    # Nothing ahead — so look BEHIND the wanted minute before giving the lead up.
+    # The spread and the rotation each aim a lead at one minute, and a lead aimed
+    # into a congested stretch used to be shed here with the rest of its window
+    # standing empty in front of it: 65 leads over 14-15 Sep, among them 42 of
+    # run 506's, counted in no column and reported on no screen. Ringing earlier
+    # than the spread asked beats not ringing, and the search stays inside
+    # [floor, wanted) so it can no more dial before the window opens, before the
+    # clock, or past a two-call lead's deadline than the forward one could.
+    for earlier in range(min(wanted, end) - 1, floor - 1, -1):
+        if load.get(earlier, 0) < dcfg.max_per_minute:
+            return earlier
     return None
 
 
